@@ -1,5 +1,6 @@
 /* Correct D3DMetal fullscreen windows left at the previous desktop size.
- * Runs in Steam's existing wrapper process; never changes display modes. */
+ * Runs in Steam's existing wrapper process; never changes display modes.
+ * MACFINALS_DISPLAY_FIX lists the game executables to watch, separated by commas. */
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -24,7 +25,9 @@ typedef struct { HANDLE stop, thread; } MVDisplayWatcher;
 static HWND mvDisplayWatchWindow;
 static ULONGLONG mvDisplayWatchUntil, mvDisplayLastRepair;
 
-static BOOL mvDeadlockWindow(HWND window) {
+static WCHAR mvDisplayGames[1024];
+
+static BOOL mvGameWindow(HWND window) {
     if(!window || !IsWindowVisible(window) || GetAncestor(window,GA_ROOT)!=window)return FALSE;
     DWORD pid=0;GetWindowThreadProcessId(window,&pid);
     HANDLE process=OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION,FALSE,pid);
@@ -35,16 +38,24 @@ static BOOL mvDeadlockWindow(HWND window) {
     if(!found)return FALSE;
     WCHAR *name=wcsrchr(path,L'\\');name=name?name+1:path;
     WCHAR *forward=wcsrchr(name,L'/');if(forward)name=forward+1;
-    return !_wcsicmp(name,L"deadlock.exe");
+    size_t length=wcslen(name);
+    for(const WCHAR *game=mvDisplayGames;*game;) {
+        const WCHAR *end=wcschr(game,L',');
+        size_t size=end?(size_t)(end-game):wcslen(game);
+        if(size==length && !_wcsnicmp(game,name,length))return TRUE;
+        if(!end)break;
+        game=end+1;
+    }
+    return FALSE;
 }
 
 static MVDisplayRect mvDisplayRect(RECT rect) {
     return (MVDisplayRect){rect.left,rect.top,rect.right,rect.bottom};
 }
 
-static BOOL CALLBACK mvRepairDeadlockWindow(HWND window,LPARAM unused) {
+static BOOL CALLBACK mvRepairGameWindow(HWND window,LPARAM unused) {
     (void)unused;
-    if(!mvDeadlockWindow(window))return TRUE;
+    if(!mvGameWindow(window))return TRUE;
     RECT client,outer;MONITORINFO monitor={0};monitor.cbSize=sizeof(monitor);
     if(!GetClientRect(window,&client) || !GetWindowRect(window,&outer) ||
        !GetMonitorInfoW(MonitorFromWindow(window,MONITOR_DEFAULTTONEAREST),&monitor))return TRUE;
@@ -58,7 +69,7 @@ static BOOL CALLBACK mvRepairDeadlockWindow(HWND window,LPARAM unused) {
     if(SetWindowPos(window,NULL,monitor.rcMonitor.left,monitor.rcMonitor.top,width,height,
                     SWP_NOZORDER|SWP_NOACTIVATE|SWP_ASYNCWINDOWPOS)) {
         mvDisplayLastRepair=now;
-        fprintf(stderr,"MacVolvo GPTK4: Deadlock fullscreen window %ldx%ld -> %ldx%ld\n",
+        fprintf(stderr,"MacFinals: game fullscreen window %ldx%ld -> %ldx%ld\n",
                 client.right-client.left,client.bottom-client.top,width,height);
         fflush(stderr);
     }
@@ -74,7 +85,7 @@ static void mvScheduleDisplayCheck(void) {
 static LRESULT CALLBACK mvDisplayWatchProc(HWND window,UINT message,WPARAM wparam,LPARAM lparam) {
     if(message==WM_DISPLAYCHANGE)mvScheduleDisplayCheck();
     else if(message==WM_TIMER && wparam==1) {
-        EnumWindows(mvRepairDeadlockWindow,0);
+        EnumWindows(mvRepairGameWindow,0);
         if(GetTickCount64()>=mvDisplayWatchUntil)KillTimer(window,1);
     }
     return DefWindowProcW(window,message,wparam,lparam);
@@ -83,12 +94,12 @@ static LRESULT CALLBACK mvDisplayWatchProc(HWND window,UINT message,WPARAM wpara
 static void CALLBACK mvDisplayWindowEvent(HWINEVENTHOOK hook,DWORD event,HWND window,
                                          LONG object,LONG child,DWORD thread,DWORD time) {
     (void)hook;(void)event;(void)child;(void)thread;(void)time;
-    if(object==OBJID_WINDOW && mvDeadlockWindow(window))mvScheduleDisplayCheck();
+    if(object==OBJID_WINDOW && mvGameWindow(window))mvScheduleDisplayCheck();
 }
 
 static DWORD WINAPI mvWatchDisplay(void *argument) {
     HANDLE stop=argument;
-    HANDLE mutex=CreateMutexW(NULL,FALSE,L"Local\\MacVolvo.GPTK4.DeadlockDisplay");
+    HANDLE mutex=CreateMutexW(NULL,FALSE,L"Local\\MacFinals.GameDisplay");
     if(!mutex)return 1;
     HANDLE waiting[]={stop,mutex};
     DWORD locked=WaitForMultipleObjects(2,waiting,FALSE,INFINITE);
@@ -97,7 +108,7 @@ static DWORD WINAPI mvWatchDisplay(void *argument) {
     SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     HINSTANCE instance=GetModuleHandleW(NULL);
     WNDCLASSW klass={0};klass.lpfnWndProc=mvDisplayWatchProc;
-    klass.hInstance=instance;klass.lpszClassName=L"MacVolvoGPTK4DisplayWatch";
+    klass.hInstance=instance;klass.lpszClassName=L"MacFinalsDisplayWatch";
     if(!RegisterClassW(&klass)) {ReleaseMutex(mutex);CloseHandle(mutex);return 1;}
     /* An invisible top-level window receives WM_DISPLAYCHANGE broadcasts. */
     mvDisplayWatchWindow=CreateWindowExW(WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE,klass.lpszClassName,L"",
@@ -122,8 +133,9 @@ static DWORD WINAPI mvWatchDisplay(void *argument) {
 }
 
 static MVDisplayWatcher mvStartDisplayWatcher(void) {
-    MVDisplayWatcher watcher={0};WCHAR enabled[4];
-    if(GetEnvironmentVariableW(L"MACVOLVO_GPTK4_DISPLAY_FIX",enabled,4)!=1 || enabled[0]!=L'1')return watcher;
+    MVDisplayWatcher watcher={0};
+    DWORD size=GetEnvironmentVariableW(L"MACFINALS_DISPLAY_FIX",mvDisplayGames,1024);
+    if(!size || size>=1024) {mvDisplayGames[0]=0;return watcher;}
     watcher.stop=CreateEventW(NULL,TRUE,FALSE,NULL);
     if(watcher.stop)watcher.thread=CreateThread(NULL,0,mvWatchDisplay,watcher.stop,0,NULL);
     if(!watcher.thread && watcher.stop) {CloseHandle(watcher.stop);watcher.stop=NULL;}

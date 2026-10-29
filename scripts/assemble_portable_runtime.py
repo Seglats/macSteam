@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""Assemble/sign a versioned runtime from Phase 2 source-build outputs.
+"""Assemble/sign MacFinals' runtime: the source-built Wine with Apple's D3DMetal.
 
-Does not copy installed developer runtimes or Windows prefixes. Apple support
-files come from the separately verified original package and remain unmodified.
+Does not copy installed developer runtimes or Windows prefixes. Apple's files come
+from the Game Porting Toolkit 4 evaluation environment (--gptk, the folder holding
+redist/ and its Read Me, License and Acknowledgements), laid over Wine's own
+Direct3D modules after everything else is signed, and remain unmodified.
 """
 import argparse
 import hashlib
@@ -19,7 +21,13 @@ from concurrent.futures import ThreadPoolExecutor
 import game_mode_app
 
 ROOT=Path(__file__).resolve().parents[1]
-APPLE_SHA='5131e631eee8b542eadf48f4df9fd662d9aeeb59139137e0e6e14047dc434995'
+# Apple's modules MacFinals loads (portable_setup.m's wineEnv); a redist without them is refused.
+APPLE_REQUIRED=['external/D3DMetal.framework/Versions/A/D3DMetal','external/libd3dshared.dylib',
+                'wine/x86_64-windows/d3d11.dll','wine/x86_64-windows/dxgi.dll',
+                'wine/x86_64-windows/d3d12.dll','wine/x86_64-windows/d3d12core.dll',
+                'wine/x86_64-unix/d3d11.so','wine/x86_64-unix/dxgi.so',
+                'wine/x86_64-unix/d3d12.so','wine/x86_64-unix/d3d12core.so']
+SOURCE_BUILDS=['wine-build-proof.json','native-build-proof.json']
 MONO_SOURCE_SHA='128e335396689e466dff5e1aa0770a714dbe3d16397fc4ddbb8a80999c67323b'
 
 
@@ -45,10 +53,29 @@ def copy(source,target):
     else:shutil.copy2(source,target)
 
 
-def assemble(work,version,identity):
+def apple_redist(gptk):
+    """Checks the GPTK folder before anything is built from it; returns D3DMetal's version."""
+    redist=gptk/'redist/lib'
+    for name in APPLE_REQUIRED:
+        if not (redist/name).exists():raise ValueError('Apple redist lacks '+name)
+    for name in ['License.rtf','Read Me.rtf','Acknowledgements.rtf']:
+        if not (gptk/name).is_file():raise ValueError('Apple package documentation missing: '+name)
+    info=plistlib.loads((redist/'external/D3DMetal.framework/Resources/Info.plist').read_bytes())
+    if info.get('CFBundleIdentifier')!='com.apple.D3DMetal' or not info['CFBundleShortVersionString'].startswith('4.'):
+        raise ValueError('The GPTK folder does not hold D3DMetal 4')
+    for p in redist.rglob('*'):
+        if p.is_symlink():
+            if os.path.isabs(os.readlink(p)) or not p.resolve().is_relative_to(redist.resolve()):
+                raise ValueError('Apple redist link escapes it: '+str(p))
+        elif macho(p):run('codesign','--verify','--strict','-R=anchor apple',p,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+    return info['CFBundleShortVersionString']
+
+
+def assemble(work,version,identity,gptk):
     if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,63}',version):raise ValueError('Invalid runtime version')
-    for name in ['wine-build-proof.json','dxmt-build-proof.json','native-build-proof.json']:
+    for name in SOURCE_BUILDS:
         if not (work/name).is_file():raise ValueError('Complete the source builds first: '+name)
+    gptk_version=apple_redist(gptk)
     dest=work/'artifacts'/version
     if dest.exists():raise ValueError('Use a new version; existing artifact is never overwritten')
     dest.mkdir(parents=True)
@@ -61,20 +88,10 @@ def assemble(work,version,identity):
         if p.is_file() and p.suffix!='.a':
             copy(p,dest/p.relative_to(wine))
     shutil.copytree(wine/'share/wine',dest/'share/wine',symlinks=True)
-    for p in (work/'dxmt-install').rglob('*'):
-        if p.is_file() and p.suffix in ('.dll','.so'):
-            target=dest/'lib/wine'/p.relative_to(work/'dxmt-install')
-            target.parent.mkdir(parents=True,exist_ok=True)
-            if target.exists() or target.is_symlink():target.unlink()
-            copy(p,target)
+    # The worker still expects the renderer profile file; D3DMetal ignores it.
     copy(ROOT/'config/dxmt-source60-1200.conf',dest/'config/dxmt.conf')
-    original=work/'apple-original'
-    apple=original/'redist/lib/external/libd3dshared.dylib'
-    if sha(apple)!=APPLE_SHA:raise ValueError('Apple support library changed')
-    run('codesign','--verify','--strict','-R=anchor apple',apple)
-    copy(apple,dest/'lib/external/libd3dshared.dylib')
     for name in ['License.rtf','Read Me.rtf','Acknowledgements.rtf']:
-        copy(original/name,dest/'licenses/apple'/name)
+        copy(gptk/name,dest/'licenses/apple'/name)
     copy(work/'sources/wine/sources/wine/COPYING.LIB',dest/'licenses/Wine-LGPL-2.1')
     for p in (ROOT/'licenses').iterdir():  # PROJECT-APACHE-2.0 and PROJECT-NOTICE among them
         if p.is_file():copy(p,dest/'licenses'/p.name)
@@ -85,7 +102,6 @@ def assemble(work,version,identity):
              dest/('licenses/compiler-runtime/MinGW-'+architecture+'-COPYING'))
     soju=work/'sources/soju/soju-3a350b32bf906dd2a509b18c642a5a2676de022a'
     copy(soju/'LICENSE',dest/'licenses/Soju-GPL-3.0')
-    copy(work/'dxmt-source/include/native/directx/COPYING.MinGW-w64.txt',dest/'licenses/DirectX-Headers-COPYING')
     mono_source=work/'downloads/wine-mono-10.4.1-src.tar.xz'
     if not mono_source.exists():
         part=Path(str(mono_source)+'.part')
@@ -113,7 +129,7 @@ def assemble(work,version,identity):
     # No unused graphical backend is copied.
     available={p.name:p for p in (work/'clean-deps/lib').glob('*.dylib')}
     available['libfreetype.6.dylib']=work/'deps/lib/libfreetype.6.dylib'
-    native=[p for p in dest.rglob('*') if macho(p) and p!=dest/'lib/external/libd3dshared.dylib']
+    native=[p for p in dest.rglob('*') if macho(p)]
     needed={'libgnutls.30.dylib','libfreetype.6.dylib','libMoltenVK.dylib','libSDL2-2.0.0.dylib'};chosen={}
     for p in native:
         for dep in links(p):
@@ -125,16 +141,16 @@ def assemble(work,version,identity):
         for dep in links(p):
             base=Path(dep).name
             if base in available and base!=name:needed.add(base)
-    native=[p for p in dest.rglob('*') if macho(p) and p!=dest/'lib/external/libd3dshared.dylib']
+    native=[p for p in dest.rglob('*') if macho(p)]
     strip=ROOT/'runtime/toolchains/llvm-mingw-20251216-ucrt-macos-universal/bin/llvm-strip'
     def strip_debug(p):
         run(strip,'--strip-debug',p,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
-    # Managed Mono assemblies are PE too; only strip built Wine/DXMT modules.
+    # Managed Mono assemblies are PE too; only strip built Wine modules.
     pe=[p for p in (dest/'lib/wine').rglob('*') if p.is_file() and not p.is_symlink()
         and p.suffix in ('.exe','.dll','.drv','.sys','.acm','.cpl','.ocx','.ax')]
     with ThreadPoolExecutor(max_workers=4) as pool:list(pool.map(strip_debug,pe))
     for p in native:
-        # Include the dependency closure copied above, not just Wine/DXMT.
+        # Include the dependency closure copied above, not just Wine.
         # Preserve exported symbols needed by Wine and dlopen.
         run('/usr/bin/strip','-S','-x',p,stderr=subprocess.DEVNULL)
         for dep in links(p):
@@ -178,14 +194,22 @@ def assemble(work,version,identity):
         'com.apple.security.cs.disable-executable-page-protection','com.apple.security.cs.disable-library-validation',
         # 1.3: without it the hardened runtime gives the game silence for the microphone, with no prompt.
         'com.apple.security.device.audio-input']}))
+    timestamp=['--timestamp'] if identity!='-' else []
     for index,p in enumerate(sorted(native)):
-        args=['codesign','--force','--options','runtime','--timestamp','--sign',identity]
+        args=['codesign','--force','--options','runtime',*timestamp,'--sign',identity]
         if p.name in ('wine','wineserver'):args+=['--entitlements',entitlements]
         run(*args,p,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
         run('codesign','--verify','--strict',p,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
         if index%10==0:print('Signed native components:',index+1,'of',len(native),flush=True)
-    run('codesign','--verify','--strict','-R=anchor apple',dest/'lib/external/libd3dshared.dylib')
-    if sha(dest/'lib/external/libd3dshared.dylib')!=APPLE_SHA:raise ValueError('Apple component must remain unmodified')
+    # Apple's D3DMetal replaces Wine's own Direct3D modules (as CrossOver's apple_gptk
+    # folder does at run time); added last, so nothing above strips or re-signs it.
+    redist=gptk/'redist/lib'
+    shutil.copytree(redist,dest/'lib',symlinks=True,dirs_exist_ok=True)
+    for p in redist.rglob('*'):
+        target=dest/'lib'/p.relative_to(redist)
+        if p.is_symlink():
+            if os.readlink(target)!=os.readlink(p):raise ValueError('Apple link changed: '+str(target))
+        elif p.is_file() and sha(target)!=sha(p):raise ValueError('Apple component must remain unmodified: '+str(target))
     # 1.1: the game app for macOS Game Mode, a copy of the signed loader (scripts/game_mode_app.py).
     game_mode_app.make(dest,'26.0',identity)
     files={}
@@ -195,11 +219,12 @@ def assemble(work,version,identity):
             files[str(p.relative_to(dest))]={'symlink':os.readlink(p)}
         elif p.is_file():files[str(p.relative_to(dest))]={'sha256':sha(p),'bytes':p.stat().st_size}
     manifest={'schema':1,'version':version,'minimum_macos':'26.0','files':files,
-              'source_builds':{n:json.loads((work/n).read_text()) for n in ['wine-build-proof.json','dxmt-build-proof.json','native-build-proof.json']},
+              'graphics_backend':'d3dmetal','gptk_version':gptk_version,
+              'source_builds':{n:json.loads((work/n).read_text()) for n in SOURCE_BUILDS},
               'native_dependency_inputs':chosen,'apple_component_unmodified':True,
               'development_path_scan_passed':True,
               'wine_mono_corresponding_source_sha256':MONO_SOURCE_SHA,
-              'status':'private_phase_2_candidate; consumer release review and QA still required'}
+              'status':'macfinals_development; release review and QA still required'}
     (dest/'runtime.json').write_text(json.dumps(manifest,indent=2)+'\n')
     archive=Path(str(dest)+'.tar.gz')
     with tarfile.open(archive,'w:gz',compresslevel=3) as tar:
@@ -213,5 +238,6 @@ def assemble(work,version,identity):
 
 if __name__=='__main__':
     p=argparse.ArgumentParser(description=__doc__);p.add_argument('--workspace',type=Path,required=True)
-    p.add_argument('--version',required=True);p.add_argument('--identity',required=True)
-    a=p.parse_args();assemble(a.workspace.resolve(),a.version,a.identity)
+    p.add_argument('--version',required=True);p.add_argument('--identity',required=True,help="'-' signs ad hoc")
+    p.add_argument('--gptk',type=Path,default=ROOT/'gptk/gptk',help='Folder holding Apple\'s redist/ and its documents')
+    a=p.parse_args();assemble(a.workspace.resolve(),a.version,a.identity,a.gptk.resolve())

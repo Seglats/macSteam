@@ -1,14 +1,10 @@
 // Offline release notes, also available from Help.
 enum WhatsNew {
-    static let version="1.1"
+    static let version="0.1"
     static let items:[(symbol:String, title:String, detail:String)]=[
-        ("macwindow","Open Steam requests its window",
-         "Restores Steam through its window request instead of only activating its process. The launcher no longer pulls focus back to your game afterward."),
-        ("arrow.clockwise","Steam browser recovery",
-         "Open Steam repairs an idle client after an update replaces its browser helper. Finish and close a running game before restarting Steam."),
-        ("checkmark.circle","Wine session cleanup",
-         "Temporary launch requests are reaped, and closing Steam waits for its remaining Wine services to exit."),
-        ("rectangle.expand.vertical","Deadlock display issue remains under investigation",
-         "UI and click positions may shift after changing video settings. Try closing Deadlock, turning off Fullscreen in MacVolvo and relaunching at a resolution that fits your display."),
+        ("cpu","THE FINALS on Apple’s D3DMetal",
+         "MacFinals runs THE FINALS through Steam with Apple’s Game Porting Toolkit 4 and DirectX 12 on macOS 27’s Metal 4."),
+        ("square.stack.3d.up","Built from MacVolvo",
+         "Steam setup, its window fix, raw mouse input and Game Mode come from MacVolvo. Its own data folder keeps it apart from MacVolvo installs."),
     ]
 }

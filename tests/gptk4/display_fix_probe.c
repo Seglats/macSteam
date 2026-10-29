@@ -1,5 +1,5 @@
 /* Native Win32 integration probe, used only in a disposable test prefix.
- * Compile the child with -DMACVOLVO_DISPLAY_FIX_CHILD as deadlock.exe. */
+ * Compile the child with -DMACVOLVO_DISPLAY_FIX_CHILD as Discovery.exe. */
 #define _WIN32_WINNT 0x0a00
 #include <windows.h>
 #include <stdio.h>
@@ -59,14 +59,14 @@ int main(int argc,char **argv) {
     DestroyWindow(window);UnregisterClassW(klass.lpszClassName,klass.hInstance);
     return ok?0:6;
 #else
-    SetEnvironmentVariableW(L"MACVOLVO_GPTK4_DISPLAY_FIX",!strcmp(argv[1],"disabled")?L"0":L"1");
+    SetEnvironmentVariableW(L"MACFINALS_DISPLAY_FIX",!strcmp(argv[1],"disabled")?NULL:L"Discovery.exe");
     MVDisplayWatcher watcher=mvStartDisplayWatcher();
     /* Let the initial check expire: the later game window must trigger an event. */
     Sleep(4200);
     WCHAR path[4096],command[8192];
     if(!GetModuleFileNameW(NULL,path,4096))return 7;
     WCHAR *slash=wcsrchr(path,L'\\');if(!slash)return 8;
-    wcscpy(slash+1,L"deadlock.exe");
+    wcscpy(slash+1,L"Discovery.exe");
     swprintf(command,8192,L"\"%ls\" %hs",path,argv[1]);
     STARTUPINFOW startup={0};startup.cb=sizeof(startup);
     PROCESS_INFORMATION process={0};

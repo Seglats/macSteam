@@ -47,8 +47,8 @@ enum InstallLocation {
     static func problem(for root:URL)->String? {
         var ancestor=root.standardizedFileURL
         while ancestor.path != "/" {
-            if FileManager.default.fileExists(atPath:ancestor.appendingPathComponent(Brand.otherOwnerMarker).path) {
-                return "This location belongs to the other MacVolvo app. Choose a separate folder."
+            if Brand.otherOwnerMarkers.contains(where:{ FileManager.default.fileExists(atPath:ancestor.appendingPathComponent($0).path) }) {
+                return "This location belongs to a MacVolvo app. Choose a separate folder."
             }
             ancestor=ancestor.deletingLastPathComponent()
         }

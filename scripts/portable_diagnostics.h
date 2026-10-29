@@ -3,11 +3,7 @@
 static NSDictionary *parityReport(NSString *engine, NSDictionary *env) {
     NSMutableDictionary *files=[NSMutableDictionary dictionary];
     NSMutableArray *names=[@[@"bin/wine",@"bin/wineserver",@"lib/wine/x86_64-windows/d3d11.dll",@"lib/wine/x86_64-windows/dxgi.dll",@"lib/wine/x86_64-unix/winemac.so",@"lib/wine/x86_64-unix/ntdll.so",@"lib/wine/x86_64-unix/win32u.so"] mutableCopy];
-#ifdef MACVOLVO_GPTK4
-    [names addObject:@"lib/external/D3DMetal.framework/Versions/A/D3DMetal"];
-#else
-    [names addObjectsFromArray:@[@"lib/wine/x86_64-windows/winemetal.dll",@"lib/wine/x86_64-unix/winemetal.so"]];
-#endif
+    [names addObjectsFromArray:@[@"lib/external/D3DMetal.framework/Versions/A/D3DMetal",@"lib/wine/x86_64-windows/d3d12.dll",@"lib/wine/x86_64-windows/d3d12core.dll"]];
     for(NSString *name in names)
         files[name]=hashFile(join(engine,name));
     NSMutableDictionary *preferences=[NSMutableDictionary dictionary];
@@ -26,7 +22,7 @@ static NSDictionary *parityReport(NSString *engine, NSDictionary *env) {
     }
     return @{@"schema":@1,@"candidate_profile":CANDIDATE_PROFILE,@"contract_sha256":CANDIDATE_CONTRACT_SHA256,
         @"runtime":state()[@"active_runtime"],@"runtime_files":files,@"launch_environment":env,
-        @"retina_enabled":@(retinaConfigured()),@"render_preferences":preferences,@"free_bytes":@(freeBytes()),
+        @"retina_enabled":@(retinaEnabled()),@"render_preferences":preferences,@"free_bytes":@(freeBytes()),
         @"worker_sha256":hashFile(NSProcessInfo.processInfo.arguments[0]),
         @"config_sha256":hashFile([fm fileExistsAtPath:join(root,@"dxmt.conf")]?join(root,@"dxmt.conf"):join(engine,@"config/dxmt.conf"))};
 }
@@ -34,14 +30,6 @@ static NSMutableDictionary *diagnosticEnvironment(NSString *engine) {
     NSString *folder=join(root,join(@"logs",[@"parity-" stringByAppendingString:NSUUID.UUID.UUIDString]));
     mkdirs(folder);
     NSMutableDictionary *env=wineEnv(engine);
-#ifndef MACVOLVO_GPTK4
-    for(NSString *kind in @[@"FRAME",@"GEOMETRY",@"WINDOW",@"DISPLAY",@"CANVAS",@"SHADER",@"PIPELINE_CACHE",@"RESOURCE"]) {
-        NSString *path=join(folder,kind.lowercaseString);
-        if([@[@"FRAME",@"GEOMETRY",@"WINDOW",@"SHADER",@"RESOURCE"] containsObject:kind])path=[@"Z:" stringByAppendingString:[path stringByReplacingOccurrencesOfString:@"/" withString:@"\\"]];
-        env[[NSString stringWithFormat:@"DXMT_%@_LOG",kind]]=path;
-    }
-    env[@"WINEMAC_INPUT_STATS"]=join(folder,@"input");
-#endif
     writeJSON(parityReport(engine,env),join(folder,@"launch.json"));
     event(@"diagnostics_started",@{@"folder":folder});
     return env;

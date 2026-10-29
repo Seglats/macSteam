@@ -11,14 +11,19 @@ final class AppModel {
     var uninstall: UninstallState = .idle
     var update: UpdateState = .idle
     var updateNotice=""
-    /// The games MacVolvo starts through Steam (worker: launch --game, status games).
+    /// The games MacFinals starts through Steam (worker: launch --game, status games;
+    /// keys and titles match mvGames in portable_steam.h).
     enum Game: String, CaseIterable, Identifiable {
-        case cs2, deadlock
+        case finals
         var id:String { rawValue }
-        var title:String { self == .cs2 ? "Counter-Strike 2" : "Deadlock" }
+        var title:String {
+            switch self {
+            case .finals: return "THE FINALS"
+            }
+        }
     }
     /// The game Play starts; the last one chosen.
-    var selectedGame=Game(rawValue:UserDefaults.standard.string(forKey:"selectedGame") ?? "") ?? .cs2 {
+    var selectedGame=Game(rawValue:UserDefaults.standard.string(forKey:"selectedGame") ?? "") ?? .finals {
         didSet { UserDefaults.standard.set(selectedGame.rawValue,forKey:"selectedGame") }
     }
     /// Games that start fullscreen (worker: launch --fullscreen); each is on until turned off.
@@ -477,8 +482,8 @@ final class AppModel {
         if value == .readyToInstall { clientInstalled=false;gameInstalled=false;freeBytes=412_000_000_000 }
         update = .upToDate
         state["onboarding_complete"]=value != .welcome && value != .readyToInstall && value != .installer
-        installedGames=[.cs2]
-        if value == .moveApp { moveReplaces=["MacVolvo Beta"] }
+        installedGames=[.finals]
+        if value == .moveApp { moveReplaces=["MacFinals Beta"] }
         let args=CommandLine.arguments
         if let i=args.firstIndex(of:"--preview-macos"),args.indices.contains(i+1) { macOS=args[i+1] }
         // The launching screen's "Preparing graphics" details: preparing, done, first,
@@ -615,7 +620,7 @@ final class AppModel {
         let launchEvents:[[String:Any]]
         do {
             // macOS Game Mode is on unless support turned it off for a player:
-            // defaults write app.macvolvo.launcher gameMode -bool false
+            // defaults write app.macfinals.launcher gameMode -bool false
             let gameMode=UserDefaults.standard.object(forKey:"gameMode") as? Bool ?? true
             launchEvents=try await service.run("launch",(game.map { ["--game",$0.rawValue,"--fullscreen",fullscreen($0) ? "1" : "0"] } ?? [])+["--metal-hud",metalHUD ? "1" : "0"]+(gameMode ? [] : ["--game-mode","0"]),event:receive)
         } catch {

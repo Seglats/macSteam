@@ -10,7 +10,7 @@ struct DisplayResolution:Hashable {
     static let standard=DisplayResolution(width:1920,height:1200)
     /// Keep the original defaults when upgrading an existing installation.
     static let legacy=Shape.allCases.flatMap { shape in Size.allCases.map { DisplayResolution(shape:shape,size:$0) } }
-    /// Common game sizes, including CS2's competitive 4:3 choices. The menu also
+    /// Common game sizes, including 4:3 choices. The menu also
     /// includes this display's modes and any valid size the player saved.
     static let all:[DisplayResolution]=[
         [640,480],[800,600],[1024,768],[1152,864],[1280,960],[1440,1080],[1600,1200],[1920,1440],
@@ -102,7 +102,7 @@ struct DisplayMode:Equatable {
 struct MainDisplay:Equatable {
     let name:String
     let builtIn:Bool
-    /// The whole screen in points, as Wine sees it at twice the size (Retina mode).
+    /// The whole screen in points, the size Wine sees it at (Retina mode off).
     let points:CGSize
     /// What macOS draws the whole screen at: the points times the backing scale. In a
     /// scaled mode it differs from the screen's own pixels and is resized to fit them.
@@ -157,17 +157,17 @@ struct MainDisplay:Equatable {
     /// The game's window has to fit inside the display as Wine sees it, or the pointer
     /// can't reach all of it. The worker applies the same rule when the game opens.
     func fits(_ resolution:DisplayResolution) -> Bool {
-        CGFloat(resolution.width) <= points.width*2 && CGFloat(resolution.height) <= points.height*2
+        CGFloat(resolution.width) <= points.width && CGFloat(resolution.height) <= points.height
     }
     /// What the game uses on this display: scale oversized choices proportionally
     /// so their aspect ratio and pointer coordinates continue to agree.
     func fitted(_ resolution:DisplayResolution) -> DisplayResolution {
         guard !fits(resolution) else { return resolution }
         guard resolution.isSupported else { return .standard }
-        let scale=min(points.width*2/CGFloat(resolution.width),points.height*2/CGFloat(resolution.height))
+        let scale=min(points.width/CGFloat(resolution.width),points.height/CGFloat(resolution.height))
         let scaled=DisplayResolution(width:Int(floor(CGFloat(resolution.width)*scale)),height:Int(floor(CGFloat(resolution.height)*scale)))
         if scaled.isSupported { return scaled }
-        let fallbackScale=min(1,points.width*2/1920,points.height*2/1200)
+        let fallbackScale=min(1,points.width/1920,points.height/1200)
         let fallback=DisplayResolution(width:Int(floor(1920*fallbackScale)),height:Int(floor(1200*fallbackScale)))
         return fallback.isSupported ? fallback : resolution
     }

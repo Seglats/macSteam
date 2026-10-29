@@ -51,7 +51,7 @@ int main(int argc,const char **argv) {@autoreleasepool {
         subprocess.run(['/usr/bin/clang','-fobjc-arc','-Wall','-Wextra','-Werror',str(path),
                         '-framework','Foundation','-o',str(cls.binary)],check=True,capture_output=True)
         worker = (ROOT/'scripts/portable_setup.m').read_text()
-        decision = worker[worker.index('    BOOL needsOptions=NO;'):worker.index('    if(!configureDeadlockRenderer())')]
+        decision = worker[worker.index('    BOOL needsOptions=NO;'):worker.index('    if(game) {\n        NSDictionary *choice=choices')]
         source = r'''#import <Foundation/Foundation.h>
 static BOOL needsRepair,closed,settled,configured;
 static BOOL steamWindowFixNeeded(void) {return needsRepair;}

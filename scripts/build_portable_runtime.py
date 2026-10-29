@@ -14,6 +14,8 @@ import shutil
 import subprocess
 import tarfile
 
+import rosetta_toolchain
+
 ROOT = Path(__file__).resolve().parents[1]
 SOJU = '3a350b32bf906dd2a509b18c642a5a2676de022a'
 INPUTS = {
@@ -71,12 +73,25 @@ def extract(work, name, prefix=None):
     return destination
 
 
-V1_PATCHES = {
-    'wine-server-registry-save.patch': '8f89556d5daff60c75ae60720ae5125c68021abc244a95df5f6352468323a1a3',
-    'wine-ntdll-syscall-log.patch': 'beac5bba576e36a0971e6581e812817e87f5cb8c41003c2e4edfe0e8f269623a',
-    'wine-win32u-display-log.patch': '1d0dae5d4810becf72bbb79d2259b97683f09481c91617ae543fd510d853aeff',
-    'wine-winemac-activation.patch': 'b96cdde689d00a6e16cab47fb0e5570e31217f6552f8c08f5581ad7f707e7c01',
-}
+# Applied to CrossOver's Wine in this order; names without a folder are in patches/.
+# Edit a patch or add one here to change the runtime; git tracks their contents and the
+# build record lists each one's hash. Soju's comes from the pinned download (PATCHES).
+WINE_PATCHES = [
+    'wine-v1-canvas.patch',
+    # Mouselook with raw mouse input; inert unless the app lists the game in
+    # WINEMAC_MOUSELOOK.
+    'wine-mouselook.patch',
+    'wine-portable-directory-boolean.patch',
+    'soju/ncrypt-persisted-keys.patch',
+    # v1.0: the registry save from a forked server, Unix library loads outside the
+    # virtual-memory lock, the window driver's activation, canvas and pointer fixes.
+    # Their diagnostics (WINESERVER_REGISTRY_LOG, WINE_SYSCALL_LOG, WINE_IO_ERROR_LOG,
+    # WINE_DISPLAY_LOG, WINEMAC_INPUT_STATS) stay off unless set.
+    'wine-server-registry-save.patch',
+    'wine-ntdll-syscall-log.patch',
+    'wine-win32u-display-log.patch',
+    'wine-winemac-activation.patch',
+]
 
 
 def apply_once(source, patch):
@@ -102,36 +117,31 @@ def build(work, tools, headers, jobs):
     ft = extract(work, 'freetype') / 'freetype-2.13.3'
     soju = extract(work, 'soju') / ('soju-' + SOJU)
     mono = extract(work, 'mono') / 'wine-mono-10.4.1'
-    patch = ROOT / 'patches/wine-v1-canvas.patch'
-    if sha(patch) != '33d57c155761838988d98777a7cddb1b2d00417d07b2e19ca9533221aa9b6f65':
-        raise RuntimeError('The accepted native driver patch changed')
-    apply_once(wine, patch)
-    # Mouselook with raw mouse input, accepted after the owner's play-tests on
-    # 2026-09-25 and 2026-09-26. It is inert unless the app lists the game in
-    # WINEMAC_MOUSELOOK.
-    mouselook = ROOT / 'patches/wine-mouselook.patch'
-    if sha(mouselook) != '343f993f1f368500b51ac1fa13ffb3d3cbb3433a15c1b04947153cb1f9858545':
-        raise RuntimeError('The accepted mouselook patch changed')
-    apply_once(wine, mouselook)
-    directory_patch = ROOT / 'patches/wine-portable-directory-boolean.patch'
-    if sha(directory_patch) != '9c7f811b1eb83d8c322d42509a82c1bcd786f101ce1b26fc1dc0c5badebe619b':
-        raise RuntimeError('Portable directory-query compatibility patch changed')
-    apply_once(wine, directory_patch)
-    for name, expected in PATCHES.items():
-        p = soju / 'patches' / name
-        if sha(p) != expected:
-            raise RuntimeError('Upstream compatibility patch changed')
+    # Later patches change lines earlier ones added, so a patched tree can't tell which
+    # patches it holds; this record can. New entries at the end of WINE_PATCHES apply
+    # to the existing tree. Changing or reordering an applied one needs clean source.
+    record_path = wine / '.macfinals-patches.json'
+    recorded = json.loads(record_path.read_text()) if record_path.exists() else []
+    applied = {}
+    for index, name in enumerate(WINE_PATCHES):
+        if name.startswith('soju/'):
+            p = soju / 'patches' / name.removeprefix('soju/')
+            if sha(p) != PATCHES[p.name]:
+                raise RuntimeError('Upstream compatibility patch changed')
+        else:
+            p = ROOT / 'patches' / name
+        applied[name] = sha(p)
+        if index < len(recorded):
+            if recorded[index] != [name, applied[name]]:
+                raise RuntimeError(name + ' differs from the one already applied; delete '
+                                   + str(work / 'sources/wine') + ' to rebuild from clean source')
+            continue
         apply_once(wine, p)
-    # v1.0, after the owner's play-tests of candidates 5-7: the registry save from
-    # a forked server, Unix library loads outside the virtual-memory lock, the
-    # window driver's activation, canvas and pointer fixes. Their diagnostics
-    # (WINESERVER_REGISTRY_LOG, WINE_SYSCALL_LOG, WINE_IO_ERROR_LOG,
-    # WINE_DISPLAY_LOG, WINEMAC_INPUT_STATS) stay off unless set.
-    for name, expected in V1_PATCHES.items():
-        p = ROOT / 'patches' / name
-        if sha(p) != expected:
-            raise RuntimeError('The accepted v1.0 patch changed: ' + name)
-        apply_once(wine, p)
+        recorded.append([name, applied[name]])
+        record_path.write_text(json.dumps(recorded, indent=2) + '\n')
+    if len(recorded) > len(WINE_PATCHES):
+        raise RuntimeError('A patch was removed from WINE_PATCHES; delete '
+                           + str(work / 'sources/wine') + ' to rebuild from clean source')
     # The complete native driver supersedes Soju's native-window patches.
     # Omit its GOG-only Chromium injection (not used by the v6 launcher), which
     # also needs a rebase against CodeWeavers' Ubisoft environment-variable hook.
@@ -142,11 +152,11 @@ def build(work, tools, headers, jobs):
         shutil.copy2(p, deps / 'lib' / p.name, follow_symlinks=True)
     env = os.environ.copy()
     env.pop('DESTDIR', None)
-    # Phase 2 was compiled by the Command Line Tools clang (2100.1.1.101) with
-    # the macOS 26.5 SDK. An Xcode update would otherwise switch /usr/bin/clang
-    # and the SDK under an existing build tree.
-    env['DEVELOPER_DIR'] = '/Library/Developer/CommandLineTools'
-    env['SDKROOT'] = '/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk'
+    # Phase 2 was compiled with the macOS 26.5 SDK; pin it so an Xcode update can't
+    # switch it under an existing build tree. Configure runs under Rosetta, so clang
+    # comes from a developer folder whose xcrun has an Intel slice (rosetta_toolchain.py).
+    env['DEVELOPER_DIR'] = rosetta_toolchain.developer_dir()
+    env['SDKROOT'] = rosetta_toolchain.SDKROOT
     env['PATH'] = ':'.join([str(tools / 'bison/bin'),
                           str(tools / 'llvm-mingw-20251216-ucrt-macos-universal/bin'),
                           '/usr/bin', '/bin', '/usr/sbin', '/sbin'])
@@ -235,10 +245,7 @@ def build(work, tools, headers, jobs):
     installed = work / 'install/usr/local'
     shutil.copytree(mono, installed / 'share/wine/mono/wine-mono-10.4.1', dirs_exist_ok=True)
     record = {'inputs': {n: {'url': v[0], 'sha256': v[1]} for n,v in INPUTS.items()},
-              'wine_patch_sha256': sha(patch), 'mouselook_patch_sha256': sha(mouselook),
-              'soju_compatibility_patches': PATCHES,
-              'directory_boolean_patch_sha256': sha(directory_patch),
-              'v1_patches': V1_PATCHES,
+              'wine_patches': applied,
               'gnutls_header_sha256': sha(headers / 'gnutls/gnutls.h'),
               'minimum_macos': '26.0', 'runtime_scope': 'Wine + FreeType built from source; DXMT assembly is separate',
               'without_vulkan': False, 'without_gstreamer': True, 'with_sdl2': True,

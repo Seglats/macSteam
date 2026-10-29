@@ -3,6 +3,81 @@
 Players don't need any of this. [Download the app](https://github.com/haeli05/MacVolvo/releases)
 instead. This page is for developers who want to rebuild the runtime or the app.
 
+## MacFinals
+
+MacFinals is one app: Apple's D3DMetal (Game Porting Toolkit 4) with DirectX 12
+on, for THE FINALS. The DXMT app build and its CS2/Deadlock settings are gone.
+Its runtime is Wine built from CrossOver 26.3's source with `patches/`, plus
+Apple's evaluation-environment redistributables in place of Wine's Direct3D
+modules. Its data folder is `~/Library/Application Support/MacFinals`;
+rebuilding the app or the runtime never touches it, so Steam and installed
+games stay put.
+
+### One-time setup
+
+- **Apple's files** go in `gptk/gptk` (git-ignored): `redist/` plus `Read Me.rtf`,
+  `License.rtf` and `Acknowledgements.rtf` from *Evaluation environment for Windows
+  games 4.0 beta 3*. The assembler checks they are D3DMetal 4, still Apple-signed, and
+  include the DirectX 12 modules.
+- **Toolchains** go in `runtime/toolchains/`. Wine's `winebuild` splits the compiler
+  command on spaces, so when the checkout's path has spaces make that folder a link to
+  one without (`ln -s ~/MacFinals-build/toolchains runtime/toolchains`):
+  - llvm-mingw 20251216, from
+    `https://github.com/mstorsjo/llvm-mingw/releases/download/20251216/llvm-mingw-20251216-ucrt-macos-universal.tar.xz`
+    (SHA-256 `38bb5e48ec3e0ce95fb901f4efff0bd6ffa966d1b32539a6510af816a959d160`), unpacked
+    as `llvm-mingw-20251216-ucrt-macos-universal/`;
+  - bison 3.8.2 (`https://ftp.gnu.org/gnu/bison/bison-3.8.2.tar.xz`, SHA-256
+    `9bba0214ccf7f1079c5d59210045227bcf619519840ebfa80cd3849cff5a5bf2`) built into
+    `bison/` (`./configure --prefix=<toolchains>/bison && make && make install`);
+    macOS's bison 2.3 is too old.
+- **Xcode**, selected for the app (`sudo xcode-select -s /Applications/Xcode.app`):
+  SwiftUI's macros aren't in the Command Line Tools. Wine's build also needs it: it
+  configures under Rosetta, and macOS 27's Command Line Tools ship `xcrun` without an
+  Intel slice, so `scripts/rosetta_toolchain.py` picks Xcode's. The Command Line Tools'
+  macOS 26.5 SDK stays pinned.
+- pkg-config, make, clang and Rosetta.
+
+### Build
+
+```sh
+W=~/MacFinals-build/phase-2   # autoconf can't build in a path with spaces
+python3 scripts/build_portable_runtime.py --workspace $W --download-only
+python3 scripts/build_portable_dependencies.py --workspace $W --jobs 4
+python3 scripts/build_portable_runtime.py --workspace $W --jobs 4          # Wine; about an hour
+python3 scripts/assemble_portable_runtime.py --workspace $W --identity - \
+  --version macfinals-1                                                   # reads gptk/gptk
+python3 scripts/build_native_app.py --identity - \
+  --runtime-archive $W/artifacts/macfinals-1.tar.gz --output runtime/build/MacFinals-1.app
+```
+
+`build_native_app.py` refuses a runtime without D3DMetal 4 and Apple's
+`d3d12`/`d3d12core` modules, and pins the archive's hash in the bundle's
+`release.json`. Runtime versions and app output paths must be new each time;
+earlier builds are kept. `--identity -` signs ad hoc, for this Mac only.
+
+### Changing the runtime
+
+`WINE_PATCHES` in `scripts/build_portable_runtime.py` lists the Wine patches in
+the order they are applied; the source tree records which it holds
+(`.macfinals-patches.json`). To change Wine, edit the patched source in
+`$W/sources/wine/sources/wine`, save that change as a new patch in `patches/` and
+add it to the end of the list: it is already in the tree, so it is recorded
+without applying again. Changing, reordering or removing a patch that is already
+applied needs clean source: delete `$W/sources/wine` (the next run re-extracts and
+rebuilds everything). Rerunning `build_portable_runtime.py` rebuilds only what
+changed. Then assemble under a new `--version` and build the app with it; the
+app installs the new runtime on its next start and keeps the Wine prefix.
+
+For Swift-only changes, rebuild just the executable inside an existing build:
+
+```sh
+swiftc -O -target arm64-apple-macos26.5 -parse-as-library app/Sources/*.swift \
+  -o runtime/build/MacFinals.app/Contents/MacOS/MacFinals
+codesign --force --sign - runtime/build/MacFinals.app
+```
+
+## Release runtime
+
 The release runtime is built from pinned upstream sources by the portable build
 scripts, then assembled and signed. The Mac app is built with command-line Swift
 tools; no Xcode project is required. The older development-checkout tools in
@@ -120,7 +195,6 @@ checkout with Apple Command Line Tools, clang, make, pkg-config and Python 3.11+
 python3 scripts/build_portable_runtime.py --workspace runtime/phase-2 --download-only
 python3 scripts/build_portable_dependencies.py --workspace runtime/phase-2 --jobs 4
 python3 scripts/build_portable_runtime.py --workspace runtime/phase-2 --jobs 4
-python3 scripts/build_portable_dxmt.py --workspace runtime/phase-2 --jobs 2
 python3 scripts/build_portable_setup.py --output runtime/phase-2/native/ow2-setup
 python3 scripts/assemble_portable_runtime.py --workspace runtime/phase-2
 python3 scripts/build_native_app.py --output runtime/build/MacVolvo.app

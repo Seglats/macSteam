@@ -13,6 +13,8 @@ import shutil
 import subprocess
 import tarfile
 
+import rosetta_toolchain
+
 INPUTS = {
     'pkgconf-2.5.1.tar.xz': ('https://distfiles.dereferenced.org/pkgconf/pkgconf-2.5.1.tar.xz', 'cd05c9589b9f86ecf044c10a2269822bc9eb001eced2582cfffd658b0a50c243'),
     'nettle-3.10.2.tar.gz': ('https://ftp.gnu.org/gnu/nettle/nettle-3.10.2.tar.gz', 'fe9ff51cb1f2abb5e65a6b8c10a92da0ab5ab6eaf26e7fc2b675c45f1fb519b5'),
@@ -61,11 +63,9 @@ def build(work, jobs, only=None):
             t.extractall(gnu, members=[m for m in t.getmembers() if m.name.startswith(('sources/gnutls/gmp/', 'sources/gnutls/nettle/'))], filter='data')
         (gnu / '.extracted').write_text(WINE_SHA)
     env = os.environ.copy(); env.pop('DESTDIR', None)
-    # The toolchain build_portable_runtime.py pins (and the one these libraries were
-    # first built with): Command Line Tools clang and the macOS 26.5 SDK, whatever
-    # xcode-select points at.
-    env.update(DEVELOPER_DIR='/Library/Developer/CommandLineTools',
-               SDKROOT='/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk')
+    # The toolchain build_portable_runtime.py pins: the macOS 26.5 SDK, whatever
+    # xcode-select points at, with a developer folder clang runs from under Rosetta.
+    env.update(DEVELOPER_DIR=rosetta_toolchain.developer_dir(), SDKROOT=rosetta_toolchain.SDKROOT)
     env.update(PATH=str(prefix / 'bin') + ':/usr/bin:/bin:/usr/sbin:/sbin',
                CC='/usr/bin/clang -arch x86_64', CXX='/usr/bin/clang++ -arch x86_64',
                CFLAGS='-O2 -g0 -ffile-prefix-map=' + str(work) + '=/build/overwatch-2-mac',

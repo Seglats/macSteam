@@ -1,7 +1,8 @@
-/* MacVolvo: Steam and Valve's Source 2 games in place of Battle.net and Overwatch.
+/* MacFinals: Steam and DirectX 12 games (THE FINALS) on Apple's D3DMetal, in place of
+ * Battle.net and Overwatch.
  *
  * Games. Each is started through Steam (steam.exe -applaunch <id>) with its own options
- * (space-separated): fullscreen or windowed at the chosen size, no joystick polling (-nojoy).
+ * (space-separated): fullscreen or windowed at the chosen size (Unreal's -ResX/-ResY).
  *
  * Steam's window. On Wine 11 (the engine is CrossOver 26.3) Steam's browser draws black
  * whenever it runs with its GPU off (https://github.com/gauthierpiarrette/highball/issues/282).
@@ -14,16 +15,18 @@
  * the original helper back, so Steam starts with -noverifyfiles once the stand-in is in place.
  *
  * Game Mode. The engine's Wine restarts a program listed in WINE_GAME_MODE from
- * lib/wine/game-mode/<name>.app, a bundle that declares itself a game. The engine ships
+ * lib/wine/game-mode/<exe name>.app, a bundle that declares itself a game. The engine ships
  * Overwatch.app; one per game is made from it, renamed and signed ad hoc with the same
  * entitlements. verifyRuntime leaves those generated bundles out of the manifest check. */
 
+/* exe: the game's process name (Wine's mouselook and Game Mode match it, case-insensitively);
+ * folder/exe also marks the game as installed. */
 typedef struct { NSString *key, *name, *exe, *appID, *folder, *options; } MVGame;
 static const MVGame mvGames[]={
-    {@"cs2",@"Counter-Strike 2",@"cs2.exe",@"730",@"Counter-Strike Global Offensive/game/bin/win64",@"-dx11"},
-    // -dx11: DXMT translates Direct3D 11 only, and Deadlock may otherwise pick Vulkan.
-    // -novid: skips Deadlock's intro video (CS2 has none).
-    {@"deadlock",@"Deadlock",@"deadlock.exe",@"1422450",@"Deadlock/game/bin/win64",@"-dx11 -novid"},
+    // Steam starts Start_Protected_Game.exe (Easy Anti-Cheat), which starts the root
+    // Discovery.exe and then Discovery/Binaries/Win64/Discovery.exe; all but EAC share a name.
+    // -dx12: D3DMetal's Direct3D 12 (macOS 27's Metal 4 path); Unreal must not fall back to 11.
+    {@"finals",@"THE FINALS",@"Discovery.exe",@"2073850",@"The Finals",@"-dx12"},
 };
 static const NSUInteger mvGameCount=sizeof(mvGames)/sizeof(mvGames[0]);
 static const MVGame *mvGame(NSString *key) {
@@ -179,15 +182,15 @@ static NSArray *mvSteamArgumentTokens(NSString *text) {
     }
     return tokens;
 }
-static NSString *mvMergedSteamArguments(NSString *current, NSString *required, BOOL initialFPSCap) {
-    NSArray *tokens=mvSteamArgumentTokens(current);NSMutableArray *kept=[NSMutableArray array];BOOL fps=NO;
-    NSSet *flags=[NSSet setWithArray:@[@"-nojoy",@"-joy",@"-dx11",@"-dx12",@"-dx9",@"-vulkan",@"-opengl",@"-fullscreen",@"-windowed",@"-window",@"-sw"]];
+static NSString *mvMergedSteamArguments(NSString *current, NSString *required) {
+    NSArray *tokens=mvSteamArgumentTokens(current);NSMutableArray *kept=[NSMutableArray array];
+    // Renderer and window flags this app sets: Unreal's (-dx12, -d3d12, -sm6, -ResX=) and
+    // the earlier Source 2 spellings, so an older setup's options don't linger.
+    NSSet *flags=[NSSet setWithArray:@[@"-nojoy",@"-joy",@"-dx11",@"-dx12",@"-d3d11",@"-d3d12",@"-dx9",@"-vulkan",@"-opengl",@"-sm5",@"-sm6",@"-fullscreen",@"-windowed",@"-window",@"-sw",@"-novid"]];
     NSSet *sizes=[NSSet setWithArray:@[@"-w",@"-width",@"-h",@"-height"]];
     for(NSUInteger i=0;i<tokens.count;i++) {
         NSString *word=tokens[i][@"word"];
-        if([word isEqual:@"+fps_max"] || [word hasPrefix:@"+fps_max="])fps=YES;
-        if([flags containsObject:word])continue;
-        if([word isEqual:@"-novid"] && [required containsString:@"-novid"])continue;
+        if([flags containsObject:word] || [word hasPrefix:@"-resx="] || [word hasPrefix:@"-resy="])continue;
         if([sizes containsObject:word]) {
             if(i+1<tokens.count && [tokens[i+1][@"word"] rangeOfCharacterFromSet:NSCharacterSet.decimalDigitCharacterSet.invertedSet].location==NSNotFound)i++;
             continue;
@@ -195,7 +198,6 @@ static NSString *mvMergedSteamArguments(NSString *current, NSString *required, B
         [kept addObject:tokens[i][@"raw"]];
     }
     [kept insertObject:required atIndex:0];
-    if(initialFPSCap && !fps)[kept addObject:@"+fps_max 120"];
     return [kept componentsJoinedByString:@" "];
 }
 static NSDictionary *steamLaunchDefaults(NSDictionary *gameOptions) {
@@ -204,7 +206,7 @@ static NSDictionary *steamLaunchDefaults(NSDictionary *gameOptions) {
         const MVGame *game=&mvGames[i];NSDictionary *options=gameOptions[game->key];
         NSInteger width=[options[@"width"] integerValue],height=[options[@"height"] integerValue];
         if(width<640 || width>16384 || height<480 || height>16384)continue;
-        defaults[game->key]=[NSString stringWithFormat:@"-nojoy %@ -w %ld -h %ld %@",[options[@"fullscreen"] boolValue]?@"-fullscreen":@"-windowed",(long)width,(long)height,game->options];
+        defaults[game->key]=[NSString stringWithFormat:@"%@ -ResX=%ld -ResY=%ld %@",[options[@"fullscreen"] boolValue]?@"-fullscreen":@"-windowed",(long)width,(long)height,game->options];
     }
     return defaults;
 }
@@ -217,7 +219,7 @@ static NSString *mvUpdatedSteamVDF(NSString *text, NSDictionary *defaults) {
         NSArray *appPath=[appsPath arrayByAddingObject:game->appID];text=mvVDFEnsureObject(text,appPath);
         NSDictionary *app=mvVDFPath(mvVDFParse(text),appPath),*option=mvVDFChild(app,@"LaunchOptions");
         if(option && !option[@"value"])mvInvalidSteamConfig();
-        NSString *before=option[@"value"]?:@"",*after=mvMergedSteamArguments(before,required,[game->key isEqual:@"cs2"]);
+        NSString *before=option[@"value"]?:@"",*after=mvMergedSteamArguments(before,required);
         if([before isEqual:after])continue;
         if(option) {NSMutableString *out=[text mutableCopy];[out replaceCharactersInRange:[option[@"valueRange"] rangeValue] withString:mvVDFQuote(after)];text=out;}
         else {
@@ -248,7 +250,7 @@ static BOOL configureSteamLaunchOptions(NSDictionary *defaults) {
     @try {
         NSArray *plan=steamLaunchOptionsPlan(defaults);
         for(NSDictionary *change in plan) {
-            NSString *path=change[@"path"],*backup=[path stringByAppendingString:@".macvolvo-backup"];
+            NSString *path=change[@"path"],*backup=[path stringByAppendingString:@".macfinals-backup"];
             if(![[NSData dataWithContentsOfFile:path] isEqual:change[@"before"]])return NO;
             struct stat st;
             if(!lstat(backup.fileSystemRepresentation,&st)) {
@@ -261,24 +263,6 @@ static BOOL configureSteamLaunchOptions(NSDictionary *defaults) {
         return YES;
     } @catch(NSException *ignored) {(void)ignored;return NO;}
 }
-/* A renderer selected in Deadlock's Video settings is saved here, outside Steam's
- * launch options. Library launches bypass our -dx11 argument, so a saved Vulkan
- * choice would bypass DXMT. Keep those launches on the same supported renderer;
- * preserve the original file and every other field. Call only with games closed. */
-static BOOL configureDeadlockRenderer(void) {
-    NSString *path=join(steamFolder(),@"steamapps/common/Deadlock/game/citadel/cfg/boot.vcfg");
-    NSString *text=[NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:nil];
-    if(!text)return YES;
-    NSRegularExpression *rx=[NSRegularExpression regularExpressionWithPattern:@"(\"DefaultRenderSystemOption\"\\s+\")-vulkan(\")" options:0 error:nil];
-    NSRange whole=NSMakeRange(0,text.length);
-    if([rx numberOfMatchesInString:text options:0 range:whole]!=1)return YES;
-    NSString *backup=[path stringByAppendingString:@".macvolvo-backup"];
-    if(![fm fileExistsAtPath:backup] && ![fm copyItemAtPath:path toPath:backup error:nil])return NO;
-    NSString *fixed=[rx stringByReplacingMatchesInString:text options:0 range:whole withTemplate:@"$1-dx11$2"];
-    if(![fixed writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil])return NO;
-    event(@"game_renderer_configured",@{@"game":@"deadlock",@"renderer":@"dx11"});
-    return YES;
-}
 static NSString *mvProcessName(NSString *name) {
     // Wine may expose either a Windows path or its absolute Unix executable
     // path through ps comm. Keep membership checks independent of that spelling.
@@ -286,7 +270,7 @@ static NSString *mvProcessName(NSString *name) {
 }
 static BOOL isGameProcess(NSString *name) {
     NSString *exe=mvProcessName(name);
-    for(NSUInteger i=0;i<mvGameCount;i++)if([exe isEqual:mvGames[i].exe])return YES;
+    for(NSUInteger i=0;i<mvGameCount;i++)if([exe isEqual:mvGames[i].exe.lowercaseString])return YES;
     return NO;
 }
 /* Every game, for WINEMAC_MOUSELOOK (';') and WINE_GAME_MODE (','). */
@@ -343,18 +327,23 @@ static BOOL steamWindowFix(NSString *engine) {
     return YES;
 }
 
-/* Steam lays itself out at Windows' 96 DPI, which Retina mode shows at half size. Twice
- * that (192) keeps its window Mac-sized with sharp text; the games handle it (DPI aware). */
+/* Steam lays itself out at Windows' DPI. MacVolvo used twice 96 (192) to undo Retina
+ * mode's doubled desktop; with Retina mode off (portable_retina.h) 96 is Mac-sized, and
+ * an install that had 192 is set back. */
 static void configureScaling(NSString *engine) {
-    registryValue(engine,@"HKCU\\Control Panel\\Desktop",@"LogPixels",@"REG_DWORD",@"192",@"scaling.log");
+    registryValue(engine,@"HKCU\\Control Panel\\Desktop",@"LogPixels",@"REG_DWORD",@"96",@"scaling.log");
 }
 
+/* Wine looks for the bundle by the executable's name without ".exe" (Discovery.app). */
+static NSString *gameAppName(const MVGame *game) {
+    return [game->exe.stringByDeletingPathExtension stringByAppendingString:@".app"];
+}
 static void makeGameApps(NSString *engine) {
     NSString *dir=join(engine,@"lib/wine/game-mode"),*source=join(dir,@"Overwatch.app");
     if(![fm fileExistsAtPath:join(source,@"Contents/MacOS/wine")])return;
     NSString *entitlements=join(join(root,@"tmp"),@"game-mode.entitlements");
     for(NSUInteger i=0;i<mvGameCount;i++) {
-        NSString *app=join(dir,[mvGames[i].key stringByAppendingString:@".app"]);
+        NSString *app=join(dir,gameAppName(&mvGames[i]));
         if([fm isExecutableFileAtPath:join(app,@"Contents/MacOS/wine")])continue;
         [fm removeItemAtPath:app error:nil];
         if(![fm copyItemAtPath:source toPath:app error:nil])continue;
@@ -374,7 +363,7 @@ static void makeGameApps(NSString *engine) {
 }
 static BOOL generatedGameApp(NSString *name) {
     for(NSUInteger i=0;i<mvGameCount;i++)
-        if([name hasPrefix:[NSString stringWithFormat:@"lib/wine/game-mode/%@.app",mvGames[i].key]])return YES;
+        if([name hasPrefix:[@"lib/wine/game-mode/" stringByAppendingString:gameAppName(&mvGames[i])]])return YES;
     return NO;
 }
 
@@ -394,7 +383,6 @@ static NSString *gamesProfile(NSString *profile, NSDictionary *gameOptions) {
             NSString *key=[[lines[j] componentsSeparatedByString:@"="][0] stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
             if([key isEqual:@"dxgi.fullscreenCanvasWidth"] && width>=640 && width<=16384)lines[j]=[NSString stringWithFormat:@"%@ = %ld",key,(long)width];
             else if([key isEqual:@"dxgi.fullscreenCanvasHeight"] && height>=480 && height<=16384)lines[j]=[NSString stringWithFormat:@"%@ = %ld",key,(long)height];
-            else if([game->key isEqual:@"cs2"] && [key isEqual:@"d3d11.shaderCompilerThreads"])lines[j]=@"d3d11.shaderCompilerThreads = 4";
         }
         [out appendFormat:@"[%@]%@\n",game->exe,[lines componentsJoinedByString:@"\n"]];
     }

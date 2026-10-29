@@ -40,9 +40,9 @@ int main(int argc,const char **argv) {@autoreleasepool {
             binary=folder/'session'
             subprocess.run(['clang','-fobjc-arc','-framework','Foundation',str(source),'-o',str(binary)],check=True,capture_output=True)
             names=[r'C:\Steam\steam.exe',str(folder/'environment/drive_c/Steam/steam.exe'),
-                   r'C:\Games\CS2.EXE',str(folder/'environment/drive_c/Deadlock/deadlock.exe'),
-                   str(folder/'environment/drive_c/Steam/steam.exe'),r'C:\Other\cs2.exe',
-                   r'C:\Games\notcs2.exe',r'C:\Steam\steam.exe\helper.exe']
+                   r'C:\Games\DISCOVERY.EXE',str(folder/'environment/drive_c/The Finals/Discovery.exe'),
+                   str(folder/'environment/drive_c/Steam/steam.exe'),r'C:\Other\Discovery.exe',
+                   r'C:\Games\notdiscovery.exe',r'C:\Steam\steam.exe\helper.exe']
             mappings={str(101+i):f'n{folder}/engine/lib/wine/winemac.so\nn{folder}/environment/game.dll\n' for i in range(len(names))}
             mappings['105']=f'n{folder}/foreign-engine/winemac.so\nn{folder}/environment/game.dll\n'
             mappings['106']=f'n{folder}/engine/winemac.so\nn{folder}/foreign-prefix/game.dll\n'

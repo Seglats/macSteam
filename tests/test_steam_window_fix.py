@@ -54,6 +54,7 @@ int main(int argc,const char **argv) {@autoreleasepool {
         decision = worker[worker.index('    BOOL needsOptions=NO;'):worker.index('    if(game) {\n        NSDictionary *choice=choices')]
         source = r'''#import <Foundation/Foundation.h>
 static BOOL needsRepair,closed,settled,configured;
+static NSString *wineDebugChannels;
 static BOOL steamWindowFixNeeded(void) {return needsRepair;}
 static BOOL steamLaunchOptionsNeedUpdate(NSDictionary *options,BOOL *needs) {(void)options;*needs=NO;return YES;}
 static NSDictionary *state(void) {return @{@"session_hud":@NO,@"session_game_mode":@YES};}

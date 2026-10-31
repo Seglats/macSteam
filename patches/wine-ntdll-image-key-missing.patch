@@ -1,0 +1,38 @@
+--- a/dlls/ntdll/env.c
++++ b/dlls/ntdll/env.c
+@@ -700,6 +700,7 @@
+         return;
+ 
+     new_params->Environment     = env;
++    new_params->Flags           = params->Flags;
+     new_params->DebugFlags      = params->DebugFlags;
+     new_params->ConsoleHandle   = params->ConsoleHandle;
+     new_params->ConsoleFlags    = params->ConsoleFlags;
+--- a/dlls/ntdll/unix/env.c
++++ b/dlls/ntdll/unix/env.c
+@@ -1707,6 +1707,9 @@
+ }
+ 
+ 
++/* Windows sets this when the image has no Image File Execution Options key */
++#define RTL_USER_PROC_IMAGE_KEY_MISSING 0x4000
++
+ /*************************************************************************
+  *		load_global_options
+  */
+@@ -1744,6 +1747,7 @@
+         peb->HeapDeCommitFreeBlockThreshold = get_dword_option( key, heapdecommitblockW, 0x1000 );
+         NtClose( key );
+     }
++    peb->ProcessParameters->Flags |= RTL_USER_PROC_IMAGE_KEY_MISSING;
+     init_unicode_string( &nameW, optionsW );
+     if (!NtOpenKey( &key, KEY_QUERY_VALUE, &attr ))
+     {
+@@ -1753,6 +1757,7 @@
+         nameW.Length = image->Length - i * sizeof(WCHAR);
+         if (!NtOpenKey( &key, KEY_QUERY_VALUE, &attr ))
+         {
++            peb->ProcessParameters->Flags &= ~RTL_USER_PROC_IMAGE_KEY_MISSING;
+             peb->NtGlobalFlag = get_dword_option( key, globalflagW, peb->NtGlobalFlag );
+             NtClose( key );
+         }

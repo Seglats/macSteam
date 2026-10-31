@@ -55,6 +55,13 @@ python3 scripts/build_native_app.py --identity - \
 `release.json`. Runtime versions and app output paths must be new each time;
 earlier builds are kept. `--identity -` signs ad hoc, for this Mac only.
 
+Ad-hoc signatures change with every build, so firewalls such as Little Snitch ask
+again each time. Sign with a stable certificate instead: create one in Keychain
+Access (Certificate Assistant › Create a Certificate…, Identity Type *Self-Signed
+Root*, Certificate Type *Code Signing*) and pass its name as `--identity` to
+**both** the assembler and the app build. Steam's and the games' network traffic
+comes from the runtime's Wine processes, not the app.
+
 ### Changing the runtime
 
 `WINE_PATCHES` in `scripts/build_portable_runtime.py` lists the Wine patches in

@@ -112,7 +112,7 @@ int main(void) {@autoreleasepool {
         self.assertEqual(env['WINEDLLOVERRIDES'],
                          'd3d11,dxgi,d3d10,d3d12,d3d12core=b;d3d10core,winemetal,nvapi64,nvngx=')
         self.assertEqual(env['D3DM_ENABLE_METALFX'], '0')
-        self.assertEqual(env['MACFINALS_DISPLAY_FIX'], 'Discovery.exe')
+        self.assertNotIn('MACFINALS_DISPLAY_FIX', env)
         self.assertEqual(env['D3DMETAL_FRAMEWORK_PATH'],
                          '/fixture/engine/lib/external/D3DMetal.framework/D3DMetal')
         self.assertNotIn('D3DM_MTL4', env)

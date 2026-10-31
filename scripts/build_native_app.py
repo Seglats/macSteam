@@ -86,7 +86,9 @@ def build(output,workspace,runtime_archive,icon=None,identity=None):
         run('/usr/bin/iconutil','-c','icns',iconset,'-o',resources/'AppIcon.icns')
     (output/'Contents/Info.plist').write_bytes(plistlib.dumps({'CFBundleIdentifier':bundle_id,'CFBundleExecutable':app_name,'CFBundleName':app_name,'CFBundleDisplayName':app_name,'CFBundlePackageType':'APPL','CFBundleShortVersionString':release['appVersion'],'CFBundleVersion':APP_BUILD,'CFBundleIconFile':'AppIcon','LSMinimumSystemVersion':MINIMUM_MACOS,'NSHighResolutionCapable':True,'LSMultipleInstancesProhibited':True,'NSPrincipalClass':'NSApplication','NSMicrophoneUsageDescription':MICROPHONE_USAGE,'NSHumanReadableCopyright':'Independent community project based on MacVolvo and Recall. Not affiliated with or endorsed by Embark Studios, Valve or Apple.'}))
     if identity:
-        timestamp=['--timestamp'] if identity!='-' else []
+        # Apple's timestamp server is for Developer ID releases; ad-hoc and self-signed
+        # identities (a local certificate, so firewalls like Little Snitch keep their rules) skip it.
+        timestamp=['--timestamp'] if identity.startswith('Developer ID') else []
         for binary in (helpers/'ow2-setup',rosetta.parent):
             run('/usr/bin/codesign','--force','--options','runtime',*timestamp,'--sign',identity,binary)
         with tempfile.TemporaryDirectory() as folder:

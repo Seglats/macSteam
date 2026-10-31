@@ -182,8 +182,11 @@ static NSMutableDictionary *wineEnv(NSString *engine) {
     for(NSString *key in env.allKeys)if([key hasPrefix:@"DXMT_"])[env removeObjectForKey:key];
     [env addEntriesFromDictionary:@{@"CX_ACTIVE_GRAPHICS_BACKEND":@"d3dmetal",@"CX_GRAPHICS_BACKEND":@"d3dmetal",
         @"WINEDLLOVERRIDES":@"d3d11,dxgi,d3d10,d3d12,d3d12core=b;d3d10core,winemetal,nvapi64,nvngx=",
-        @"D3DMETAL_FRAMEWORK_PATH":join(engine,@"lib/external/D3DMetal.framework/D3DMetal"),@"D3DM_ENABLE_METALFX":@"0",
-        @"MACFINALS_DISPLAY_FIX":gameList(@",")}];
+        @"D3DMETAL_FRAMEWORK_PATH":join(engine,@"lib/external/D3DMetal.framework/D3DMetal"),@"D3DM_ENABLE_METALFX":@"0"}];
+    // The fullscreen-size fix (gptk4_display_fix.h) hooks window events system-wide and
+    // moves the game's window, which anti-cheat flags like a window tool ("Conflicting
+    // software detected" in THE FINALS). Off unless the worker's environment asks for it.
+    if(NSProcessInfo.processInfo.environment[@"MACFINALS_DISPLAY_FIX"])env[@"MACFINALS_DISPLAY_FIX"]=gameList(@",");
     return env;
 }
 static NSTask *task(NSString *executable, NSArray *args, NSDictionary *env, NSString *logname) {
@@ -475,8 +478,64 @@ static void endSession(NSString *engine) {
  * shaders, the cause of a first match's stutters.
  * macOS Game Mode: WINE_GAME_MODE makes Wine start each game from its game app
  * (lib/wine/game-mode/<game>.app, portable_steam.h). launch --game-mode 0 leaves it out. */
+/* Wine logging for Steam and everything it starts, the game included (launch --wine-debug):
+ * "1" is the set for finding why a game fails to start: every line marked with its process,
+ * thread and time; exceptions; DLL and module loading; process creation; services and the
+ * kernel-driver host (anti-cheat drivers run there); the program's own debug messages;
+ * errors, and functions Wine hasn't implemented (fixme). Anything else is a WINEDEBUG string.
+ * The output goes to Steam's log in logs/. Off (WINEDEBUG=-all) unless asked for. */
+static NSString *wineDebugChannels;
+static NSString *const MVWineDebugDefault=@"+pid,+tid,+timestamp,err+all,fixme+all,+seh,+loaddll,+process,warn+module,+ntoskrnl,+service,+debugstr,+threadname";
+static NSString *debugChannels(NSString *channels, NSString *preset) {
+    if(!channels.length)return nil;
+    if([channels isEqual:@"1"])channels=preset;
+    if(!matches(channels,@"^[A-Za-z0-9_+,.-]{1,512}$"))fail(@"invalid_arguments");
+    return channels;
+}
+static void chooseWineDebug(NSString *channels) {wineDebugChannels=debugChannels(channels,MVWineDebugDefault);}
+/* Game-only logging (launch --game-debug): Play opens Steam as usual, without these channels,
+ * and then starts the game itself with them, so channels too heavy for Steam (every system
+ * call, every registry access) cover only the game and the processes it starts. "1" adds those
+ * two to the --wine-debug set. Log: logs/game-<id>.log. */
+static NSString *gameDebugChannels;
+static NSMutableDictionary *clientEnvironment(NSMutableDictionary *env, BOOL hud, BOOL gameMode);
+static NSString *const MVGameDebugDefault=@"+pid,+tid,+timestamp,err+all,fixme+all,+seh,+loaddll,+process,warn+module,+syscall,+reg,+ntoskrnl,+service,+debugstr,+threadname";
+/* Starts GAME the way Steam does, but from here: its executable in its install folder, with
+ * Steam's launch options and the variables Steam gives the games it starts, so the Steam API
+ * attaches to the running client. Nothing in the game's folder changes. */
+static void startGameDirectly(NSString *engine, const MVGame *game, NSString *options, BOOL hud, BOOL gameMode) {
+    NSMutableDictionary *env=clientEnvironment(wineEnv(engine),hud,gameMode);
+    env[@"WINEDEBUG"]=gameDebugChannels;
+    for(NSString *name in @[@"SteamAppId",@"SteamGameId",@"SteamOverlayGameId"])env[name]=game->appID;
+    env[@"SteamClientLaunch"]=@"1";env[@"SteamEnv"]=@"1";
+    NSString *folder=join(join(steamFolder(),@"steamapps/common"),game->folder);
+    NSString *exe=[NSString stringWithFormat:@"C:\\Program Files (x86)\\Steam\\steamapps\\common\\%@\\%@",
+        [game->folder stringByReplacingOccurrencesOfString:@"/" withString:@"\\"],game->exe];
+    NSMutableArray *args=[@[exe] mutableCopy];
+    for(NSString *word in [options componentsSeparatedByString:@" "])if(word.length)[args addObject:word];
+    NSString *name=[NSString stringWithFormat:@"game-%@.log",NSUUID.UUID.UUIDString],*log=join(join(root,@"logs"),name);
+    [fm createFileAtPath:log contents:nil attributes:@{NSFilePosixPermissions:@0600}];
+    NSFileHandle *out=[NSFileHandle fileHandleForWritingAtPath:log];
+    NSTask *p=[NSTask new];p.executableURL=[NSURL fileURLWithPath:join(engine,@"bin/wine")];p.arguments=args;p.environment=env;
+    p.currentDirectoryURL=[NSURL fileURLWithPath:folder];p.standardOutput=out;p.standardError=out;
+    if(![p launchAndReturnError:nil])fail(@"process_launch_failed");
+    event(@"game_debug_started",@{@"game":game->key,@"log":name,@"pid":@(p.processIdentifier)});
+}
+/* A game started by itself needs a signed-in client: wait for Steam's browser, which starts
+ * once the client is up, then give the sign-in a moment. */
+static void waitForSteamClient(void) {
+    for(int i=0;i<180 && !cancelRequested;i++) {
+        NSString *table=capture(@"/bin/ps",@[@"-axo",@"comm="]);
+        if([table rangeOfString:@"steamwebhelper" options:NSCaseInsensitiveSearch].location!=NSNotFound) {
+            [NSThread sleepForTimeInterval:15];return;
+        }
+        [NSThread sleepForTimeInterval:1];
+    }
+    fail(@"steam_client_not_running");
+}
 static NSMutableDictionary *clientEnvironment(NSMutableDictionary *env, BOOL hud, BOOL gameMode) {
     if(!gameMode)[env removeObjectForKey:@"WINE_GAME_MODE"];
+    if(wineDebugChannels)env[@"WINEDEBUG"]=wineDebugChannels;
     if(hud)[env addEntriesFromDictionary:@{@"MTL_HUD_ENABLED":@"1",@"MTL_HUD_DISABLE_MENU_BAR":@"1",
         @"MTL_HUD_ELEMENTS":@"device,rosetta,layersize,memory,gamemode,fps,gputime,frameinterval,frameintervalgraph,shaders"}];
     return env;
@@ -522,7 +581,8 @@ static void launchClient(BOOL diagnostic, NSString *play, NSString *fullscreen, 
     BOOL needsOptions=NO;
     if(!steamLaunchOptionsNeedUpdate(defaults,&needsOptions))fail(@"steam_launch_options_invalid");
     NSDictionary *s=state();
-    BOOL environmentChanged=![s[@"session_hud"] isEqual:@(hud)] || ![s[@"session_game_mode"] isEqual:@(gameMode)];
+    BOOL environmentChanged=![s[@"session_hud"] isEqual:@(hud)] || ![s[@"session_game_mode"] isEqual:@(gameMode)]
+        || ![(s[@"session_wine_debug"] ?: @"") isEqual:(wineDebugChannels ?: @"")];
     BOOL needsWindowFix=existing.count && steamWindowFixNeeded();
     // Steam owns its children's environment and cached launch options. Reopen an idle
     // client cleanly when those change; never edit a live client's account config.
@@ -546,13 +606,14 @@ static void launchClient(BOOL diagnostic, NSString *play, NSString *fullscreen, 
     if(![config writeToFile:join(root,@"dxmt.conf") atomically:YES encoding:NSUTF8StringEncoding error:nil])fail(@"settings_write_failed");
     makeGameApps(engine);
     NSMutableArray *client=[@[clientPath(),@"-no-cef-sandbox"] mutableCopy];
-    if(game) {
+    if(game && !gameDebugChannels) {
         // The same persisted settings apply to both Library and app launches.
         // Keep the browser behind the game to avoid a startup focus transition.
         [client addObjectsFromArray:@[@"-silent",@"-applaunch",game->appID]];
     }
     if(existing.count) {
         configureVoiceMicrophone(engine,nil,YES,NO);
+        if(game && gameDebugChannels) {startGameDirectly(engine,game,defaults[game->key],hud,gameMode);return;}
         if(game) {
             [client insertObject:@"-noverifyfiles" atIndex:1];
             // This second Steam is only an IPC request to the existing client.
@@ -573,11 +634,14 @@ static void launchClient(BOOL diagnostic, NSString *play, NSString *fullscreen, 
     configureVoiceMicrophone(engine,nil,YES,YES);
     NSMutableDictionary *session=state();
     if(displays)session[@"session_displays"]=displays;
-    session[@"session_hud"]=@(hud);session[@"session_game_mode"]=@(gameMode);writeJSON(session,join(root,@"state.json"));
+    session[@"session_hud"]=@(hud);session[@"session_game_mode"]=@(gameMode);
+    if(wineDebugChannels)session[@"session_wine_debug"]=wineDebugChannels;else [session removeObjectForKey:@"session_wine_debug"];
+    writeJSON(session,join(root,@"state.json"));
     NSDictionary *env=clientEnvironment(diagnostic?diagnosticEnvironment(engine):wineEnv(engine),hud,gameMode);
     NSTask *p=task(join(engine,@"bin/wine"),client,env,[NSString stringWithFormat:@"steam-%@.log",NSUUID.UUID.UUIDString]);
     saveStage(@"battlenet_started");event(@"battlenet_open",@{@"pid":@(p.processIdentifier)});
-    if(game)event(@"game_launch_requested",@{@"game":game->key});
+    if(game && gameDebugChannels) {waitForSteamClient();startGameDirectly(engine,game,defaults[game->key],hud,gameMode);}
+    else if(game)event(@"game_launch_requested",@{@"game":game->key});
 }
 
 /* Settings › Advanced. Steam and the games carry both settings from when they start,
@@ -716,12 +780,18 @@ int main(int argc, const char *argv[]) { @autoreleasepool {
         // --fullscreen 0 starts the game in a window (Fullscreen toggle per game); on by default.
         // --metal-hud 1 shows Apple's Metal Performance HUD over the game (Settings); off by default.
         // --game-mode 0 starts the game without macOS Game Mode (hidden app default); on by default.
+        // --wine-debug 1 (or a WINEDEBUG string) logs Wine for Steam and the game (hidden app default).
+        // --game-debug 1 (or a WINEDEBUG string) starts the game itself with game-only logging.
         else if([command isEqual:@"launch"]) {
+            chooseWineDebug(options[@"wine-debug"]);gameDebugChannels=debugChannels(options[@"game-debug"],MVGameDebugDefault);
             NSString *game=options[@"game"];
             if(!game && [options[@"play"] isEqual:@"1"])game=installedGames().firstObject ?: mvGames[0].key;
             launchClient(NO,game,options[@"fullscreen"],[options[@"metal-hud"] isEqual:@"1"],![options[@"game-mode"] isEqual:@"0"]);
         }
-        else if([command isEqual:@"diagnostic-launch"])launchClient(YES,options[@"game"],options[@"fullscreen"],[options[@"metal-hud"] isEqual:@"1"],![options[@"game-mode"] isEqual:@"0"]);
+        else if([command isEqual:@"diagnostic-launch"]) {
+            chooseWineDebug(options[@"wine-debug"]);
+            launchClient(YES,options[@"game"],options[@"fullscreen"],[options[@"metal-hud"] isEqual:@"1"],![options[@"game-mode"] isEqual:@"0"]);
+        }
         // Support and tests: what a launch with --enabled 0|1 (and --sharpening) sets up for MetalFX
         // upscaling (portable_metalfx.h); --apply 0 only reports.
         else if([command isEqual:@"metalfx"]) {

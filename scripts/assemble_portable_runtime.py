@@ -194,7 +194,9 @@ def assemble(work,version,identity,gptk):
         'com.apple.security.cs.disable-executable-page-protection','com.apple.security.cs.disable-library-validation',
         # 1.3: without it the hardened runtime gives the game silence for the microphone, with no prompt.
         'com.apple.security.device.audio-input']}))
-    timestamp=['--timestamp'] if identity!='-' else []
+    # Apple's timestamp server is for Developer ID releases; ad-hoc and self-signed
+    # identities (a local certificate, so firewalls like Little Snitch keep their rules) skip it.
+    timestamp=['--timestamp'] if identity.startswith('Developer ID') else []
     for index,p in enumerate(sorted(native)):
         args=['codesign','--force','--options','runtime',*timestamp,'--sign',identity]
         if p.name in ('wine','wineserver'):args+=['--entitlements',entitlements]

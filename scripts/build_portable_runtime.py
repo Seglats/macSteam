@@ -91,6 +91,9 @@ WINE_PATCHES = [
     'wine-ntdll-syscall-log.patch',
     'wine-win32u-display-log.patch',
     'wine-winemac-activation.patch',
+    # ProcessParameters.Flags gets RTL_USER_PROC_IMAGE_KEY_MISSING (0x4000) when the
+    # image has no Image File Execution Options key, as Windows and Proton set it.
+    'wine-ntdll-image-key-missing.patch',
 ]
 
 

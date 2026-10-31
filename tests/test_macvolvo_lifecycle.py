@@ -80,10 +80,14 @@ static NSArray *sessionProcesses(void) {
 }
 ''' + tasks + end_session + close_client + r'''
 typedef struct {NSString *key;} FixtureGame;
+static NSString *gameDebugChannels;
+static void startGameDirectly(NSString *engine,FixtureGame *game,NSString *options,BOOL hud,BOOL gameMode) {
+    (void)engine;(void)game;(void)options;(void)hud;(void)gameMode;event(@"game_debug_started",nil);
+}
 static void requestGame(void) {
     NSString *engine=runtime();BOOL hud=NO,gameMode=YES;
     FixtureGame chosen={@"cs2"};FixtureGame *game=&chosen;
-    NSArray *existing=@[@{@"kind":@"client"}];
+    NSArray *existing=@[@{@"kind":@"client"}];NSDictionary *defaults=@{};
     NSMutableArray *client=[@[clientPath(),@"-applaunch",@"730"] mutableCopy];
 ''' + request + r'''
 }

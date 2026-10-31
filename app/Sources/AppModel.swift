@@ -622,7 +622,13 @@ final class AppModel {
             // macOS Game Mode is on unless support turned it off for a player:
             // defaults write app.macfinals.launcher gameMode -bool false
             let gameMode=UserDefaults.standard.object(forKey:"gameMode") as? Bool ?? true
-            launchEvents=try await service.run("launch",(game.map { ["--game",$0.rawValue,"--fullscreen",fullscreen($0) ? "1" : "0"] } ?? [])+["--metal-hud",metalHUD ? "1" : "0"]+(gameMode ? [] : ["--game-mode","0"]),event:receive)
+            // Wine logging for Steam and the game, in Steam's log under logs/; off unless set:
+            // defaults write app.macfinals.launcher wineDebug 1   (or a WINEDEBUG string)
+            let wineDebug=UserDefaults.standard.string(forKey:"wineDebug") ?? ""
+            // Play starts the game itself with logging for the game only, in logs/game-<id>.log:
+            // defaults write app.macfinals.launcher gameDebug 1   (or a WINEDEBUG string)
+            let gameDebug=UserDefaults.standard.string(forKey:"gameDebug") ?? ""
+            launchEvents=try await service.run("launch",(game.map { ["--game",$0.rawValue,"--fullscreen",fullscreen($0) ? "1" : "0"] } ?? [])+["--metal-hud",metalHUD ? "1" : "0"]+(gameMode ? [] : ["--game-mode","0"])+(wineDebug.isEmpty ? [] : ["--wine-debug",wineDebug])+(gameDebug.isEmpty ? [] : ["--game-debug",gameDebug]),event:receive)
         } catch {
             guard stopLaunchWait else { throw error }
             canCancel=false;screen = .ready;notice="Cancelled. Steam wasn’t opened."

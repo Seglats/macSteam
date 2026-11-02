@@ -4,7 +4,9 @@
 Does not copy installed developer runtimes or Windows prefixes. Apple's files come
 from the Game Porting Toolkit 4 evaluation environment (--gptk, the folder holding
 redist/ and its Read Me, License and Acknowledgements), laid over Wine's own
-Direct3D modules after everything else is signed, and remain unmodified.
+Direct3D modules after everything else is signed, and remain unmodified — except
+that the MacFinals d3d12 layer takes d3d12.dll's place, with Apple's original kept
+byte-identical under the d3d12_gptk name (see assemble()).
 """
 import argparse
 import hashlib
@@ -142,7 +144,10 @@ def assemble(work,version,identity,gptk):
             base=Path(dep).name
             if base in available and base!=name:needed.add(base)
     native=[p for p in dest.rglob('*') if macho(p)]
-    strip=ROOT/'runtime/toolchains/llvm-mingw-20251216-ucrt-macos-universal/bin/llvm-strip'
+    # GNU strip from the MinGW-w64 GCC toolchain that builds these modules
+    # (build_portable_runtime.py); the known-good CrossOver-based ntdll.dll was stripped
+    # the same way. i686 modules are plain PE too, so the x86_64 strip handles both.
+    strip=Path('/opt/homebrew/opt/mingw-w64/bin/x86_64-w64-mingw32-strip')
     def strip_debug(p):
         run(strip,'--strip-debug',p,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
     # Managed Mono assemblies are PE too; only strip built Wine modules.
@@ -212,6 +217,29 @@ def assemble(work,version,identity,gptk):
         if p.is_symlink():
             if os.readlink(target)!=os.readlink(p):raise ValueError('Apple link changed: '+str(target))
         elif p.is_file() and sha(target)!=sha(p):raise ValueError('Apple component must remain unmodified: '+str(target))
+    # The MacFinals d3d12 layer in front of Apple's d3d12 (skin-curve fix,
+    # tests/rosetta_nt/R15_SKIN_CURVE.md). Wine resolves builtin modules by the PE's
+    # internal export name, and Apple's d3d12.dll says "d3d12.dll", so any copy of it
+    # that the prefix can open funnels to whichever builtin holds that name. The layer
+    # takes the name; Apple's module moves outside the arch dir (bare lib/wine), where
+    # only Wine's builtin search finds it and prefix bootstrap never copies it over
+    # the placeholder that reserves the d3d12_gptk name in system32:
+    #   lib/wine/x86_64-windows/d3d12.dll       the layer, rewrites unsafe DXIL
+    #   lib/wine/x86_64-windows/d3d12_gptk.dll  placeholder (Wine fake, no exports)
+    #   lib/wine/d3d12_gptk.dll                 Apple's d3d12.dll, unchanged
+    #   lib/wine/d3d12_gptk.so                  -> ../external/libd3dshared.dylib
+    run(ROOT/'d3d12_layer/build.sh',work/'d3d12-layer',work/'wine-build/tools/winebuild/winebuild')
+    apple_d3d12=dest/'lib/wine/x86_64-windows/d3d12.dll'
+    copy(apple_d3d12,dest/'lib/wine/d3d12_gptk.dll')
+    if sha(dest/'lib/wine/d3d12_gptk.dll')!=sha(redist/'wine/x86_64-windows/d3d12.dll'):
+        raise ValueError('Apple d3d12 copy changed')
+    copy(work/'d3d12-layer/d3d12.dll',apple_d3d12)
+    copy(work/'d3d12-layer/d3d12_gptk.dll',dest/'lib/wine/x86_64-windows/d3d12_gptk.dll')
+    (dest/'lib/wine/d3d12_gptk.so').symlink_to('../external/libd3dshared.dylib')
+    for p in (dest/'lib/wine/d3d12_gptk.dll',dest/'lib/wine/x86_64-windows/d3d12.dll',
+              dest/'lib/wine/x86_64-windows/d3d12_gptk.dll'):
+        data=p.read_bytes()
+        if any(value in data for value in private_paths):raise ValueError('Development path remains in payload: '+str(p.relative_to(dest)))
     # 1.1: the game app for macOS Game Mode, a copy of the signed loader (scripts/game_mode_app.py).
     game_mode_app.make(dest,'26.0',identity)
     files={}
@@ -222,6 +250,8 @@ def assemble(work,version,identity,gptk):
         elif p.is_file():files[str(p.relative_to(dest))]={'sha256':sha(p),'bytes':p.stat().st_size}
     manifest={'schema':1,'version':version,'minimum_macos':'26.0','files':files,
               'graphics_backend':'d3dmetal','gptk_version':gptk_version,
+              'd3d12_layer':{'apple_original':'lib/wine/d3d12_gptk.dll',
+                             'replaces':'lib/wine/x86_64-windows/d3d12.dll'},
               'source_builds':{n:json.loads((work/n).read_text()) for n in SOURCE_BUILDS},
               'native_dependency_inputs':chosen,'apple_component_unmodified':True,
               'development_path_scan_passed':True,

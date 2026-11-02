@@ -51,8 +51,38 @@ risk of tuning for the canary is accepted as slim.
   unrecognised Rosetta build deactivates the hook instead of corrupting translation, and
   scoped to `POPF`/`PUSHF`/`IRET` flag handling only.
 
-## Current status (2026-11-01)
+## Current status (2026-11-02)
 
+- **The S12 skin fix (missing arms/limbs) ships as a d3d12 layer since runtime `macfinals-20` /
+  `macfinals-21`.** `d3d12_layer/` sits between the game and GPTK's d3d12.dll (byte-identical,
+  under the `d3d12_gptk` name) and clamps unsafe dynamic array reads in DXIL before D3DMetal
+  translates it — structural construct matching, no shader list, GPTK and game files untouched.
+  Wine resolves builtins by the PE's internal export name, so the real GPTK PE must stay outside
+  `lib/wine/x86_64-windows/` (a placeholder there reserves the name in the prefix); layout and
+  history in `tests/rosetta_nt/R15_SKIN_CURVE.md`. Probe-verified on `macfinals-21`; the in-game
+  check (skins have limbs) is still pending. `MACFINALS_SKIN_FIX=0` disables the rewrite.
+- **Newest runtime `macfinals-31`** (2026-11-02): skin fix (Proton-equivalent constant-buffer
+  rewrite; limbs confirmed back on `macfinals-27`), Wine fix for macOS `IP_RECVTOS` control
+  messages (Steam's TOS assert and its in-game minidumps are gone; that dump could hang the game
+  on first launch), and a diagnostic for threads Wine kills with "nested exception on signal
+  stack". Still inconsistent: main-menu buttons sometimes do not open menus. Test with
+  `RUNTIME=macfinals-31 DEBUG=max tests/finals_bisect/launch_main.sh`. See
+  `tests/rosetta_nt/R16_FIRST_LAUNCH_HANG.md`.
+- **THE FINALS gets past its startup checks on runtime `macfinals-19` / `MacFinals-14.app`.** The
+  real `Discovery.exe` loads `denuvo-anti-cheat-runtime.dll`, D3D12 and EOS. **The E111000D
+  ("Conflicting software detected") cause was the PE toolchain:** Wine's Windows-side modules were
+  built with llvm-mingw (clang + lld). CrossOver builds them with **MinGW-w64 GCC + GNU binutils**,
+  whose PE layout differs (`.edata`/`.xdata`/`.idata`/`.bss`). Swapping only `ntdll.dll` between
+  the two decided pass or fail. Found by bisecting against CrossOver 26.3's own prebuilt Wine in
+  a throwaway setup (`/Users/rasmus/Documents/Kod/Annat/finalsTesting`, never copied back); the
+  steps are in `tests/rosetta_nt/(removed)`. **Never go back to llvm-mingw for PE
+  modules.**
+- **The first launch past the check in a prefix** shows Denuvo's "issue with starting Denuvo
+  Anti-Cheat" (`2:{launcher,10}`). The second launch goes in. Seen on both routes.
+- **Not yet confirmed:** the main menu. The CrossOver-route run reached Embark ID creation and then
+  died of a stack overflow, in a run with heavy `+seh` logging. Test with light or no logging.
+- Full write-up of the fix and what we learned: `tests/rosetta_nt/(removed)`.
+- Earlier status (kept for history):
 - **THE FINALS still stops with E111000D on MacFinals-12 / runtime `macfinals-13`**, confirmed by
   the "Conflicting software detected" dialog and `NtTerminateProcess(-1, e111000d)` in the debug
   log. That is with every Windows code region registered, the NT hook active and TLS at Proton
@@ -112,16 +142,22 @@ risk of tuning for the canary is accepted as slim.
 ## Build
 
 The workspace path must contain no spaces (autoconf), and `DEVELOPER_DIR` must point at
-Xcode or the Swift build fails on SwiftUI macros.
+Xcode or the Swift build fails on SwiftUI macros. Wine's Windows side needs **MinGW-w64 GCC**
+(`brew install mingw-w64`; GCC 16.2.0 / binutils 2.47 when this was written). The build script
+refuses to run without it. The GCC workspace is `~/MacFinals-build-gcc/phase-2`. The older
+`~/MacFinals-build/phase-2` was built with llvm-mingw; its next build reconfigures and rebuilds the
+whole PE side.
 
 ```sh
-W=~/MacFinals-build/phase-2
+W=~/MacFinals-build-gcc/phase-2
 python3 scripts/build_portable_runtime.py --workspace $W --download-only
 python3 scripts/build_portable_dependencies.py --workspace $W --jobs 4
 python3 scripts/build_portable_runtime.py --workspace $W --jobs 4   # Wine; incremental after the first run
 python3 scripts/assemble_portable_runtime.py --workspace $W \
   --identity "MacFinals Signing" --version macfinals-N
 python3 scripts/add_nt_hook.py --workspace $W --base-version macfinals-N --version macfinals-N+1
+# assemble also builds d3d12_layer/ via build.sh (MinGW-w64 GCC + the workspace winebuild);
+# it needs the wine-build tree the source builds produced, so run it after they finish
 DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
   python3 scripts/build_native_app.py --identity "MacFinals Signing" \
   --runtime-archive $W/artifacts/macfinals-N+1.tar.gz --output runtime/build/MacFinals-M.app
@@ -166,6 +202,12 @@ and confirm the runtime in use with `grep active_runtime \
 "$HOME/Library/Application Support/MacFinals/state.json"`. A fresh log file in
 `logs/` is the cheapest proof that new code actually ran. This caught a run on the old build
 again on 2026-11-01. Check the `runtimes/macfinals-N` paths in the log too.
+
+**Never log the game with `warn+heap`, `trace+heap`, `relay` or `snoop`** (so never plain
+`warn+all`; use `warn+all,warn-heap`). Heap warnings make Wine set heap validation flags
+(`dlls/ntdll/heap.c`, `heap_set_debug_flags`) that look exactly like a process started under a
+debugger, and the anti-cheat quits with "disallowed tool" (2026-11-02). `+seh` changed the
+game's behaviour too. `tests/finals_bisect/launch_main.sh DEBUG=max` is the safe maximum.
 
 Steam records each game exit in `drive_c/Program Files (x86)/Steam/logs/gameprocess_log.txt`,
 which is useful when game debug logging was off. E111000D only appears in logs when it is on.

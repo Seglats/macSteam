@@ -28,6 +28,9 @@ INPUTS = {
 PATCHES = {
     'ncrypt-persisted-keys.patch': '6283b3637b1d98bf43f68618c0991ee23e719c8bddaed05eff05e3989c954efe',
 }
+# Homebrew's mingw-w64 (GCC 16.2.0, binutils 2.47 when this was written), the toolchain
+# CrossOver 26.3 builds its Windows modules with. Build machine only.
+MINGW_GCC = Path('/opt/homebrew/opt/mingw-w64/bin')
 
 
 def sha(path):
@@ -122,6 +125,15 @@ WINE_PATCHES = [
     # and treat addresses above the host's address space as taken, which used to end the
     # search with STATUS_NO_MEMORY while free memory remained.
     'wine-macos-host-region-search.patch',
+    # macOS delivers a received datagram's TOS byte as an IP_RECVTOS control message, not
+    # IP_TOS, which Wine dropped ("Unhandled IPPROTO_IP message header type 27"). Steam's
+    # networking then asserts ("No control data returned even though we asked for TOS?")
+    # and writes a minidump from inside THE FINALS, whose thread suspension can hang the game.
+    'wine-socket-recvtos-cmsg.patch',
+    # Diagnostics only: when a thread is killed for "nested exception on signal stack", also
+    # log the exception (code, fault address), the thread's start address and its stacks.
+    # Seen in THE FINALS at usr1_handler's first read of its signal context.
+    'wine-nested-exception-diag.patch',
 ]
 
 
@@ -188,8 +200,14 @@ def build(work, tools, headers, jobs):
     # comes from a developer folder whose xcrun has an Intel slice (rosetta_toolchain.py).
     env['DEVELOPER_DIR'] = rosetta_toolchain.developer_dir()
     env['SDKROOT'] = rosetta_toolchain.SDKROOT
-    env['PATH'] = ':'.join([str(tools / 'bison/bin'),
-                          str(tools / 'llvm-mingw-20251216-ucrt-macos-universal/bin'),
+    # Windows modules are built with MinGW-w64 GCC and GNU binutils, as CrossOver's own
+    # Wine is. THE FINALS rejects (E111000D) an ntdll.dll of the same source built with
+    # llvm-mingw's clang and lld, whose PE layout differs (no .edata/.xdata/.idata);
+    # swapping only that file decides pass or fail. Only the MinGW folder is put on PATH,
+    # so winebuild finds GNU as/ld/ar and nothing else from Homebrew leaks in.
+    if not (MINGW_GCC / 'x86_64-w64-mingw32-gcc').is_file():
+        raise RuntimeError('MinGW-w64 GCC is missing: brew install mingw-w64')
+    env['PATH'] = ':'.join([str(tools / 'bison/bin'), str(MINGW_GCC),
                           '/usr/bin', '/bin', '/usr/sbin', '/sbin'])
     env['MACOSX_DEPLOYMENT_TARGET'] = '26.0'
     flags = '-O2 -g0 -ffile-prefix-map=' + str(work) + '=/build/overwatch-2-mac'
@@ -214,9 +232,13 @@ def build(work, tools, headers, jobs):
     with (logdir / 'wine.log').open('w') as log:
         configuration = builddir / '.portable-configuration'
         # 1.2 adds SDL2 (controllers other than PlayStation ones); an older tree is
-        # configured again so config.h gains SONAME_LIBSDL2.
+        # configured again so config.h gains SONAME_LIBSDL2. MinGW GCC (above) also needs a
+        # new configure; its marker removes everything an LLVM cross build left behind.
         if (not (builddir / 'Makefile').exists() or not configuration.exists()
-                or configuration.read_text() != 'vulkan-sdl2-enabled-v1\n'):
+                or configuration.read_text() != 'vulkan-sdl2-mingw-gcc-v1\n'):
+            for architecture in ('i386-windows', 'x86_64-windows'):
+                for output in builddir.glob('**/' + architecture + '/**/*'):
+                    if output.is_file() and not output.is_symlink(): output.unlink()
             run(['/usr/bin/arch', '-x86_64', wine / 'configure', '--prefix=/usr/local',
                  '--enable-archs=i386,x86_64', '--without-x', '--disable-tests',
                  '--without-gstreamer', '--with-vulkan',
@@ -230,9 +252,10 @@ def build(work, tools, headers, jobs):
                  'SDL2_LIBS=-L' + str(work / 'clean-deps/lib') + ' -lSDL2',
                  'LDFLAGS=-Wl,-headerpad,0x1000 -L' + str(deps / 'lib'), 'CFLAGS=' + flags,
                  'CROSSCFLAGS=' + flags,
+                 'x86_64_CC=x86_64-w64-mingw32-gcc', 'i386_CC=i686-w64-mingw32-gcc',
                  'CC=/usr/bin/clang -arch x86_64', 'CXX=/usr/bin/clang++ -arch x86_64'],
                 cwd=builddir, env=env, stdout=log, stderr=subprocess.STDOUT)
-            configuration.write_text('vulkan-sdl2-enabled-v1\n')
+            configuration.write_text('vulkan-sdl2-mingw-gcc-v1\n')
         config = builddir / 'include/config.h'
         text = config.read_text()
         for required in ('#define HAVE_SYS_INOTIFY_H 1', '#define SONAME_LIBGNUTLS ', '#define SONAME_LIBFREETYPE ',

@@ -1,0 +1,28 @@
+--- a/dlls/ntdll/unix/socket.c
++++ b/dlls/ntdll/unix/socket.c
+@@ -427,8 +427,16 @@
+                     }
+ #endif /* IP_PKTINFO */
+ 
++#if defined(IP_TOS) || defined(IP_RECVTOS)
++#if defined(IP_RECVTOS) && (!defined(IP_TOS) || IP_RECVTOS != IP_TOS)
++                    /* macOS and the BSDs deliver the received TOS byte under the option's
++                     * own name (IP_RECVTOS), Linux under IP_TOS; the payload is one byte
++                     * either way. Windows reports it as IP_TOS. */
++                    case IP_RECVTOS:
++#endif
+ #if defined(IP_TOS)
+                     case IP_TOS:
++#endif
+                     {
+                         INT tos = *(unsigned char *)CMSG_DATA(cmsg_unix);
+                         ptr = fill_control_message( WS_IPPROTO_IP, WS_IP_TOS, ptr, &ctlsize,
+@@ -436,7 +444,7 @@
+                         if (!ptr) goto error;
+                         break;
+                     }
+-#endif /* IP_TOS */
++#endif /* IP_TOS || IP_RECVTOS */
+ 
+ #if defined(IP_TTL)
+                     case IP_TTL:

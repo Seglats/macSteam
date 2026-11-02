@@ -357,7 +357,10 @@ static void makeGameApps(NSString *engine) {
         [info writeToFile:plist atomically:YES];
         if(![fm fileExistsAtPath:entitlements])
             waitTask(task(@"/bin/sh",@[@"-c",@"/usr/bin/codesign -d --entitlements :- \"$1\" > \"$2\"",@"sh",source,entitlements],nil,@"game-mode-sign.log"),30);
-        if(waitTask(task(@"/usr/bin/codesign",@[@"--force",@"--sign",@"-",@"--options",@"runtime",@"--entitlements",entitlements,app],nil,@"game-mode-sign.log"),60))
+        // Ad hoc without --options runtime: the hardened-runtime flag makes dyld
+        // strip DYLD_INSERT_LIBRARIES, which the NT hook rides in on (2026-11-01).
+        // Entitlements (audio input) survive fine on a non-hardened ad-hoc seal.
+        if(waitTask(task(@"/usr/bin/codesign",@[@"--force",@"--sign",@"-",@"--entitlements",entitlements,app],nil,@"game-mode-sign.log"),60))
             [fm removeItemAtPath:app error:nil];
     }
 }

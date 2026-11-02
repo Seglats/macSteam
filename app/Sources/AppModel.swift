@@ -628,7 +628,12 @@ final class AppModel {
             // Play starts the game itself with logging for the game only, in logs/game-<id>.log:
             // defaults write app.macfinals.launcher gameDebug 1   (or a WINEDEBUG string)
             let gameDebug=UserDefaults.standard.string(forKey:"gameDebug") ?? ""
-            launchEvents=try await service.run("launch",(game.map { ["--game",$0.rawValue,"--fullscreen",fullscreen($0) ? "1" : "0"] } ?? [])+["--metal-hud",metalHUD ? "1" : "0"]+(gameMode ? [] : ["--game-mode","0"])+(wineDebug.isEmpty ? [] : ["--wine-debug",wineDebug])+(gameDebug.isEmpty ? [] : ["--game-debug",gameDebug]),event:receive)
+            // Whole-session settings for comparing with other setups; a change reopens Steam:
+            // defaults write app.macfinals.launcher msync 0          (WINEMSYNC off)
+            // defaults write app.macfinals.launcher advertiseAVX 0   (Rosetta's own default)
+            let msync=UserDefaults.standard.string(forKey:"msync") ?? ""
+            let advertiseAVX=UserDefaults.standard.string(forKey:"advertiseAVX") ?? ""
+            launchEvents=try await service.run("launch",(game.map { ["--game",$0.rawValue,"--fullscreen",fullscreen($0) ? "1" : "0"] } ?? [])+["--metal-hud",metalHUD ? "1" : "0"]+(gameMode ? [] : ["--game-mode","0"])+(wineDebug.isEmpty ? [] : ["--wine-debug",wineDebug])+(gameDebug.isEmpty ? [] : ["--game-debug",gameDebug])+(msync.isEmpty ? [] : ["--msync",msync])+(advertiseAVX.isEmpty ? [] : ["--advertise-avx",advertiseAVX]),event:receive)
         } catch {
             guard stopLaunchWait else { throw error }
             canCancel=false;screen = .ready;notice="Cancelled. Steam wasn’t opened."

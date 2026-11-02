@@ -102,24 +102,63 @@ def format_macos(value):
 
 def minimum_field(read):
     """(offset, version) of the minimum-macOS field of a 64-bit Mach-O, or None for any other
-    file. READ(n) returns the next n bytes of the file from its start."""
+    file. READ(n) returns the next n bytes of the file from its start. Universal files report
+    their strictest slice, at that slice's field offset in the fat file."""
     header = read(32)
-    if header[:4] == b'\xca\xfe\xba\xbe' and int.from_bytes(header[4:8], 'big') < 20:
-        raise ValueError('Universal Mach-O files are not supported')
+    if header[:4] in (b'\xca\xfe\xba\xbe', b'\xca\xfe\xba\xbf'):
+        count = int.from_bytes(header[4:8], 'big')
+        if count >= 20:
+            return None  # same class of file the old guard rejected: not a Mach-O we know
+        data = header
+        while chunk := read(1 << 20):
+            data += chunk
+        strictest = None
+        for i in range(count):
+            entry = data[8 + i * 20:8 + (i + 1) * 20]  # cputype, cpusubtype, offset, size, align
+            slice_offset = int.from_bytes(entry[8:12], 'big')
+            found = _thin_minimum(lambda start, length, o=slice_offset: data[o + start:o + start + length], slice_offset)
+            if strictest is None or found[1] > strictest[1]:
+                strictest = found
+        return strictest
     if header[:4] in (b'\xce\xfa\xed\xfe', b'\xfe\xed\xfa\xce', b'\xfe\xed\xfa\xcf'):
         raise ValueError('Only 64-bit little-endian Mach-O files are supported')
     if header[:4] != b'\xcf\xfa\xed\xfe':
         return None
-    commands = header + read(int.from_bytes(header[20:24], 'little'))
+    buffered = _Rereadable(read, header)
+    return _thin_minimum(buffered.pread, 0)
+
+
+class _Rereadable:
+    """Buffers a sequential READ(n) stream so _thin_minimum can fetch by file offset.
+    HEADER holds the bytes minimum_field has already read from the stream's start."""
+    def __init__(self, read, header=b''):
+        self.read, self.buffer, self.done = read, header, False
+    def pread(self, start, length):
+        while len(self.buffer) < start + length and not self.done:
+            chunk = self.read(1 << 20)
+            if not chunk:
+                self.done = True
+            else:
+                self.buffer += chunk
+        return self.buffer[start:start + length]
+
+
+def _thin_minimum(fetch, base):
+    """minimum_field's thin-Mach-O half; FETCH(start, length) returns bytes at that offset
+    of the slice, BASE is the slice's offset in the enclosing file."""
+    header = fetch(0, 32)
+    if header[:4] != b'\xcf\xfa\xed\xfe':
+        raise ValueError('Only 64-bit little-endian Mach-O slices are supported')
+    commands = fetch(0, 32 + int.from_bytes(header[20:24], 'little'))
     offset = 32
     for _ in range(int.from_bytes(header[16:20], 'little')):
         cmd, size = (int.from_bytes(commands[offset + i:offset + i + 4], 'little') for i in (0, 4))
         if cmd == LC_BUILD_VERSION:  # cmd, cmdsize, platform, minos, sdk, ntools
             if int.from_bytes(commands[offset + 8:offset + 12], 'little') != PLATFORM_MACOS:
                 raise ValueError('Mach-O file built for another platform')
-            return offset + 12, int.from_bytes(commands[offset + 12:offset + 16], 'little')
+            return base + offset + 12, int.from_bytes(commands[offset + 12:offset + 16], 'little')
         if cmd == LC_VERSION_MIN_MACOSX:  # cmd, cmdsize, version, sdk
-            return offset + 8, int.from_bytes(commands[offset + 8:offset + 12], 'little')
+            return base + offset + 8, int.from_bytes(commands[offset + 8:offset + 12], 'little')
         offset += size
     raise ValueError('Mach-O file without a minimum macOS')
 

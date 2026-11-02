@@ -94,6 +94,34 @@ WINE_PATCHES = [
     # ProcessParameters.Flags gets RTL_USER_PROC_IMAGE_KEY_MISSING (0x4000) when the
     # image has no Image File Execution Options key, as Windows and Proton set it.
     'wine-ntdll-image-key-missing.patch',
+    # The real GS base sits on the TEB while Windows code runs and on macOS thread
+    # data while Unix code runs (dispatchers, signal handlers, user callbacks), so
+    # every gs-relative access from Windows code sees the TEB, like on Linux.
+    # Also skips CW HACK 18756 for marked threads (fast TlsAlloc slots back).
+    # Rosetta-only, and MACFINALS_NO_GS_TEB disables it.
+    'wine-macos-gsbase-teb-switch.patch',
+    # Follow-up: the loader.c marker moves from TEB Instrumentation[1] (which
+    # D3D12-loaded code dereferences as a pointer) into SYSTEM_DLL_INIT_BLOCK,
+    # Wine's existing Unix-to-PE channel, filled by the Unix loader.
+    'wine-macos-gsbase-loader-marker.patch',
+    # All Windows executable memory (VirtualAlloc, VirtualProtect, section views, images
+    # mapped by hand) is registered with GPTK's register_non_native_code_region, as CW HACK
+    # 22434 does for PE modules, so Rosetta gives that code TEB semantics through %gs.
+    # Rosetta-only, and MACFINALS_NO_EXEC_REGIONS disables it. The GS-base switch above
+    # crashes with D3DMetal, so it becomes opt-in (MACFINALS_GS_TEB).
+    'wine-macos-register-exec-regions.patch',
+    # With every Windows code region registered, gs-relative TLS reads see the TEB, so CW
+    # HACK 18756 is skipped and the first TlsAlloc returns 2 as on Windows, not 65.
+    'wine-macos-exec-regions-tls.patch',
+    # GPTK's region table silently ignores anything past 1024 entries, repeats included.
+    # Reserved Windows address space is registered whole and once; elsewhere whole views,
+    # once each, with an ERR if the table fills.
+    'wine-macos-exec-region-budget.patch',
+    # Address searches past host mappings Wine has no view for: skip each mapping instead of
+    # stepping through it 64 KB at a time under the virtual-memory lock (over 1 s measured),
+    # and treat addresses above the host's address space as taken, which used to end the
+    # search with STATUS_NO_MEMORY while free memory remained.
+    'wine-macos-host-region-search.patch',
 ]
 
 

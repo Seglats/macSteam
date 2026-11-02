@@ -1,0 +1,28 @@
+--- a/dlls/ntdll/unix/loader.c
++++ b/dlls/ntdll/unix/loader.c
+@@ -1727,6 +1727,13 @@
+     }
+     else
+         TRACE( "Loading libd3dshared.dylib failed: %s\n", dlerror() );
++}
++
++/* Whether all Windows code runs in registered regions, so gs-relative reads see the TEB. */
++BOOL mac_exec_regions_active(void)
++{
++    pthread_once( &non_native_init_once, &init_non_native_support );
++    return mac_exec_regions_enabled;
+ }
+ 
+ /***********************************************************************
+@@ -2316,8 +2323,9 @@
+     else *p__wine_unix_call_dispatcher = __wine_unix_call_dispatcher;
+ #if defined(__x86_64__) && defined(__APPLE__)
+     /* signal_init_process() has already run, so this reflects the final
+-     * state of mac_gsbase_switching; loader.c skips CW HACK 18756 for it. */
+-    pLdrSystemDllInitBlock->mac_gsbase_teb = mac_gsbase_switching;
++     * state of mac_gsbase_switching; loader.c skips CW HACK 18756 for it,
++     * and for registered code regions, which see the TEB through %gs too. */
++    pLdrSystemDllInitBlock->mac_gsbase_teb = mac_gsbase_switching || mac_exec_regions_active();
+ #endif
+ #undef GET_FUNC
+ }

@@ -57,7 +57,11 @@ static BOOL needsRepair,closed,settled,configured;
 static NSString *wineDebugChannels;
 static BOOL steamWindowFixNeeded(void) {return needsRepair;}
 static BOOL steamLaunchOptionsNeedUpdate(NSDictionary *options,BOOL *needs) {(void)options;*needs=NO;return YES;}
-static NSDictionary *state(void) {return @{@"session_hud":@NO,@"session_game_mode":@YES};}
+static NSString *msyncChoice,*advertiseAVXChoice;
+static NSString *root=@"/fixture";
+static NSString *join(NSString *a,NSString *b) {return [a stringByAppendingPathComponent:b];}
+static void writeJSON(id value,NSString *path) {(void)value;(void)path;}
+static NSMutableDictionary *state(void) {return [@{@"session_hud":@NO,@"session_game_mode":@YES} mutableCopy];}
 static void fail(NSString *code) {(void)code;abort();}
 static void event(NSString *stage,id details) {(void)stage;(void)details;}
 static void closeClient(NSString *guard) {(void)guard;closed=YES;}

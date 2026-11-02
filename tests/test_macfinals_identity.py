@@ -28,6 +28,12 @@ static NSString *root=@"/fixture";
 static NSFileManager *fm;
 static NSString *join(NSString *a,NSString *b) {return [a stringByAppendingPathComponent:b];}
 static NSString *gameList(NSString *separator) {return [@[@"Discovery.exe"] componentsJoinedByString:separator];}
+static NSMutableDictionary *state(void) {
+    NSMutableDictionary *s=[NSMutableDictionary dictionary];
+    if(getenv("FIXTURE_MSYNC"))s[@"session_msync"]=@(getenv("FIXTURE_MSYNC"));
+    if(getenv("FIXTURE_AVX"))s[@"session_advertise_avx"]=@(getenv("FIXTURE_AVX"));
+    return s;
+}
 ''' + env + r'''
 int main(void) {@autoreleasepool {
     fm=NSFileManager.defaultManager;
@@ -56,6 +62,7 @@ int main(void) {@autoreleasepool {
                         '-I', str(ROOT / 'scripts'), str(env_path), '-framework',
                         'Foundation', '-o', str(profile)], check=True, capture_output=True)
         cls.profile = json.loads(subprocess.check_output([str(profile)]))
+        cls.profile_binary = profile
         cls.brand = folder / 'brand'
         result=subprocess.run(['swiftc', '-parse-as-library', '-target', 'arm64-apple-macos26.5',
                         str(ROOT / 'app/Sources/Brand.swift'),
@@ -121,6 +128,16 @@ int main(void) {@autoreleasepool {
                            ('WINEPREFIX', '/fixture/environment'), ('WINEMAC_MOUSELOOK', 'Discovery.exe'),
                            ('WINE_GAME_MODE', 'Discovery.exe'), ('WEBHELPER_EXTRA_ARGS', '--use-angle=vulkan')):
             self.assertEqual(env[key], value, key)
+
+    def test_session_settings_change_only_what_was_chosen(self):
+        env = json.loads(subprocess.check_output([str(self.profile_binary)],
+                                                 env={'FIXTURE_MSYNC': '0'}))
+        self.assertNotIn('WINEMSYNC', env)
+        self.assertEqual(env['ROSETTA_ADVERTISE_AVX'], '1')
+        env = json.loads(subprocess.check_output([str(self.profile_binary)],
+                                                 env={'FIXTURE_AVX': '0'}))
+        self.assertEqual(env['WINEMSYNC'], '1')
+        self.assertEqual(env['ROSETTA_ADVERTISE_AVX'], '0')
 
 
 if __name__ == '__main__':

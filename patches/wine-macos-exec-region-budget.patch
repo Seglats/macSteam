@@ -1,0 +1,196 @@
+--- a/dlls/ntdll/unix/loader.c
++++ b/dlls/ntdll/unix/loader.c
+@@ -1729,24 +1729,61 @@
+         TRACE( "Loading libd3dshared.dylib failed: %s\n", dlerror() );
+ }
+ 
+-/* Whether all Windows code runs in registered regions, so gs-relative reads see the TEB. */
+-BOOL mac_exec_regions_active(void)
++/* Whether all Windows code runs in registered regions, so gs-relative reads see the TEB.
++ * Called once, before any Windows code runs. */
++BOOL mac_exec_regions_start(void)
+ {
+     pthread_once( &non_native_init_once, &init_non_native_support );
++    if (mac_exec_regions_enabled) virtual_mac_register_reserved_areas();
+     return mac_exec_regions_enabled;
+ }
+ 
+ /***********************************************************************
+  *           mac_register_exec_region
+  *
+- * Register Windows executable memory that did not come through the PE loader.
++ * Register Windows executable memory, once per range.  libd3dshared has no unregister, and
++ * its table silently ignores anything past 1024 entries (measured), repeats included.  So
++ * ranges inside one already registered cost nothing, which also makes this cheap on
++ * protection changes: the reserved areas take the first entries and cover most memory.
+  * virtual_mutex must not be held: the first call may dlopen, and libd3dshared's locking
+- * is unknown.  There is no unregister; registering a range again is harmless.
++ * is unknown.
+  */
+ void mac_register_exec_region( void *start, void *end )
+ {
++    static struct { char *start, *end; } regions[1024];
++    static pthread_mutex_t regions_mutex = PTHREAD_MUTEX_INITIALIZER;
++    static LONG count;
++    static BOOL full;
++    sigset_t sigset;
++    LONG i, seen;
++    BOOL add;
++
+     pthread_once( &non_native_init_once, &init_non_native_support );
+-    if (mac_exec_regions_enabled)
++    if (!mac_exec_regions_enabled) return;
++
++    seen = ReadAcquire( &count );
++    for (i = 0; i < seen; i++)
++        if (regions[i].start <= (char *)start && (char *)end <= regions[i].end) return;
++
++    server_enter_uninterrupted_section( &regions_mutex, &sigset );
++    for (i = seen; i < count; i++)
++        if (regions[i].start <= (char *)start && (char *)end <= regions[i].end) break;
++    add = i == count && count < ARRAY_SIZE(regions);
++    if (add)
++    {
++        regions[count].start = start;
++        regions[count].end = end;
++        WriteRelease( &count, count + 1 );
++    }
++    else if (i == count && !full)
++    {
++        full = TRUE;
++        ERR( "non-native code region table full (%u), %p-%p and later ranges get macOS %%gs\n",
++             (unsigned int)ARRAY_SIZE(regions), start, end );
++    }
++    server_leave_uninterrupted_section( &regions_mutex, &sigset );
++
++    if (add)
+     {
+         TRACE( "Marking non_native_code_region: %p-%p\n", start, end );
+         register_non_native_code_region( start, end );
+@@ -1758,7 +1795,8 @@
+     struct pe_module_loaded_params *params = args;
+ 
+     pthread_once( &non_native_init_once, &init_non_native_support );
+-    if ((supports_non_native_code_regions && supports_non_native_code_regions()))
++    if (mac_exec_regions_enabled) mac_register_exec_region( params->start, params->end );
++    else if ((supports_non_native_code_regions && supports_non_native_code_regions()))
+     {
+         TRACE( "Marking non_native_code_region: %p-%p\n", params->start, params->end );
+         register_non_native_code_region( params->start, params->end );
+@@ -2275,6 +2313,7 @@
+ /* unix/signal_x86_64.c: set when the GS base switches between the TEB and
+  * macOS thread data at every Windows/Unix transition. */
+ extern int mac_gsbase_switching;
++extern BOOL mac_exec_regions_start(void);
+ #endif
+ 
+ /***********************************************************************
+@@ -2325,7 +2364,7 @@
+     /* signal_init_process() has already run, so this reflects the final
+      * state of mac_gsbase_switching; loader.c skips CW HACK 18756 for it,
+      * and for registered code regions, which see the TEB through %gs too. */
+-    pLdrSystemDllInitBlock->mac_gsbase_teb = mac_gsbase_switching || mac_exec_regions_active();
++    pLdrSystemDllInitBlock->mac_gsbase_teb = mac_gsbase_switching || mac_exec_regions_start();
+ #endif
+ #undef GET_FUNC
+ }
+--- a/dlls/ntdll/unix/virtual.c
++++ b/dlls/ntdll/unix/virtual.c
+@@ -2045,6 +2045,30 @@
+     }
+     return TRUE;
+ }
++
++/***********************************************************************
++ *           virtual_mac_register_reserved_areas
++ *
++ * Register the reserved areas whole: only Windows memory lands in them, and they stay
++ * reserved when it is freed, so native code can never appear there.
++ */
++void virtual_mac_register_reserved_areas(void)
++{
++    struct reserved_area *area;
++    struct { void *start, *end; } ranges[16];
++    unsigned int i, count = 0;
++    sigset_t sigset;
++
++    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
++    LIST_FOR_EACH_ENTRY( area, &reserved_areas, struct reserved_area, entry )
++    {
++        if (count == ARRAY_SIZE(ranges)) break;
++        ranges[count].start = area->base;
++        ranges[count++].end = (char *)area->base + area->size;
++    }
++    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
++    for (i = 0; i < count; i++) mac_register_exec_region( ranges[i].start, ranges[i].end );
++}
+ #endif
+ 
+ 
+@@ -5285,7 +5309,7 @@
+     SIZE_T size = *size_ptr;
+     NTSTATUS status = STATUS_SUCCESS;
+ #if defined(__APPLE__) && defined(__x86_64__)
+-    BOOL register_exec = FALSE;
++    char *exec_start = NULL, *exec_end = NULL;
+ #endif
+ 
+     /* Round parameters to a page boundary */
+@@ -5385,13 +5409,16 @@
+     if (!status) VIRTUAL_DEBUG_DUMP_VIEW( view );
+ 
+ #if defined(__APPLE__) && defined(__x86_64__)
+-    if (!status && (protect & PAGE_EXECUTE_ANY) && !(type & MEM_RESET))
+-        register_exec = is_mac_exec_region_view( view );
++    if (!status && (protect & PAGE_EXECUTE_ANY) && !(type & MEM_RESET) && is_mac_exec_region_view( view ))
++    {
++        exec_start = view->base;
++        exec_end = (char *)view->base + view->size;
++    }
+ #endif
+     server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+ 
+ #if defined(__APPLE__) && defined(__x86_64__)
+-    if (register_exec) mac_register_exec_region( base, (char *)base + size );
++    if (exec_start) mac_register_exec_region( exec_start, exec_end );
+ #endif
+     if (status == STATUS_SUCCESS)
+     {
+@@ -5711,7 +5738,7 @@
+     LPVOID addr = *addr_ptr;
+     DWORD old;
+ #if defined(__APPLE__) && defined(__x86_64__)
+-    BOOL register_exec = FALSE;
++    char *exec_start = NULL, *exec_end = NULL;
+ #endif
+ 
+     TRACE("%p %p %08lx %08x\n", process, addr, size, new_prot );
+@@ -5775,12 +5802,16 @@
+     if (!status) VIRTUAL_DEBUG_DUMP_VIEW( view );
+ 
+ #if defined(__APPLE__) && defined(__x86_64__)
+-    if (!status && (new_prot & PAGE_EXECUTE_ANY)) register_exec = is_mac_exec_region_view( view );
++    if (!status && (new_prot & PAGE_EXECUTE_ANY) && is_mac_exec_region_view( view ))
++    {
++        exec_start = view->base;
++        exec_end = (char *)view->base + view->size;
++    }
+ #endif
+     server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+ 
+ #if defined(__APPLE__) && defined(__x86_64__)
+-    if (register_exec) mac_register_exec_region( base, (char *)base + size );
++    if (exec_start) mac_register_exec_region( exec_start, exec_end );
+ #endif
+     if (status == STATUS_SUCCESS)
+     {
+--- a/dlls/ntdll/unix/unix_private.h
++++ b/dlls/ntdll/unix/unix_private.h
+@@ -281,6 +281,7 @@
+ extern void virtual_init(void);
+ #if defined(__APPLE__) && defined(__x86_64__)
+ extern void mac_register_exec_region( void *start, void *end );
++extern void virtual_mac_register_reserved_areas(void);
+ #endif
+ extern ULONG_PTR get_system_affinity_mask(void);
+ extern void virtual_get_system_info( SYSTEM_BASIC_INFORMATION *info, BOOL wow64 );

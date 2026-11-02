@@ -183,10 +183,40 @@ static NSMutableDictionary *wineEnv(NSString *engine) {
     [env addEntriesFromDictionary:@{@"CX_ACTIVE_GRAPHICS_BACKEND":@"d3dmetal",@"CX_GRAPHICS_BACKEND":@"d3dmetal",
         @"WINEDLLOVERRIDES":@"d3d11,dxgi,d3d10,d3d12,d3d12core=b;d3d10core,winemetal,nvapi64,nvngx=",
         @"D3DMETAL_FRAMEWORK_PATH":join(engine,@"lib/external/D3DMetal.framework/D3DMetal"),@"D3DM_ENABLE_METALFX":@"0"}];
+    // Whole-session settings (launch --msync, --advertise-avx). Every Wine process of a session
+    // has to agree on MSync, or it exits, so they come from state.json, not from one command.
+    NSDictionary *chosen=state();
+    if([chosen[@"session_msync"] isEqual:@"0"])[env removeObjectForKey:@"WINEMSYNC"];
+    if([chosen[@"session_advertise_avx"] isEqual:@"0"])env[@"ROSETTA_ADVERTISE_AVX"]=@"0";
     // The fullscreen-size fix (gptk4_display_fix.h) hooks window events system-wide and
     // moves the game's window, which anti-cheat flags like a window tool ("Conflicting
     // software detected" in THE FINALS). Off unless the worker's environment asks for it.
     if(NSProcessInfo.processInfo.environment[@"MACFINALS_DISPLAY_FIX"])env[@"MACFINALS_DISPLAY_FIX"]=gameList(@",");
+    // In-process Rosetta NT correction (tests/rosetta_nt/hooklib.c). When a hook
+    // dylib is present it is inserted into every translated process of the
+    // session — Steam, its children, the game — via DYLD_INSERT_LIBRARIES; the
+    // dylib itself is universal and no-ops in native children, and Apple's own
+    // binaries never load it (dyld strips DYLD_* for platform binaries).
+    // Resolution order: MACFINALS_NT_HOOK in the worker's own environment
+    // (explicit path, or "0" to force off), then the runtime-internal copy at
+    // lib/macfinals-nt-hook.dylib, which is how the app's plain Play button
+    // gets the hook without any extra configuration. DISABLE_AOT rides along:
+    // the dylib refuses to install without it, because cached AOT translations
+    // bypass the hook and would leave a process half-fixed. Needs the runtime's
+    // wine-side executables signed without the hardened-runtime flag, or dyld
+    // strips the insertion there too (verified 2026-11-01).
+    {
+        NSString *ntHook=NSProcessInfo.processInfo.environment[@"MACFINALS_NT_HOOK"];
+        if(!ntHook.length) {
+            NSString *bundled=join(engine,@"lib/macfinals-nt-hook.dylib");
+            if([fm fileExistsAtPath:bundled]) ntHook=bundled;
+        }
+        if([ntHook isEqualToString:@"0"]) ntHook=nil;
+        if(ntHook.length && [fm fileExistsAtPath:ntHook]) {
+            env[@"DYLD_INSERT_LIBRARIES"]=ntHook;
+            env[@"DISABLE_AOT"]=@"1";
+        }
+    }
     return env;
 }
 static NSTask *task(NSString *executable, NSArray *args, NSDictionary *env, NSString *logname) {
@@ -487,7 +517,7 @@ static void endSession(NSString *engine) {
 static NSString *wineDebugChannels;
 static NSString *const MVWineDebugDefault=@"+pid,+tid,+timestamp,err+all,fixme+all,+seh,+loaddll,+process,warn+module,+ntoskrnl,+service,+debugstr,+threadname";
 static NSString *debugChannels(NSString *channels, NSString *preset) {
-    if(!channels.length)return nil;
+    if(!channels.length || [channels isEqual:@"0"])return nil;
     if([channels isEqual:@"1"])channels=preset;
     if(!matches(channels,@"^[A-Za-z0-9_+,.-]{1,512}$"))fail(@"invalid_arguments");
     return channels;
@@ -498,6 +528,12 @@ static void chooseWineDebug(NSString *channels) {wineDebugChannels=debugChannels
  * call, every registry access) cover only the game and the processes it starts. "1" adds those
  * two to the --wine-debug set. Log: logs/game-<id>.log. */
 static NSString *gameDebugChannels;
+/* launch --msync 0 and --advertise-avx 0: off for the whole session; absent or 1 is the default. */
+static NSString *msyncChoice,*advertiseAVXChoice;
+static NSString *sessionChoice(NSString *value) {
+    if(value && ![value isEqual:@"0"] && ![value isEqual:@"1"])fail(@"invalid_arguments");
+    return [value isEqual:@"0"]?value:nil;
+}
 static NSMutableDictionary *clientEnvironment(NSMutableDictionary *env, BOOL hud, BOOL gameMode);
 static NSString *const MVGameDebugDefault=@"+pid,+tid,+timestamp,err+all,fixme+all,+seh,+loaddll,+process,warn+module,+syscall,+reg,+ntoskrnl,+service,+debugstr,+threadname";
 /* Starts GAME the way Steam does, but from here: its executable in its install folder, with
@@ -582,7 +618,9 @@ static void launchClient(BOOL diagnostic, NSString *play, NSString *fullscreen, 
     if(!steamLaunchOptionsNeedUpdate(defaults,&needsOptions))fail(@"steam_launch_options_invalid");
     NSDictionary *s=state();
     BOOL environmentChanged=![s[@"session_hud"] isEqual:@(hud)] || ![s[@"session_game_mode"] isEqual:@(gameMode)]
-        || ![(s[@"session_wine_debug"] ?: @"") isEqual:(wineDebugChannels ?: @"")];
+        || ![(s[@"session_wine_debug"] ?: @"") isEqual:(wineDebugChannels ?: @"")]
+        || ![(s[@"session_msync"] ?: @"") isEqual:(msyncChoice ?: @"")]
+        || ![(s[@"session_advertise_avx"] ?: @"") isEqual:(advertiseAVXChoice ?: @"")];
     BOOL needsWindowFix=existing.count && steamWindowFixNeeded();
     // Steam owns its children's environment and cached launch options. Reopen an idle
     // client cleanly when those change; never edit a live client's account config.
@@ -591,7 +629,12 @@ static void launchClient(BOOL diagnostic, NSString *play, NSString *fullscreen, 
         closeClient(@"close_game_before_maintenance");existing=@[];
     }
     if(!existing.count) {
+        // Ends the old session with the settings it was started with, then takes the new ones.
         endSession(engine);
+        NSMutableDictionary *chosen=state();
+        if(msyncChoice)chosen[@"session_msync"]=msyncChoice;else [chosen removeObjectForKey:@"session_msync"];
+        if(advertiseAVXChoice)chosen[@"session_advertise_avx"]=advertiseAVXChoice;else [chosen removeObjectForKey:@"session_advertise_avx"];
+        writeJSON(chosen,join(root,@"state.json"));
         if(!configureSteamLaunchOptions(defaults))fail(@"steam_launch_options_write_failed");
     }
     if(game) {
@@ -782,8 +825,10 @@ int main(int argc, const char *argv[]) { @autoreleasepool {
         // --game-mode 0 starts the game without macOS Game Mode (hidden app default); on by default.
         // --wine-debug 1 (or a WINEDEBUG string) logs Wine for Steam and the game (hidden app default).
         // --game-debug 1 (or a WINEDEBUG string) starts the game itself with game-only logging.
+        // --msync 0 and --advertise-avx 0 change those settings for the whole session (hidden app defaults).
         else if([command isEqual:@"launch"]) {
             chooseWineDebug(options[@"wine-debug"]);gameDebugChannels=debugChannels(options[@"game-debug"],MVGameDebugDefault);
+            msyncChoice=sessionChoice(options[@"msync"]);advertiseAVXChoice=sessionChoice(options[@"advertise-avx"]);
             NSString *game=options[@"game"];
             if(!game && [options[@"play"] isEqual:@"1"])game=installedGames().firstObject ?: mvGames[0].key;
             launchClient(NO,game,options[@"fullscreen"],[options[@"metal-hud"] isEqual:@"1"],![options[@"game-mode"] isEqual:@"0"]);

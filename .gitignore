@@ -17,3 +17,14 @@
 **/*.p8
 **/*.p12
 **/*.mobileprovision
+/gptk/
+# Local Claude Code settings and session transcripts
+/.claude/
+/context.txt
+# r13 Rosetta NT build outputs (sources are tracked; hooklib.dylib is a build input
+# for scripts/add_nt_hook.py and stays tracked)
+/tests/rosetta_nt/*.o
+/tests/rosetta_nt/exectest
+/tests/rosetta_nt/ntstub
+/tests/rosetta_nt/host_payload_test
+/tests/rosetta_nt/payload.dylib

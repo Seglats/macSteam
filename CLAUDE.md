@@ -51,12 +51,38 @@ risk of tuning for the canary is accepted as slim.
   unrecognised Rosetta build deactivates the hook instead of corrupting translation, and
   scoped to `POPF`/`PUSHF`/`IRET` flag handling only.
 
-## Current status (2026-10-29)
+## Current status (2026-11-01)
 
-- **The blocker is the NT (nested task) EFLAGS bit.** Rosetta does not model it: `POPF`
-  never sets it, so exception contexts carry 0 and `IRETQ` with NT set does not fault.
-  Reproducible with no Wine involved at all by a plain x86-64 macOS binary.
-- **Wine cannot fix it, and Wine is not at fault** — tested on both targets, not assumed.
+- **THE FINALS still stops with E111000D on MacFinals-12 / runtime `macfinals-13`**, confirmed by
+  the "Conflicting software detected" dialog and `NtTerminateProcess(-1, e111000d)` in the debug
+  log. That is with every Windows code region registered, the NT hook active and TLS at Proton
+  parity. **So `%gs` was not the only blocker, and possibly not a blocker at all. Do not keep
+  chasing it.** Crab Champions, the DX12 canary, still works and Steam still works, so the patches
+  did not break the runtime. Details: `tests/rosetta_nt/R13_NEXT_SESSION.md`.
+- **Current work and latest results: `tests/rosetta_nt/(removed)`.** Newest build is
+  MacFinals-13 / `macfinals-17`, which fixes the hook losing NT after a literal `0` or `0x202` in
+  guest code (`nt_patterns_probe`). Steam and Crab Champions work on it; THE FINALS still stops with
+  E111000D. Open questions: `tests/rosetta_nt/(removed)`. Measured differences from
+  Proton beyond CPUID identity and CS/SS are tabled there, and fixing any outside
+  `POPF`/`PUSHF`/`IRET` is Rasmus's decision.
+- **Rebuild the hook with the commands in `tests/rosetta_nt/NOTES.md` and stop on failure.** A failed
+  payload build leaves the old `payload_blob.h`, and `hooklib.dylib` then silently embeds it.
+- **NT handled by the in-process Rosetta hook** (`tests/rosetta_nt/`, shipped as
+  `lib/macfinals-nt-hook.dylib`). `macfinals-probe` passes 4/4 inside Wine, and pushf/popf are
+  fixed inside the game process, yet the game still fails, so NT is not the whole story.
+- **`%gs` is now truthful for Windows code by registering regions, not by moving the GS base.**
+  GPTK's `register_non_native_code_region` gives a region TEB semantics under Rosetta; it needs
+  `CX_APPLEGPTK_LIBD3DSHARED_PATH`, which the app sets, so **always set it when probing**. The
+  GS-base switch crashes every D3D12 process because GPTK calls macOS code directly from Windows
+  threads, so it is opt-in (`MACFINALS_GS_TEB`). `MACFINALS_NO_EXEC_REGIONS=1` turns registration
+  off, which also brings CW HACK 18756 back.
+- **GPTK's region table holds 1024 entries and silently ignores the rest, repeats included.** All
+  registration must go through `mac_register_exec_region`, which dedupes. The loader's reserved
+  areas take 2 entries and cover most memory. Look for `non-native code region table full` in logs.
+- **NT background: Rosetta does not model the bit.** `POPF` never sets it, so exception contexts
+  carry 0 and `IRETQ` with NT set does not fault. Reproducible with no Wine involved at all by a
+  plain x86-64 macOS binary.
+- **Wine cannot fix NT, and Wine is not at fault** — tested on both targets, not assumed.
   Proton on a real x86-64 CPU passes all four NT checks with the same wine-11.0 code, so
   Wine carries the flag correctly. Do not repeat the earlier mistaken claim that Wine's
   three `andq $~0x4000` sites in `dlls/ntdll/unix/signal_x86_64.c` suppress NT: they only
@@ -95,10 +121,16 @@ python3 scripts/build_portable_dependencies.py --workspace $W --jobs 4
 python3 scripts/build_portable_runtime.py --workspace $W --jobs 4   # Wine; incremental after the first run
 python3 scripts/assemble_portable_runtime.py --workspace $W \
   --identity "MacFinals Signing" --version macfinals-N
+python3 scripts/add_nt_hook.py --workspace $W --base-version macfinals-N --version macfinals-N+1
 DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
   python3 scripts/build_native_app.py --identity "MacFinals Signing" \
-  --runtime-archive $W/artifacts/macfinals-N.tar.gz --output runtime/build/MacFinals-N.app
+  --runtime-archive $W/artifacts/macfinals-N+1.tar.gz --output runtime/build/MacFinals-M.app
 ```
+
+`N+1` means the next free number, written out, and `M` is the next free app number. **Do not
+skip `add_nt_hook.py`.** An assembled runtime has no hook and signs the Wine executables with
+the hardened runtime, which makes dyld strip the insertion, so the app would silently ship
+without the NT fix. It adds `tests/rosetta_nt/hooklib.dylib` and re-signs those executables ad hoc.
 
 Runtime versions and app output paths must be new each time; existing ones are never
 overwritten. An interrupted run leaves a partial artifact directory or `.app` shell that
@@ -132,7 +164,11 @@ ps -axo pid,lstart,command | grep 'MacFinals-[0-9].app'
 
 and confirm the runtime in use with `grep active_runtime \
 "$HOME/Library/Application Support/MacFinals/state.json"`. A fresh log file in
-`logs/` is the cheapest proof that new code actually ran.
+`logs/` is the cheapest proof that new code actually ran. This caught a run on the old build
+again on 2026-11-01. Check the `runtimes/macfinals-N` paths in the log too.
+
+Steam records each game exit in `drive_c/Program Files (x86)/Steam/logs/gameprocess_log.txt`,
+which is useful when game debug logging was off. E111000D only appears in logs when it is on.
 
 ## Tests
 
@@ -162,6 +198,10 @@ are the Mac's own clang lacking Windows headers and can be ignored.
 wrong-typed or invalid handle. MacFinals and Proton return identical tables, so Wine's rule
 (wrong type → `c0000024`, not a handle → `c0000008`) is upstream Wine's, not ours. Only a
 real Windows run can say where Windows draws the line.
+
+`tests/windows_probe/exec_region_probe.c` checks `%gs` and TLS at scale: hand-mapped images,
+free and re-allocate, 100k protection flips, 20k regions. `capacity N` finds where regions stop
+working. Short probes cannot see the region table limit; this one can.
 
 ## The Proton reference machine
 

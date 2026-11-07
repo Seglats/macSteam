@@ -133,6 +133,19 @@ The DMG opens as a fixed Finder window with the app, an Applications shortcut
 and a background drawn by `scripts/dmg_background.swift`. dmgbuild writes that
 layout without scripting Finder; `--plain` skips it.
 
+Runtime `macvolvo-1.2-dev.1` (development build, not Developer ID signed) is Recall
+1.6.2's release runtime `phase2-20261028.2` (archive SHA-256 `28c3270b…8655d8899`) with
+only the Mac driver replaced. Earlier MacVolvo runtimes were Recall's `phase2-20261014.1`
+re-signed. Recall 1.6.2's runtime already carries builds of the ntdll, win32u,
+`wine-audio-devices` and `wine-service-security` patches in `patches/`. `winemac.so` was
+compiled in a CrossOver 26.3 build tree with `wine-v1-canvas.patch`, `wine-mouselook.patch`
+and `wine-winemac-activation.patch` applied in that order. It was packaged like
+`build_wine_native.py` (stripped, rpaths `@loader_path` and `@loader_path/../..`) and put
+in place with `derive_runtime.replace_files` (re-stamped to macOS 15.0, ad-hoc signed with
+the hardened runtime). The `--native` chain check was skipped because the manifests of the
+base's ancestors aren't available. Before release, re-sign it with `scripts/sign_runtime.py`
+and a Developer ID.
+
 Runtime `phase2-20261007.3` is `phase2-20261007.2` with DXMT built with
 `patches/dxmt-metalfx-upscaling.patch` for MetalFX upscaling (`scripts/build_portable_dxmt.py`,
 then `scripts/derive_runtime.py --metalfx <DXMT workspace>`): DXMT's five files are

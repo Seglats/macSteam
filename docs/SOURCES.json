@@ -44,15 +44,23 @@
     },
     {
      "patch": "patches/wine-ntdll-syscall-log.patch",
-     "sha256": "beac5bba576e36a0971e6581e812817e87f5cb8c41003c2e4edfe0e8f269623a"
+     "sha256": "6954daf1e96013d2508920b2999b2532e135541838958d04bb0baccab25b78a1"
     },
     {
      "patch": "patches/wine-win32u-display-log.patch",
-     "sha256": "1d0dae5d4810becf72bbb79d2259b97683f09481c91617ae543fd510d853aeff"
+     "sha256": "2387fa06d76891b7b5981473bb06b3b939e2c7569f79b6e3a7cbf12c21297568"
     },
     {
      "patch": "patches/wine-winemac-activation.patch",
-     "sha256": "b96cdde689d00a6e16cab47fb0e5570e31217f6552f8c08f5581ad7f707e7c01"
+     "sha256": "c4f3a4a26aa24ee8a6ae544162bc818175908effc2e44af025d285afb86a664e"
+    },
+    {
+     "patch": "patches/wine-audio-devices.patch",
+     "sha256": "a75446af346c92362afb277cdc8d8a542629c02ad7d7512c7aaa60a42956d225"
+    },
+    {
+     "patch": "patches/wine-service-security.patch",
+     "sha256": "964f3162bc2272861e29f020fe88fded9f508587b9836ae1feebb638366a6d25"
     }
    ],
    "v1_patches_apply_after": "patches/wine-portable-directory-boolean.patch and Soju's ncrypt-persisted-keys.patch"
@@ -152,15 +160,23 @@
   },
   {
    "path": "patches/wine-ntdll-syscall-log.patch",
-   "sha256": "beac5bba576e36a0971e6581e812817e87f5cb8c41003c2e4edfe0e8f269623a"
+   "sha256": "6954daf1e96013d2508920b2999b2532e135541838958d04bb0baccab25b78a1"
   },
   {
    "path": "patches/wine-win32u-display-log.patch",
-   "sha256": "1d0dae5d4810becf72bbb79d2259b97683f09481c91617ae543fd510d853aeff"
+   "sha256": "2387fa06d76891b7b5981473bb06b3b939e2c7569f79b6e3a7cbf12c21297568"
   },
   {
    "path": "patches/wine-winemac-activation.patch",
-   "sha256": "b96cdde689d00a6e16cab47fb0e5570e31217f6552f8c08f5581ad7f707e7c01"
+   "sha256": "c4f3a4a26aa24ee8a6ae544162bc818175908effc2e44af025d285afb86a664e"
+  },
+  {
+   "path": "patches/wine-audio-devices.patch",
+   "sha256": "a75446af346c92362afb277cdc8d8a542629c02ad7d7512c7aaa60a42956d225"
+  },
+  {
+   "path": "patches/wine-service-security.patch",
+   "sha256": "964f3162bc2272861e29f020fe88fded9f508587b9836ae1feebb638366a6d25"
   }
  ]
 }

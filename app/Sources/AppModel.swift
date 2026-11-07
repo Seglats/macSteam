@@ -55,6 +55,32 @@ final class AppModel {
     var metalHUD=UserDefaults.standard.bool(forKey:"metalHUD") {
         didSet { UserDefaults.standard.set(metalHUD,forKey:"metalHUD") }
     }
+    /// How the game gets the mouse (Settings › General › Mouse; worker: launch --mouse; ported from
+    /// Recall 1.6). Standard is the window driver's "precise" input: buttons come from GCMouse in
+    /// order with its motion. Classic is Recall 1.4's clicks and timing. High-precision reads the
+    /// mouse's own reports through IOHID and needs Input Monitoring (InputMonitoring); without it
+    /// Standard's input stays. Steam carries it from when it opens, like the HUD.
+    enum MouseInput:String, CaseIterable { case standard, classic, highPrecision="high-precision" }
+    var mouseInput=MouseInput(rawValue:UserDefaults.standard.string(forKey:"mouseInput") ?? "") ?? .standard {
+        didSet { UserDefaults.standard.set(mouseInput.rawValue,forKey:"mouseInput") }
+    }
+    /// At most how many times a second the game is sent the mouse's movement (worker: launch
+    /// --mouse-rate). The window driver adds up what comes in between, so none is lost, only later.
+    /// Every report unless the player lowers it. Standard and High-precision only.
+    enum MouseRate:String, CaseIterable {
+        case all, perSecond2000="2000", perSecond1000="1000", perSecond500="500", perSecond250="250"
+        /// The slider's stops, fewest first; All at the right end.
+        static var stops:[MouseRate] { allCases.reversed() }
+        var perSecond:Int? { Int(rawValue) }
+    }
+    var mouseRate=MouseRate(rawValue:UserDefaults.standard.string(forKey:"mouseRate") ?? "") ?? .all {
+        didSet { UserDefaults.standard.set(mouseRate.rawValue,forKey:"mouseRate") }
+    }
+    /// Chooses High-precision and, the first time, shows macOS's Input Monitoring prompt.
+    func turnOnHighPrecision() {
+        mouseInput = .highPrecision
+        if InputMonitoring.access == .undecided { InputMonitoring.ask() }
+    }
     enum Running { case client, game }
     /// What runs now, as Settings last checked; nil when neither Steam nor a game does.
     var running: Running?
@@ -617,7 +643,8 @@ final class AppModel {
             // macOS Game Mode is on unless support turned it off for a player:
             // defaults write app.macvolvo.launcher gameMode -bool false
             let gameMode=UserDefaults.standard.object(forKey:"gameMode") as? Bool ?? true
-            launchEvents=try await service.run("launch",(game.map { ["--game",$0.rawValue,"--fullscreen",fullscreen($0) ? "1" : "0"] } ?? [])+["--metal-hud",metalHUD ? "1" : "0"]+(gameMode ? [] : ["--game-mode","0"]),event:receive)
+            launchEvents=try await service.run("launch",(game.map { ["--game",$0.rawValue,"--fullscreen",fullscreen($0) ? "1" : "0"] } ?? [])+["--metal-hud",metalHUD ? "1" : "0"]+(gameMode ? [] : ["--game-mode","0"]) +
+                ["--mouse",mouseInput.rawValue,"--mouse-rate",mouseRate.rawValue],event:receive)
         } catch {
             guard stopLaunchWait else { throw error }
             canCancel=false;screen = .ready;notice="Cancelled. Steam wasn’t opened."

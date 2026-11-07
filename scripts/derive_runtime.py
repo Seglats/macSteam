@@ -50,6 +50,22 @@ and makes the game app again from that loader; unsigned, every file stays byte-i
 in that workspace (MetalFX upscaling: dxmt-metalfx-upscaling.patch), replaces Wine's d3d12.dll
 with DXMT's stand-in and adds DXMT's signed DLSS stand-in (nvngx.dll), its NVAPI stand-in
 (nvapi64.dll) and NVAPI's MIT license. Launches disable all three unless upscaling is on.
+
+--shader-pack DXMT_WORKSPACE (1.4) replaces the base's winemetal.so with the build_portable_dxmt.py
+build in that workspace (dxmt-shader-pack.patch: the shader pack holds every learned pipeline).
+The patch changes only the pipeline cache, which only winemetal.so contains, so DXMT's other files
+stay as the base ships them.
+
+--audio (1.6) replaces Wine's mmdevapi.dll and Mac sound driver (winecoreaudio.so) with their
+build_wine_native.py builds (wine-audio-devices.patch): audio devices connected or removed while a
+program runs, and changes of the Mac's default devices, reach it as on Windows. Later builds of
+the same patch replace them with --native mmdevapi,winecoreaudio.
+
+--services (1.6) replaces Wine's service manager (services.exe) and its client sechost.dll, in both
+architectures, with their build_wine_native.py builds (wine-service-security.patch): a service keeps
+the security descriptor programs give it, Windows' default until then, and a program path given with
+forward slashes reads back with backslashes, so Battle.net's update agent stops reinstalling itself
+on every other start. Later builds go through --native services,sechost,sechost32.
 """
 import argparse
 import hashlib
@@ -216,6 +232,8 @@ def check_driver(path):
 def tree(root):
     entries = {}
     for p in sorted(root.rglob('*')):
+        if p.name == '.DS_Store':
+            continue  # Finder writes these into open folders at any time; archives never hold them
         key = str(p.relative_to(root))
         if p.is_symlink():
             entries[key] = ('link', os.readlink(p))
@@ -329,6 +347,12 @@ def derive(base_version, version, identity):
 NATIVE = ROOT / 'runtime/build/wine-native'
 NATIVE_FILES = {'wineserver': 'bin/wineserver', 'ntdll': 'lib/wine/x86_64-unix/ntdll.so',
                 'win32u': 'lib/wine/x86_64-unix/win32u.so', 'winemac': 'lib/wine/x86_64-unix/winemac.so'}
+# 1.6: one experiment, two files; not among the v1.0 components that --components replaces.
+AUDIO_FILES = {'mmdevapi': 'lib/wine/x86_64-windows/mmdevapi.dll', 'winecoreaudio': 'lib/wine/x86_64-unix/winecoreaudio.so'}
+# 1.6 (REC-39): the service manager and both architectures of its client, one experiment.
+SERVICE_FILES = {'services': 'lib/wine/x86_64-windows/services.exe', 'sechost': 'lib/wine/x86_64-windows/sechost.dll',
+                 'sechost32': 'lib/wine/i386-windows/sechost.dll'}
+EXPERIMENT_FILES = {**AUDIO_FILES, **SERVICE_FILES}
 DXMT_FILES = {'lib/wine/x86_64-windows/d3d11.dll': 'x86_64-windows/d3d11.dll',
               'lib/wine/x86_64-windows/dxgi.dll': 'x86_64-windows/dxgi.dll',
               'lib/wine/x86_64-windows/d3d10core.dll': 'x86_64-windows/d3d10core.dll',
@@ -698,9 +722,9 @@ def derive_native(base_version, version, identity, components, game_mode=False):
         raise ValueError('The base artifact names a different version')
     sources, replaced = {}, {}
     for component in components:
-        if component not in NATIVE_FILES:
+        if component not in {**NATIVE_FILES, **EXPERIMENT_FILES}:
             raise ValueError('Unknown native component: ' + component)
-        relative = NATIVE_FILES[component]
+        relative = {**NATIVE_FILES, **EXPERIMENT_FILES}[component]
         build = json.loads((NATIVE / component / 'current/manifest.json').read_text())
         built = NATIVE / component / 'current' / Path(relative).name
         if build['sha256'] != sha(built) or build['patch_sha256'] != sha(ROOT / build['patch']):
@@ -714,6 +738,49 @@ def derive_native(base_version, version, identity, components, game_mode=False):
         replaced[relative] = {'build_sha256': build['sha256'], 'built_by': f'scripts/build_wine_native.py {component}',
                               'patch': build['patch'], 'patch_sha256': build['patch_sha256']}
     replace_files(base, dest, base_version, version, identity, manifest, sources, replaced, game_mode)
+
+
+def derive_audio(base_version, version, identity):
+    """1.6: mmdevapi.dll and winecoreaudio.so from build_wine_native.py replace the base's, so audio
+    devices that come and go while a program runs reach it; built from the base's own files."""
+    derive_experiment(base_version, version, identity, AUDIO_FILES)
+
+
+def derive_services(base_version, version, identity):
+    """1.6: services.exe and sechost.dll (both architectures) from build_wine_native.py replace the
+    base's, so services keep their security descriptors and programs read back their program
+    paths in Windows' form (Battle.net's update agent no longer reinstalls itself)."""
+    derive_experiment(base_version, version, identity, SERVICE_FILES)
+
+
+def derive_experiment(base_version, version, identity, files):
+    """The first derivation with these build_wine_native.py components, all built from one patch
+    against the base's own files; later builds of the patch replace them with --native."""
+    if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,63}', version):
+        raise ValueError('Invalid runtime version')
+    base, dest = ARTIFACTS / base_version, ARTIFACTS / version
+    if dest.exists() or Path(str(dest) + '.tar.gz').exists():
+        raise ValueError('Use a new version; existing artifact is never overwritten')
+    manifest = json.loads((base / 'runtime.json').read_text())
+    if manifest['version'] != base_version:
+        raise ValueError('The base artifact names a different version')
+    sources, replaced, patches = {}, {}, set()
+    for component, relative in files.items():
+        build = json.loads((NATIVE / component / 'current/manifest.json').read_text())
+        built = NATIVE / component / 'current' / Path(relative).name
+        if build['sha256'] != sha(built) or build['patch_sha256'] != sha(ROOT / build['patch']):
+            raise ValueError(f'Rebuild {component}: its build manifest does not match the file or the patch')
+        if chain_replacement(base_version, relative):
+            raise ValueError(f'{base_version} already replaces {relative}; use --native {component}')
+        if build['base_sha256'] != chain_original(base_version, relative, build['patch']):
+            raise ValueError(f'{component} was built against a different base runtime')
+        patches.add((build['patch'], build['patch_sha256']))
+        sources[relative] = built
+        replaced[relative] = {'build_sha256': build['sha256'], 'built_by': f'scripts/build_wine_native.py {component}',
+                              'patch': build['patch'], 'patch_sha256': build['patch_sha256']}
+    if len(patches) != 1:
+        raise ValueError(', '.join(files) + ' were built from different patches: rebuild them all')
+    replace_files(base, dest, base_version, version, identity, manifest, sources, replaced)
 
 
 WINEBUS = 'lib/wine/x86_64-unix/winebus.so'
@@ -816,6 +883,40 @@ def derive_metalfx(base_version, version, identity, dxmt_workspace):
         replace_files(base, dest, base_version, version, identity, manifest, sources, replaced, additions=additions)
     if sha(dest / METALFX_NVNGX) != proof['files'][METALFX_ADDED[METALFX_NVNGX]] or not sign_pe.check(dest / METALFX_NVNGX):
         raise ValueError('nvngx.dll changed on its way into the runtime')
+
+
+# The shader pack (1.4): every learned pipeline is prepared, in batches, with no limit on the
+# pack's size (pipeline_cache.c, which only winemetal.so contains).
+SHADER_PACK_PATCHES = {**DXMT_PATCHES, 'patches/dxmt-shader-pack.patch': 'shader_pack_patch_sha256'}
+SHADER_PACK_REPLACED = {'lib/wine/x86_64-unix/winemetal.so': 'x86_64-unix/winemetal.so'}
+
+
+def derive_shader_pack(base_version, version, identity, dxmt_workspace):
+    """1.4: the shader pack. The DXMT build with the shader pack patch on top of the MetalFX
+    build's patches gives the base a new winemetal.so, packaged as the assembler packages DXMT's
+    and signed; every other file stays byte-identical."""
+    if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,63}', version):
+        raise ValueError('Invalid runtime version')
+    base, dest = ARTIFACTS / base_version, ARTIFACTS / version
+    if dest.exists() or Path(str(dest) + '.tar.gz').exists():
+        raise ValueError('Use a new version; existing artifact is never overwritten')
+    manifest = json.loads((base / 'runtime.json').read_text())
+    if manifest['version'] != base_version:
+        raise ValueError('The base artifact names a different version')
+    proof = json.loads((dxmt_workspace / 'dxmt-build-proof.json').read_text())
+    install = dxmt_workspace / 'dxmt-install'
+    for patch, key in SHADER_PACK_PATCHES.items():
+        if proof.get(key) != sha(ROOT / patch):
+            raise ValueError(f'Rebuild DXMT: {patch} changed since the build')
+    record = {'built_by': 'scripts/build_portable_dxmt.py',
+              'patches': {patch: proof[key] for patch, key in SHADER_PACK_PATCHES.items()}}
+    sources, replaced = {}, {}
+    for relative, built in SHADER_PACK_REPLACED.items():
+        if proof['files'].get(built) != sha(install / built):
+            raise ValueError(f'DXMT build proof does not match {built}')
+        sources[relative] = install / built
+        replaced[relative] = dict(record, build_sha256=proof['files'][built])
+    replace_files(base, dest, base_version, version, identity, manifest, sources, replaced)
 
 
 def unsigned_identical(original, resigned):
@@ -940,6 +1041,12 @@ if __name__ == '__main__':
     parser.add_argument('--metalfx', type=Path, metavar='DXMT_WORKSPACE',
                         help="Replace DXMT with this build_portable_dxmt.py workspace's MetalFX build and add its "
                              'd3d12, DLSS and NVAPI stand-ins')
+    parser.add_argument('--audio', action='store_true',
+                        help="Replace Wine's mmdevapi.dll and winecoreaudio.so with their build_wine_native.py builds")
+    parser.add_argument('--services', action='store_true',
+                        help="Replace Wine's services.exe and sechost.dll (both architectures) with their build_wine_native.py builds")
+    parser.add_argument('--shader-pack', type=Path, metavar='DXMT_WORKSPACE',
+                        help="Replace winemetal.so with this build_portable_dxmt.py workspace's shader pack build")
     args = parser.parse_args()
     if args.repackage:
         repackage(args.base_version, args.version)
@@ -949,10 +1056,16 @@ if __name__ == '__main__':
         parser.error('--identity is required to replace components')
     elif args.controllers:
         derive_controllers(args.base_version, args.version, args.identity)
+    elif args.audio:
+        derive_audio(args.base_version, args.version, args.identity)
+    elif args.services:
+        derive_services(args.base_version, args.version, args.identity)
     elif args.microphone:
         derive_microphone(args.base_version, args.version, args.identity)
     elif args.metalfx:
         derive_metalfx(args.base_version, args.version, args.identity, args.metalfx.resolve())
+    elif args.shader_pack:
+        derive_shader_pack(args.base_version, args.version, args.identity, args.shader_pack.resolve())
     elif args.minimum_macos:
         restamp_runtime(args.base_version, args.version, args.identity, args.minimum_macos)
     elif args.native:

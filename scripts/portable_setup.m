@@ -485,8 +485,29 @@ static void endSession(NSString *engine) {
  * panel ("gamemode" is undocumented) plus the shader compiler, which shows the game compiling
  * shaders, the cause of a first match's stutters.
  * macOS Game Mode: WINE_GAME_MODE makes Wine start each game from its game app
- * (lib/wine/game-mode/<game>.app, portable_steam.h). launch --game-mode 0 leaves it out. */
+ * (lib/wine/game-mode/<game>.app, portable_steam.h). launch --game-mode 0 leaves it out.
+ * The mouse (Settings › General › Mouse, launch --mouse; ported from Recall 1.6). Standard keeps
+ * the contract's input variant ("precise"): buttons come from GCMouse in order with its motion.
+ * Classic sets the window driver's "classic", Recall 1.4's clicks and timing with the stand-in.
+ * High-precision sets WINEMAC_RAW_SOURCE=hid: the driver reads the mouse's own reports through
+ * IOHID instead of GCMouse, with the app's Input Monitoring permission; without it the driver
+ * keeps GCMouse. With Standard and High-precision, launch --mouse-rate sets the most deliveries
+ * a second: WINEMAC_MOUSELOOK_RAW_INTERVAL_US, 0 for every report (the default) or a million
+ * over 2000, 1000, 500 or 250. Classic leaves the driver's own 1 ms. */
+static NSString *mouseInput=@"standard",*mouseRate=@"all";
+static NSString *mouseIntervalMicroseconds(void) {
+    return [mouseRate isEqual:@"all"] ? @"0" : [NSString stringWithFormat:@"%d",1000000/mouseRate.intValue];
+}
+// What the session's mouse environment came from; a change reopens an idle Steam, like the HUD.
+static NSString *sessionMouse(void) {
+    return [mouseInput isEqual:@"classic"] ? mouseInput : [NSString stringWithFormat:@"%@/%@",mouseInput,mouseRate];
+}
 static NSMutableDictionary *clientEnvironment(NSMutableDictionary *env, BOOL hud, BOOL gameMode) {
+    if([mouseInput isEqual:@"classic"])env[@"WINEMAC_INPUT_VARIANT"]=@"classic";
+    else {
+        if([mouseInput isEqual:@"high-precision"])env[@"WINEMAC_RAW_SOURCE"]=@"hid";
+        env[@"WINEMAC_MOUSELOOK_RAW_INTERVAL_US"]=mouseIntervalMicroseconds();
+    }
     if(!gameMode)[env removeObjectForKey:@"WINE_GAME_MODE"];
     if(hud)[env addEntriesFromDictionary:@{@"MTL_HUD_ENABLED":@"1",@"MTL_HUD_DISABLE_MENU_BAR":@"1",
         @"MTL_HUD_ELEMENTS":@"device,rosetta,layersize,memory,gamemode,fps,gputime,frameinterval,frameintervalgraph,shaders"}];
@@ -533,7 +554,8 @@ static void launchClient(BOOL diagnostic, NSString *play, NSString *fullscreen, 
     BOOL needsOptions=NO;
     if(!steamLaunchOptionsNeedUpdate(defaults,&needsOptions))fail(@"steam_launch_options_invalid");
     NSDictionary *s=state();
-    BOOL environmentChanged=![s[@"session_hud"] isEqual:@(hud)] || ![s[@"session_game_mode"] isEqual:@(gameMode)];
+    BOOL environmentChanged=![s[@"session_hud"] isEqual:@(hud)] || ![s[@"session_game_mode"] isEqual:@(gameMode)] ||
+        ![s[@"session_mouse"] isEqual:sessionMouse()];
     BOOL needsWindowFix=existing.count && steamWindowFixNeeded();
     // Steam owns its children's environment and cached launch options. Reopen an idle
     // client cleanly when those change; never edit a live client's account config.
@@ -588,7 +610,7 @@ static void launchClient(BOOL diagnostic, NSString *play, NSString *fullscreen, 
     configureVoiceMicrophone(engine,nil,YES,YES);
     NSMutableDictionary *session=state();
     if(displays)session[@"session_displays"]=displays;
-    session[@"session_hud"]=@(hud);session[@"session_game_mode"]=@(gameMode);writeJSON(session,join(root,@"state.json"));
+    session[@"session_hud"]=@(hud);session[@"session_game_mode"]=@(gameMode);session[@"session_mouse"]=sessionMouse();writeJSON(session,join(root,@"state.json"));
     NSDictionary *env=clientEnvironment(diagnostic?diagnosticEnvironment(engine):wineEnv(engine),hud,gameMode);
     NSTask *p=task(join(engine,@"bin/wine"),client,env,[NSString stringWithFormat:@"steam-%@.log",NSUUID.UUID.UUIDString]);
     saveStage(@"battlenet_started");event(@"battlenet_open",@{@"pid":@(p.processIdentifier)});
@@ -673,6 +695,8 @@ int main(int argc, const char *argv[]) { @autoreleasepool {
         NSString *defaultRoot=join([fm URLsForDirectory:NSApplicationSupportDirectory inDomains:NSUserDomainMask].firstObject.path,MV_DATA_FOLDER);
         monitorMode=[command isEqual:@"watch"];
         ownRoot(options[@"root"] ?: defaultRoot);
+        if([@[@"classic",@"high-precision"] containsObject:options[@"mouse"] ?: @""])mouseInput=options[@"mouse"];
+        if([@[@"2000",@"1000",@"500",@"250"] containsObject:options[@"mouse-rate"] ?: @""])mouseRate=options[@"mouse-rate"];
         if([command isEqual:@"preflight"])preflight();
         else if([command isEqual:@"status"]) {
             // The resolution the game opens at next on the main display.

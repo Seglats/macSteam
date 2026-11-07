@@ -56,7 +56,8 @@ int main(int argc,const char **argv) {@autoreleasepool {
 static BOOL needsRepair,closed,settled,configured;
 static BOOL steamWindowFixNeeded(void) {return needsRepair;}
 static BOOL steamLaunchOptionsNeedUpdate(NSDictionary *options,BOOL *needs) {(void)options;*needs=NO;return YES;}
-static NSDictionary *state(void) {return @{@"session_hud":@NO,@"session_game_mode":@YES};}
+static NSString *sessionMouse(void) {return @"standard/all";}
+static NSDictionary *state(void) {return @{@"session_hud":@NO,@"session_game_mode":@YES,@"session_mouse":sessionMouse()};}
 static void fail(NSString *code) {(void)code;abort();}
 static void event(NSString *stage,id details) {(void)stage;(void)details;}
 static void closeClient(NSString *guard) {(void)guard;closed=YES;}

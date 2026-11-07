@@ -88,6 +88,11 @@ struct SettingsSheet:View {
     @State private var main=MainDisplay.current
     /// Also follows System Settings, where the player turns the microphone on or off.
     @State private var microphoneAccess=Microphone.access
+    /// Also follows System Settings, where the player allows Input Monitoring for High-precision.
+    @State private var inputMonitoring=InputMonitoring.access
+    @State private var explainHighPrecision=false
+    @State private var mouseAdvanced=false
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     var body:some View {
         VStack(spacing:16) {
             LauncherHeading(title:"Settings",subtitle:"",compact:true)
@@ -115,8 +120,12 @@ struct SettingsSheet:View {
             // and the microphone been turned on or off in System Settings.
             .onAppear { model.checkRunning() }
             .onReceive(NotificationCenter.default.publisher(for:NSApplication.didBecomeActiveNotification)) { _ in
-                model.checkRunning();microphoneAccess=Microphone.access
+                model.checkRunning();microphoneAccess=Microphone.access;inputMonitoring=InputMonitoring.access
             }
+            .alert("Use the High-precision mouse?",isPresented:$explainHighPrecision) {
+                Button("Cancel",role:.cancel) {}
+                Button("Turn On") { model.turnOnHighPrecision();inputMonitoring=InputMonitoring.access }
+            } message: { Text("Your game reads your mouse’s own reports instead of macOS’s mouse input for games, which drops some of them in game. macOS will ask to allow Input Monitoring for \(Brand.name). Its prompt mentions keystrokes, but only mice are opened, and only their movement and buttons are read. Until you allow it, the mouse works as Standard does.") }
             .alert("Force quit your game and Steam?",isPresented:$confirmForceQuit) {
                 Button("Cancel",role:.cancel) {}
                 Button("Force Quit",role:.destructive,action:model.forceQuit)
@@ -157,6 +166,7 @@ struct SettingsSheet:View {
         case .general:
             if Brand.allowsUpdates { updates }
             steam
+            mouse
         case .display:
             display
             resetDisplay
@@ -295,6 +305,98 @@ struct SettingsSheet:View {
             }
         }
     }
+    /// How the game gets the mouse (AppModel.MouseInput, ported from Recall 1.6): one of three. The
+    /// window driver reads it as Steam opens, so like the HUD it changes while Steam is closed.
+    /// High-precision first explains why macOS will ask for Input Monitoring; until the player
+    /// allows it in System Settings, the mouse works as Standard does and the panel says so.
+    private var mouse:some View {
+        LauncherPanel(inset:16) {
+            VStack(alignment:.leading,spacing:6) {
+                VStack(alignment:.leading,spacing:2) {
+                    Text("Mouse").font(LauncherStyle.font(14,.semibold))
+                    Text("How your game gets your mouse’s movement and clicks.").font(LauncherStyle.font(12))
+                        .foregroundStyle(.secondary).fixedSize(horizontal:false,vertical:true)
+                }
+                VStack(alignment:.leading,spacing:10) {
+                    MouseChoice(title:"Standard",detail:"Your game gets your mouse from macOS, with each click after the movement before it. No permission needed.",
+                                selected:model.mouseInput == .standard,disabled:model.running != nil) { model.mouseInput = .standard }
+                    MouseChoice(title:"Classic",detail:"The older mouse timing. Try it if Standard feels different to you.",
+                                selected:model.mouseInput == .classic,disabled:model.running != nil) { model.mouseInput = .classic }
+                    MouseChoice(title:"High-precision",detail:"Your game reads your mouse directly, skipping macOS’s mouse layer. Needs Input Monitoring.",
+                                selected:model.mouseInput == .highPrecision,disabled:model.running != nil) {
+                        if model.mouseInput != .highPrecision { explainHighPrecision=true }
+                    }
+                }.padding(.top,8)
+                if model.mouseInput == .highPrecision && inputMonitoring != .allowed {
+                    HStack(spacing:12) {
+                        Text("Needs Input Monitoring: turn on \(Brand.name) in System Settings › Privacy & Security › Input Monitoring. Until then, the mouse works as Standard does.")
+                            .font(LauncherStyle.font(12,.medium)).fixedSize(horizontal:false,vertical:true)
+                        Spacer(minLength:8)
+                        Button("Open System Settings") { NSWorkspace.shared.open(InputMonitoring.privacySettings) }
+                            .buttonStyle(.bordered).buttonBorderShape(.capsule)
+                    }.padding(.top,6)
+                }
+                mouseRate
+                if let running=model.running { closeFirst(running,"the mouse") }
+            }
+        }
+    }
+    /// Mouse › Advanced (AppModel.MouseRate), closed until the player opens it: how many times a
+    /// second the game gets the mouse's movement, with All at the slider's right end. Classic keeps
+    /// its own timing, so with Classic chosen it says so in place of the slider.
+    private var mouseRate:some View {
+        let stops=AppModel.MouseRate.stops,rate=model.mouseRate
+        let classic=model.mouseInput == .classic
+        let caption=rate == .all ? "Your game gets every update your mouse sends, at its full polling rate, as on a Windows PC."
+            : "Your game gets up to \((rate.perSecond ?? 0).formatted()) updates a second. Movement in between is added to the next one, so none is lost."
+        return VStack(alignment:.leading,spacing:10) {
+            Divider().padding(.bottom,-2)
+            Button { withAnimation(reduceMotion ? nil : .easeOut(duration:0.15)) { mouseAdvanced.toggle() } } label: {
+                HStack(spacing:6) {
+                    Text("Advanced").font(LauncherStyle.font(12,.medium))
+                    Image(systemName:"chevron.down").font(.system(size:10,weight:.semibold)).rotationEffect(.degrees(mouseAdvanced ? 180 : 0))
+                    if !mouseAdvanced && !classic && rate != .all {
+                        Text(verbatim:"·").font(LauncherStyle.font(12))
+                        Text(mouseRateLabel(rate)).font(LauncherStyle.font(12)).monospacedDigit()
+                    }
+                }.foregroundStyle(.secondary).contentShape(Rectangle())
+            }.buttonStyle(.plain)
+                .accessibilityHint(mouseAdvanced ? "Hides the advanced mouse setting" : "Shows how often your game gets your mouse’s movement")
+            if mouseAdvanced {
+                if classic {
+                    Text("Classic keeps its own timing, so this setting doesn’t change it.")
+                        .font(LauncherStyle.font(12)).foregroundStyle(.secondary).fixedSize(horizontal:false,vertical:true)
+                } else {
+                    VStack(alignment:.leading,spacing:8) {
+                        HStack(alignment:.center,spacing:12) {
+                            VStack(alignment:.leading,spacing:2) {
+                                Text("Mouse updates").font(LauncherStyle.font(13,.semibold))
+                                Text("How many times a second your game gets your mouse’s movement.").font(LauncherStyle.font(12))
+                                    .foregroundStyle(.secondary).fixedSize(horizontal:false,vertical:true)
+                            }
+                            Spacer(minLength:12)
+                            Text(mouseRateLabel(rate)).font(LauncherStyle.font(13,.medium)).monospacedDigit()
+                        }.accessibilityElement(children:.combine)
+                        HStack(spacing:10) {
+                            Text("Fewer").font(LauncherStyle.font(12)).foregroundStyle(.secondary).accessibilityHidden(true)
+                            Slider(value:Binding(get:{ Double(stops.firstIndex(of:model.mouseRate) ?? stops.count-1) },
+                                                 set:{ model.mouseRate=stops[min(stops.count-1,max(0,Int($0.rounded())))] }),
+                                   in:0...Double(stops.count-1),step:1) {
+                                Text("Mouse updates")
+                            }.labelsHidden().tint(LauncherStyle.accent).accessibilityValue(mouseRateLabel(rate))
+                            Text("All").font(LauncherStyle.font(12)).foregroundStyle(.secondary).accessibilityHidden(true)
+                        }.disabled(model.running != nil)
+                        Text(caption).font(LauncherStyle.font(13)).lineSpacing(3).fixedSize(horizontal:false,vertical:true)
+                        Text("Lower this only if your game runs slower while you move your mouse.")
+                            .font(LauncherStyle.font(12)).foregroundStyle(.secondary).fixedSize(horizontal:false,vertical:true)
+                    }
+                }
+            }
+        }.padding(.top,8)
+    }
+    private func mouseRateLabel(_ rate:AppModel.MouseRate) -> String {
+        rate.perSecond.map { "\($0.formatted()) a second" } ?? "Every update"
+    }
     /// A setting Steam carries from when it opens: change it once it's closed.
     private func closeFirst(_ running:AppModel.Running, _ what:String) -> some View {
         HStack(spacing:12) {
@@ -383,6 +485,28 @@ struct SettingsSheet:View {
                 if let running=model.running { closeFirst(running,"this") }
             }
         }
+    }
+}
+/// One of the mouse's choices: a radio button with its name over an explanation.
+private struct MouseChoice:View {
+    let title:String
+    let detail:String
+    let selected:Bool
+    let disabled:Bool
+    let choose:()->Void
+    var body:some View {
+        Button(action:choose) {
+            HStack(alignment:.firstTextBaseline,spacing:10) {
+                Image(systemName:selected ? "largecircle.fill.circle" : "circle").font(.system(size:14))
+                    .foregroundStyle(selected ? LauncherStyle.accent : .secondary).accessibilityHidden(true)
+                VStack(alignment:.leading,spacing:2) {
+                    Text(title).font(LauncherStyle.font(13,.semibold))
+                    Text(detail).font(LauncherStyle.font(12)).foregroundStyle(.secondary).fixedSize(horizontal:false,vertical:true)
+                }
+                Spacer(minLength:0)
+            }.contentShape(Rectangle())
+        }.buttonStyle(.plain).disabled(disabled).opacity(disabled ? 0.6 : 1)
+            .accessibilityElement(children:.combine).accessibilityAddTraits(selected ? .isSelected : [])
     }
 }
 /// A setting with its switch at the trailing edge, as in System Settings: title (and anything

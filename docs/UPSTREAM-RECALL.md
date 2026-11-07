@@ -79,6 +79,15 @@ The new driver behaves as before unless the launcher sets environment variables:
 | High-precision | `WINEMAC_RAW_SOURCE=hid`; needs the app's Input Monitoring permission (`app/Sources/InputMonitoring.swift`) |
 | Mouse updates slider | `WINEMAC_MOUSELOOK_RAW_INTERVAL_US` (0 = every report); not with Classic |
 
+All of these only apply in programs named in `WINEMAC_MOUSELOOK`. Recall names only
+`Overwatch.exe`. MacVolvo is for whatever the player starts from Steam, so its driver also
+accepts `*` (every program) and `!name` (leave one out). The launcher (`mouselookList()` in
+`portable_steam.h`) passes `*` and excludes Steam's own processes and Wine's `explorer.exe`.
+A program left out gets Wine's pointer path instead: macOS pointer acceleration and, in
+Retina mode, two Windows pixels per point. That made KovaaK's feel much faster than Recall's
+Overwatch until `macvolvo-1.2-dev.2`. Keep this wildcard support when merging Recall's
+`macdrv_main.c` (`setup_mouselook`).
+
 The app passes `--mouse` and `--mouse-rate` to `launch`. In `portable_setup.m`, the
 `clientEnvironment()` function sets the variables. `sessionMouse()` makes a changed setting
 reopen an idle Steam, the same way the HUD and Game Mode settings work. Steam passes its

@@ -29,6 +29,7 @@ static NSString *root=@"/fixture";
 static NSFileManager *fm;
 static NSString *join(NSString *a,NSString *b) {return [a stringByAppendingPathComponent:b];}
 static NSString *gameList(NSString *separator) {return [@[@"cs2.exe",@"deadlock.exe"] componentsJoinedByString:separator];}
+static NSString *mouselookList(void) {return @"*;!steam.exe";}
 ''' + env + r'''
 int main(void) {@autoreleasepool {
     fm=NSFileManager.defaultManager;

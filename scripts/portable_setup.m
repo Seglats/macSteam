@@ -164,6 +164,7 @@ static NSString *runtime(void) {
     return p;
 }
 static NSString *gameList(NSString *separator); // portable_steam.h
+static NSString *mouselookList(void); // portable_steam.h
 static NSMutableDictionary *wineEnv(NSString *engine) {
     // Keep Wine's Windows profile and shell-folder symlinks inside this new
     // environment. Never borrow the developer's HOME, account state or caches.
@@ -177,7 +178,7 @@ static NSMutableDictionary *wineEnv(NSString *engine) {
         @"DXMT_CONFIG_FILE":[@"Z:" stringByAppendingString:[([fm fileExistsAtPath:join(root,@"dxmt.conf")]?join(root,@"dxmt.conf"):join(engine,@"config/dxmt.conf")) stringByReplacingOccurrencesOfString:@"/" withString:@"\\"]],
         @"DXMT_PIPELINE_CACHE_PATH":join(root,@"cache/pipelines")}];
     // The contract names Overwatch; MacVolvo's games take its place (portable_steam.h).
-    [env addEntriesFromDictionary:@{@"WINEMAC_MOUSELOOK":gameList(@";"),@"WINE_GAME_MODE":gameList(@","),
+    [env addEntriesFromDictionary:@{@"WINEMAC_MOUSELOOK":mouselookList(),@"WINE_GAME_MODE":gameList(@","),
         @"DXMT_PIPELINE_CACHE_NAMESPACE":@"macvolvo-v1",
         // Chrome flags for Steam's browser (portable_steam.h); the worker's own environment
         // can set others, for testing.

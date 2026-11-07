@@ -289,11 +289,22 @@ static BOOL isGameProcess(NSString *name) {
     for(NSUInteger i=0;i<mvGameCount;i++)if([exe isEqual:mvGames[i].exe])return YES;
     return NO;
 }
-/* Every game, for WINEMAC_MOUSELOOK (';') and WINE_GAME_MODE (','). */
+/* Every game, for WINE_GAME_MODE (','). */
 static NSString *gameList(NSString *separator) {
     NSMutableArray *names=[NSMutableArray array];
     for(NSUInteger i=0;i<mvGameCount;i++)[names addObject:mvGames[i].exe];
     return [names componentsJoinedByString:separator];
+}
+/* WINEMAC_MOUSELOOK: which programs get the window driver's raw mouse input (Settings ›
+ * General › Mouse: Standard, Classic, High-precision) and its mouselook. Every program the
+ * player starts through Steam does ("*"), not only the games above; a program left out would
+ * get Wine's pointer path instead, with macOS's pointer acceleration and, in Retina mode, two
+ * Windows pixels per point, so its sensitivity wouldn't match. Mouselook itself engages only
+ * while a program hides and confines the cursor. Steam's own processes and Wine's desktop are
+ * left out ("!name"), so they don't open the mouse for raw input. */
+static NSString *mouselookList(void) {
+    return @"*;!steam.exe;!steamwebhelper.exe;!steamwebhelper_real.exe;!steamservice.exe;"
+           "!steamerrorreporter.exe;!steamerrorreporter64.exe;!gameoverlayui.exe;!gameoverlayui64.exe;!explorer.exe";
 }
 
 static BOOL registryValue(NSString *engine, NSString *key, NSString *name, NSString *type, NSString *data, NSString *log) {

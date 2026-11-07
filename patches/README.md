@@ -112,6 +112,9 @@ patches above:
   return in seven to the fullscreen game (Cmd-Tab or a Spaces swipe) the game drew
   nothing for 8–13 s, and the held exit from fullscreen (below) was then applied
   as well. Changes macOS announces while you are away still reach Wine at once;
+- (MacVolvo) `WINEMAC_MOUSELOOK` also accepts `*` (every program) and `!name` (leave one
+  out even then), so the launcher gives raw mouse input to whatever the player starts
+  from Steam while keeping it out of Steam's own processes;
 - (MacVolvo) the resize-start query that reads the monitor DPI is queued for the
   normal event pump (`WineQueryNoPreemptWait`) instead of running inside
   `OnMainThread`'s query pump, where `ChangeDisplaySettings` can be waiting while

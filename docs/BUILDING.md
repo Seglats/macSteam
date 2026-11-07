@@ -136,6 +136,10 @@ layout without scripting Finder; `--plain` skips it.
 For syncing with Recall, merging Mac driver patches, building `winemac.so` and deriving
 a runtime without the full pipeline, see [UPSTREAM-RECALL.md](UPSTREAM-RECALL.md).
 
+Runtime `macvolvo-1.2-dev.2` is the same as `macvolvo-1.2-dev.1` below, except its Mac
+driver also accepts `*` and `!name` in `WINEMAC_MOUSELOOK`. The launcher uses this to give
+the raw mouse input to every program started through Steam, not only CS2 and Deadlock.
+
 Runtime `macvolvo-1.2-dev.1` (development build, not Developer ID signed) is Recall
 1.6.2's release runtime `phase2-20261028.2` (archive SHA-256 `28c3270b…8655d8899`) with
 only the Mac driver replaced. Earlier MacVolvo runtimes were Recall's `phase2-20261014.1`

@@ -2899,6 +2899,49 @@ index 4d4efaa..59fc37f 100644
          struct {
              unsigned long   serial;
              void           *tried_windows;
+diff --git a/dlls/winemac.drv/macdrv_main.c b/dlls/winemac.drv/macdrv_main.c
+index 8f0dbed..5b0fd44 100644
+--- a/dlls/winemac.drv/macdrv_main.c
++++ b/dlls/winemac.drv/macdrv_main.c
+@@ -291,10 +291,14 @@ static inline DWORD get_config_key(HKEY defkey, HKEY appkey, const char *name,
+  * Mouselook (relative mouse mode while the client hides and confines or
+  * re-centres the cursor) is opt-in per executable: WINEMAC_MOUSELOOK is a
+  * semicolon-separated list of exe names, matched case-insensitively.
++ * (MacVolvo) "*" names every executable, and "!name" leaves one out even
++ * then, so a launcher can give its raw mouse input to whatever the player
++ * starts while keeping it out of the client's own processes.
+  */
+ static void setup_mouselook(const WCHAR *appname)
+ {
+     const char *list = getenv("WINEMAC_MOUSELOOK");
++    bool named = false, all = false, excluded = false;
+     int i;
+ 
+     for (i = 0; appname[i] && i < ARRAY_SIZE(mouselook_process) - 1; i++)
+@@ -306,13 +310,20 @@ static void setup_mouselook(const WCHAR *appname)
+     {
+         const char *end = strchr(list, ';');
+         size_t len = end ? (size_t)(end - list) : strlen(list);
+-        if (len && len == strlen(mouselook_process) && !strncasecmp(list, mouselook_process, len))
++        bool exclude = len && *list == '!';
++        const char *name = exclude ? list + 1 : list;
++        size_t name_len = exclude ? len - 1 : len;
++
++        if (name_len == 1 && *name == '*')
++            all = all || !exclude;
++        else if (name_len && name_len == strlen(mouselook_process) && !strncasecmp(name, mouselook_process, name_len))
+         {
+-            mouselook_allowed = true;
+-            break;
++            if (exclude) excluded = true;
++            else named = true;
+         }
+         list = end ? end + 1 : NULL;
+     }
++    mouselook_allowed = !excluded && (named || all);
+ }
+ 
+ static void setup_options(void)
 diff --git a/dlls/winemac.drv/mouse.c b/dlls/winemac.drv/mouse.c
 index 59f891e..40d60d1 100644
 --- a/dlls/winemac.drv/mouse.c

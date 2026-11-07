@@ -133,6 +133,9 @@ The DMG opens as a fixed Finder window with the app, an Applications shortcut
 and a background drawn by `scripts/dmg_background.swift`. dmgbuild writes that
 layout without scripting Finder; `--plain` skips it.
 
+For syncing with Recall, merging Mac driver patches, building `winemac.so` and deriving
+a runtime without the full pipeline, see [UPSTREAM-RECALL.md](UPSTREAM-RECALL.md).
+
 Runtime `macvolvo-1.2-dev.1` (development build, not Developer ID signed) is Recall
 1.6.2's release runtime `phase2-20261028.2` (archive SHA-256 `28c3270b…8655d8899`) with
 only the Mac driver replaced. Earlier MacVolvo runtimes were Recall's `phase2-20261014.1`

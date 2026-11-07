@@ -127,25 +127,26 @@ struct MousePanel:View {
 }
 
 /// The High-precision mouse in NotProton's Steam, as MacVolvo's driver reported it in the latest
-/// game that used it (NotProton.MouseStatus): macOS asks Steam for Input Monitoring, which started
-/// the game, and only the game can tell whether Steam has it. MacVolvo never asks for itself here.
+/// game that used it (NotProton.MouseStatus). The game may read the mouse if Steam, which started it,
+/// may read input: through Device Control and Data Access (Accessibility before macOS 27), which
+/// NotProton asks for, or Input Monitoring. Only the game can tell. MacVolvo never asks for itself here.
 struct SteamMouseStatus:View {
     @Bindable var model:AppModel
     var body:some View {
         if let report=model.mouseStatus {
             let when="in \(report.process), \(report.date.formatted(.relative(presentation:.named)))"
             if report.access != "granted" {
-                StatusLine(.problem,"Steam needs Input Monitoring (\(when)). Turn on Steam in System Settings › Privacy & Security › Input Monitoring, then quit and reopen Steam. Until then, the mouse works as Standard does.",
+                StatusLine(.problem,"Steam isn’t allowed to read your mouse (\(when)). In System Settings › Privacy & Security, turn on Steam under Device Control and Data Access (NotProton asks for it there) or Input Monitoring, then quit and reopen Steam. Until then, the mouse works as Standard does.",
                            button:"Open System Settings") { NSWorkspace.shared.open(InputMonitoring.privacySettings) }
             } else if report.reporting {
                 StatusLine(.good,"High-precision mouse is working: your game reads your mouse directly (\(when)).")
             } else if report.mice > 0 {
-                StatusLine(.good,"Steam has Input Monitoring and your mouse is open (\(when)). Move it in the game to confirm.")
+                StatusLine(.good,"Steam may read your mouse, and it is open (\(when)). Move it in the game to confirm.")
             } else {
-                StatusLine(.warning,"Steam has Input Monitoring, but no mouse was connected (\(when)). A trackpad works as Standard does.")
+                StatusLine(.warning,"Steam may read your mouse, but none was connected (\(when)). A trackpad works as Standard does.")
             }
         } else {
-            StatusLine(.pending,"No game has used High-precision yet. In Steam, choose MacVolvo driver and turn on MacVolvo mouse › High-precision for a game, then start it: macOS asks to allow Input Monitoring for Steam then, since Steam starts your games. Steam only appears in System Settings after that, and it works from the next launch. This shows how it went.")
+            StatusLine(.pending,"No game has used High-precision yet. In Steam, choose MacVolvo driver and turn on MacVolvo mouse › High-precision for a game, then start it. It works if Steam is on under Device Control and Data Access, which NotProton asks for; otherwise macOS asks to allow Input Monitoring for Steam, and it works from the next launch. This shows how it went.")
         }
     }
 }

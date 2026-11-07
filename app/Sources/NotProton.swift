@@ -130,7 +130,7 @@ enum NotProton {
 
         [NOTPROTON_MACVOLVO_HIGH_PRECISION]
         label = High-precision
-        description = Reads your mouse directly, skipping macOS’s mouse layer. macOS asks to allow Input Monitoring for Steam.
+        description = Reads your mouse directly, skipping macOS’s mouse layer. Needs Steam to be allowed to read input: Device Control and Data Access, which NotProton asks for, or Input Monitoring.
         depends = NOTPROTON_MACVOLVO_MOUSE
         \(toolLines)
         env = WINEMAC_RAW_SOURCE=hid

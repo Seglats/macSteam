@@ -95,6 +95,11 @@ NotProton builds a runner copy with the driver on that game's first launch.
 
 ## The High-precision mouse and Input Monitoring
 
+- **Usually already allowed:** NotProton asks macOS to let Steam control the computer, for Steam
+  Input (`input_access.c`, `CGRequestPostEventAccess`). That is Device Control and Data Access
+  (Accessibility before macOS 27), and it also lets Steam read input. So `IOHIDCheckAccess`
+  answers granted in the game, no prompt shows, and Steam never appears under Input Monitoring.
+  This was seen on 2026-11-07: High-precision worked in FPSAimTrainer without that entry.
 - **Who needs the permission:** NotProton usually runs the game's Wine directly from its
   script, a child of Steam, so macOS gives Input Monitoring to **Steam**. MacVolvo never asks
   for itself in this mode.
@@ -107,7 +112,7 @@ NotProton builds a runner copy with the driver on that game's first launch.
 - **The report:** with `WINEMAC_RAW_STATUS` the driver writes `hid-status.json`: access, open
   result, mice open, whether one has reported, process and time. It writes it whenever one of
   those changes (`cocoa_app.m` `hid_write_status`). The window reads it every few seconds and
-  says "High-precision mouse is working" or "Steam needs Input Monitoring".
+  says "High-precision mouse is working" or "Steam isn’t allowed to read your mouse".
 
 ## Supporting another CrossOver build
 

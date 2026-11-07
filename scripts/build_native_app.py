@@ -34,6 +34,38 @@ def sha(p):return hashlib.sha256(p.read_bytes()).hexdigest()
 # so it also fits NotProton's runner of that build, named as NotProton names the runner folder.
 NOTPROTON_DRIVER='lib/wine/x86_64-unix/winemac.so'
 NOTPROTON_BUILDS=('26.3.0.39832',)
+# MacVolvo's DXMT (Recall's, paired with this Mac driver's canvas) for the "MacVolvo DXMT" variant:
+# (runtime file, place under the runner's lib/). CrossOver keeps a copy of winemetal.dll in
+# lib/wine as well, and its PE half has to match winemetal.so, so that copy is replaced too.
+NOTPROTON_DXMT=[
+    ('lib/wine/x86_64-windows/d3d11.dll','dxmt/x86_64-windows/d3d11.dll'),
+    ('lib/wine/x86_64-windows/dxgi.dll','dxmt/x86_64-windows/dxgi.dll'),
+    ('lib/wine/x86_64-windows/d3d10core.dll','dxmt/x86_64-windows/d3d10core.dll'),
+    ('lib/wine/x86_64-windows/winemetal.dll','dxmt/x86_64-windows/winemetal.dll'),
+    ('lib/wine/x86_64-windows/winemetal.dll','wine/x86_64-windows/winemetal.dll'),
+    ('lib/wine/i386-windows/d3d11.dll','dxmt/i386-windows/d3d11.dll'),
+    ('lib/wine/i386-windows/dxgi.dll','dxmt/i386-windows/dxgi.dll'),
+    ('lib/wine/i386-windows/d3d10core.dll','dxmt/i386-windows/d3d10core.dll'),
+    ('lib/wine/x86_64-unix/winemetal.so','dxmt/x86_64-unix/winemetal.so'),
+]
+NOTPROTON_PROFILE='config/dxmt.conf'
+
+def notproton_profiles(profile):
+    """The runtime's DXMT renderer profile (written for Overwatch.exe) as one file per game, for
+    the per-game profiles in NotProton (app/Sources/NotProton.swift). The fullscreen canvas size
+    lines go: MacVolvo's own launcher fills them in from its resolution setting, NotProton's Steam
+    has none, so DXMT keeps the game's own size. CS2 takes 4 shader compiler threads, as
+    portable_steam.h gamesProfile gives it."""
+    start=profile.index('[Overwatch.exe]')
+    body=profile[start+len('[Overwatch.exe]'):]
+    if '\n[' in body:body=body[:body.index('\n[')+1]
+    lines=[l for l in body.split('\n') if l.split('=')[0].strip() not in ('dxgi.fullscreenCanvasWidth','dxgi.fullscreenCanvasHeight')]
+    out={}
+    for name,exe in (('cs2.conf','cs2.exe'),('deadlock.conf','deadlock.exe')):
+        game=[l for l in lines if not (exe=='cs2.exe' and l.startswith('# Eight normal-priority workers'))]
+        game=[('# Four for CS2, as MacVolvo\'s launcher gives it.\nd3d11.shaderCompilerThreads = 4' if exe=='cs2.exe' and l.split('=')[0].strip()=='d3d11.shaderCompilerThreads' else l) for l in game]
+        out[name]=f'# MacVolvo renderer profile for {exe} (MacVolvo DXMT), from MacVolvo\'s runtime.\n[{exe}]'+'\n'.join(game).rstrip()+'\n'
+    return out
 
 def build(output,workspace,runtime_archive,icon=None,identity=None,variant='dxmt'):
     if variant not in ('dxmt','gptk4'):raise ValueError('Unknown app variant')
@@ -76,10 +108,18 @@ def build(output,workspace,runtime_archive,icon=None,identity=None,variant='dxmt
     if not evaluation:
         notproton=resources/'NotProton';notproton.mkdir()
         with tempfile.TemporaryDirectory() as folder:
-            run('/usr/bin/tar','-xzf',runtime_archive,'-C',folder,NOTPROTON_DRIVER)
+            run('/usr/bin/tar','-xzf',runtime_archive,'-C',folder,NOTPROTON_DRIVER,NOTPROTON_PROFILE,*sorted({s for s,_ in NOTPROTON_DXMT}))
             for build in NOTPROTON_BUILDS:
                 (notproton/build).mkdir()
                 shutil.copy2(Path(folder)/NOTPROTON_DRIVER,notproton/build/'winemac.so')
+                # The "MacVolvo DXMT" variant's tree, laid over the runner's lib/: CrossOver keeps
+                # DXMT in lib/dxmt/<arch>, and a copy of winemetal.dll in lib/wine.
+                for source,target in NOTPROTON_DXMT:
+                    (notproton/build/'dxmt'/target).parent.mkdir(parents=True,exist_ok=True)
+                    shutil.copy2(Path(folder)/source,notproton/build/'dxmt'/target)
+            (notproton/'profiles').mkdir()
+            for name,text in notproton_profiles((Path(folder)/NOTPROTON_PROFILE).read_text()).items():
+                (notproton/'profiles'/name).write_text(text)
     # Notices from the actual reviewed runtime; kept readable without extraction.
     with tempfile.TemporaryDirectory() as folder:
         run('/usr/bin/tar','-xzf',runtime_archive,'-C',folder,'licenses')

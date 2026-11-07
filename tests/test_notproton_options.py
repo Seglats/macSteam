@@ -18,6 +18,8 @@ import Foundation
         switch a[3] {
         case "add": try NotProton.add(resources:res)
         case "remove": try NotProton.remove()
+        case "cs2": try NotProton.setProfile(.cs2,installed:true,resources:res);try NotProton.add(resources:res)
+        case "deadlock": try NotProton.setProfile(.deadlock,installed:true,resources:res)
         default: break
         }
     } catch { out["error"]=error.localizedDescription }
@@ -37,6 +39,7 @@ class NotProtonOptions(unittest.TestCase):
         (folder / 'harness.swift').write_text(HARNESS)
         cls.tool = folder / 'harness'
         subprocess.run(['xcrun', 'swiftc', '-parse-as-library', str(ROOT / 'app/Sources/NotProton.swift'),
+                        str(ROOT / 'app/Sources/NotProtonExtras.swift'),
                         str(folder / 'harness.swift'), '-o', str(cls.tool)], check=True, capture_output=True)
 
     def setUp(self):
@@ -51,6 +54,12 @@ class NotProtonOptions(unittest.TestCase):
         self.resources = root / 'Resources'
         (self.resources / 'NotProton/26.3.0.39832').mkdir(parents=True)
         (self.resources / 'NotProton/26.3.0.39832/winemac.so').write_bytes(b'driver v1')
+        dxmt = self.resources / 'NotProton/26.3.0.39832/dxmt/dxmt/x86_64-unix'
+        dxmt.mkdir(parents=True)
+        (dxmt / 'winemetal.so').write_bytes(b'dxmt v1')
+        (self.resources / 'NotProton/profiles').mkdir()
+        for name in ('cs2', 'deadlock'):
+            (self.resources / f'NotProton/profiles/{name}.conf').write_text(f'[{name}.exe]\nd3d11.x = 1\n')
         self.variants = self.lib / 'notproton/variants/macvolvo.conf'
         self.plugins = self.lib / 'notproton/plugins/macvolvo.conf'
 
@@ -74,6 +83,32 @@ class NotProtonOptions(unittest.TestCase):
         self.assertIn('env = WINEMAC_RAW_REQUEST=1', plugins)
         self.assertEqual(plugins.count('tools = notproton-26.3\n'), 4)
 
+    def test_adds_macvolvo_dxmt_with_the_driver_and_no_d3dmetal_until_imported(self):
+        self.run_tool('add')
+        variants = self.variants.read_text()
+        self.assertIn('[macvolvo-dxmt-26.3.0.39832]\nlabel = MacVolvo DXMT\nvariant = MacVolvo renderer', variants)
+        self.assertIn('variant = MacVolvo driver', variants)
+        self.assertNotIn('d3dmetal', variants)
+        self.assertEqual((self.lib / 'MacVolvo NotProton/26.3.0.39832/dxmt/dxmt/x86_64-unix/winemetal.so').read_bytes(), b'dxmt v1')
+
+    def test_a_profile_adds_its_row_pointing_dxmt_at_its_file(self):
+        self.run_tool('add')
+        self.assertNotIn('PROFILE', self.plugins.read_text())
+        self.assertEqual(self.run_tool('cs2'), {'status': 'added', 'current': True})
+        plugins = self.plugins.read_text()
+        self.assertIn('[NOTPROTON_MACVOLVO_PROFILE_CS2]', plugins)
+        self.assertIn('env = DXMT_CONFIG_FILE=Z:' + str(self.lib / 'MacVolvo NotProton/profiles/cs2.conf').replace('/', '\\'), plugins)
+        self.assertNotIn('DEADLOCK', plugins)
+
+    def test_the_deadlock_profile_keeps_deadlock_on_directx_11_with_a_backup(self):
+        cfg = self.lib / 'Steam/steamapps/common/Deadlock/game/citadel/cfg/boot.vcfg'
+        cfg.parent.mkdir(parents=True)
+        original = '"config"\n{\n\t"DefaultRenderSystemOption"\t\t"-vulkan"\n\t"Other"\t"1"\n}\n'
+        cfg.write_text(original)
+        self.run_tool('deadlock')
+        self.assertEqual(cfg.read_text(), original.replace('-vulkan', '-dx11'))
+        self.assertEqual(cfg.with_name('boot.vcfg.macvolvo-backup').read_text(), original)
+
     def test_never_writes_a_tool_or_touches_notprotons_files(self):
         self.run_tool('add')
         tools = self.lib / 'Steam/compatibilitytools.d'
@@ -83,6 +118,9 @@ class NotProtonOptions(unittest.TestCase):
     def test_a_newer_driver_makes_it_out_of_date_until_updated(self):
         self.run_tool('add')
         (self.resources / 'NotProton/26.3.0.39832/winemac.so').write_bytes(b'driver v2')
+        self.assertEqual(self.run_tool('status'), {'status': 'added', 'current': False})
+        self.assertEqual(self.run_tool('add'), {'status': 'added', 'current': True})
+        (self.resources / 'NotProton/26.3.0.39832/dxmt/dxmt/x86_64-unix/winemetal.so').write_bytes(b'dxmt v2')
         self.assertEqual(self.run_tool('status'), {'status': 'added', 'current': False})
         self.assertEqual(self.run_tool('add'), {'status': 'added', 'current': True})
 

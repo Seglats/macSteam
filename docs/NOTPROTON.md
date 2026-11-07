@@ -12,8 +12,34 @@ them, and shows whether the High-precision mouse works. It installs no Steam and
 | Path (under `~/Library/Application Support`) | What |
 |---|---|
 | `MacVolvo NotProton/<build>/winemac.so` | MacVolvo's Mac driver for that CrossOver build |
-| `notproton/variants/macvolvo.conf` | runner variant "MacVolvo" per build: lays the driver over `lib/wine/x86_64-unix` and names its `build` |
+| `MacVolvo NotProton/<build>/dxmt/` | MacVolvo DXMT, bundled with the app (from its runtime) |
+| `MacVolvo NotProton/d3dmetal/` | Apple's D3DMetal, only after you choose your own Game Porting Toolkit image |
+| `MacVolvo NotProton/profiles/<game>.conf` | the game profiles you installed |
+| `notproton/variants/macvolvo.conf` | two dropdowns, **MacVolvo driver** and **MacVolvo renderer**; choices from both combine |
 | `notproton/plugins/macvolvo.conf` | rows in each game's Compatibility page (Developer section) |
+
+The variants:
+
+| Group | Variant | Lays | Over the runner's |
+|---|---|---|---|
+| MacVolvo driver | MacVolvo driver | `winemac.so` (needs `build`) | `lib/wine/x86_64-unix` |
+| MacVolvo renderer | MacVolvo DXMT | `dxmt/<arch>/…` and `wine/x86_64-windows/winemetal.dll` (needs `build`) | `lib` |
+| MacVolvo renderer | Apple D3DMetal *version* | Apple's `redist/lib`, unchanged | `lib64/apple_gptk` |
+
+- **MacVolvo DXMT** is Recall's DXMT. Its `winemetal.so` finds the Mac driver by install name,
+  so choose it together with MacVolvo driver. CrossOver also loads a copy of `winemetal.dll`
+  from `lib/wine`, and its PE half has to match the Unix half, so that copy is replaced too.
+- **Apple D3DMetal:** Apple doesn't allow it to be redistributed, so MacVolvo ships none. Choose
+  Game Porting Toolkit… asks for the "Evaluation environment for Windows games" image.
+  `NotProtonExtras.swift` `importGPTK` then:
+  1. mounts it read-only
+  2. checks `com.apple.D3DMetal` version 3 or later, Apple's signature on every native file,
+     the required modules, and that no links point outside the package
+  3. copies `redist/lib` and Apple's notices with `ditto`
+  4. swaps the copy in
+
+  A bad image changes nothing.
+- **Graphics backend:** choose NotProton's matching backend for the game (DXMT or D3DMetal).
 
 The rows:
 
@@ -23,6 +49,18 @@ The rows:
 | ↳ **High-precision** | `WINEMAC_RAW_SOURCE=hid`, `WINEMAC_RAW_REQUEST=1` |
 | ↳ **Classic timing** | `WINEMAC_INPUT_VARIANT=classic` (a later row's `env` wins) |
 | ↳ **Mouse updates** (slider) | `NOTPROTON_ENV_WINEMAC_MOUSELOOK_RAW_INTERVAL_US`; the default writes nothing, which is the driver's own 1 ms |
+
+| **MacVolvo *game* profile** (installed from Game profiles) | `DXMT_CONFIG_FILE=Z:\…\profiles\<game>.conf` |
+
+**Game profiles:**
+- `scripts/build_native_app.py` `notproton_profiles` generates them from the runtime's DXMT
+  renderer profile. The canvas-size lines are dropped (NotProton's Steam has no resolution
+  setting), and CS2 gets 4 shader compiler threads.
+- The **Deadlock** profile also switches `boot.vcfg`'s `DefaultRenderSystemOption` from
+  `-vulkan` to `-dx11` in every Steam library (`libraryfolders.vdf`), keeping
+  `boot.vcfg.macvolvo-backup`. A saved Vulkan choice bypasses DXMT and D3DMetal. It's
+  re-applied each time MacVolvo opens.
+- `-novid` stays up to you, in Steam's launch options.
 
 Every row names the tools it's for (`tools = notproton-26.3`), so FEX runners never show it.
 

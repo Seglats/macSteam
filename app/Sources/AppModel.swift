@@ -1,6 +1,7 @@
 import AppKit
 import SwiftUI
 import Observation
+import UniformTypeIdentifiers
 
 @MainActor @Observable
 final class AppModel {
@@ -85,6 +86,49 @@ final class AppModel {
         notProton=NotProton.status(resources)
         notProtonCurrent=NotProton.isCurrent(resources:resources)
         mouseStatus=NotProton.mouseStatus()
+        d3dmetalVersion=NotProton.d3dmetalVersion
+        profiles=Set(NotProton.installedProfiles)
+    }
+    /// Apple's D3DMetal as the player imported it from their Game Porting Toolkit (NotProtonExtras.swift).
+    var d3dmetalVersion:String?
+    var importingGPTK=false
+    /// The game profiles chosen for NotProton's Steam.
+    var profiles=Set<NotProton.Profile>()
+    /// After a change to the renderers or profiles, the rows in Steam follow at once if added.
+    private func rewriteNotProton() {
+        guard case .added=notProton else { return }
+        do { try NotProton.add(resources:resources) } catch { notice=error.localizedDescription }
+    }
+    func chooseGPTK() {
+        let panel=NSOpenPanel()
+        panel.message="Choose Apple’s \u{201C}Evaluation environment for Windows games\u{201D} disk image from the Game Porting Toolkit."
+        panel.prompt="Use"
+        panel.allowedContentTypes=[.diskImage]
+        panel.directoryURL=FileManager.default.urls(for:.downloadsDirectory,in:.userDomainMask).first
+        guard panel.runModal() == .OK,let image=panel.url else { return }
+        importingGPTK=true;notice=""
+        Task {
+            let result=await Task.detached { Result { try NotProton.importGPTK(image) } }.value
+            importingGPTK=false
+            switch result {
+            case .success(let version):
+                notice="Apple D3DMetal \(version) is ready. Choose it under MacVolvo renderer in a game’s Compatibility settings, with D3DMetal as the graphics backend."
+                rewriteNotProton()
+            case .failure(let error): notice=error.localizedDescription
+            }
+            checkNotProton()
+        }
+    }
+    func removeGPTK() {
+        do { try NotProton.removeGPTK();rewriteNotProton() } catch { notice=error.localizedDescription }
+        checkNotProton()
+    }
+    func setProfile(_ profile:NotProton.Profile,_ on:Bool) {
+        do {
+            try NotProton.setProfile(profile,installed:on,resources:resources)
+            rewriteNotProton()
+        } catch { notice=error.localizedDescription }
+        checkNotProton()
     }
     func addToNotProton() {
         let wasAdded:Bool={ if case .added=notProton { return true };return false }()

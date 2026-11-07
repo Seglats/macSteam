@@ -5,14 +5,15 @@ import Foundation
 /// replaces nothing of it: no tool, no runner, no CrossOver. It adds options to each game's
 /// Compatibility page in Steam, through NotProton's own extension points (its conf-format.md):
 ///
-/// - a runner variant, "MacVolvo" (notproton/variants/macvolvo.conf): MacVolvo's Mac driver
-///   (winemac.so: raw mouse input, High-precision, fullscreen and display fixes) laid over
-///   NotProton's runner, in a copy NotProton builds on first use. The driver is compiled from the
-///   same CrossOver sources as the runner, one per build (Resources/NotProton/<build>/winemac.so),
-///   and the variant names its build, so NotProton never applies it to another one;
+/// - runner variants (notproton/variants/macvolvo.conf), laid over NotProton's runner in a copy
+///   NotProton builds on first use. "MacVolvo driver": MacVolvo's Mac driver (winemac.so: raw mouse
+///   input, High-precision, fullscreen and display fixes), compiled from the same CrossOver sources
+///   as the runner, one per build (Resources/NotProton/<build>/winemac.so), naming its build so
+///   NotProton never applies it to another. "MacVolvo renderer": MacVolvo DXMT, or Apple's D3DMetal
+///   from the player's own Game Porting Toolkit (NotProtonExtras.swift);
 /// - plugin rows (notproton/plugins/macvolvo.conf): "MacVolvo mouse", with High-precision,
-///   Classic timing and Mouse updates under it. Each sets the driver's WINEMAC_* variables for
-///   that game only, and only for the CrossOver tools the driver is built for.
+///   Classic timing and Mouse updates under it, and the game profiles chosen in MacVolvo. Each sets
+///   variables for that game only, and only for the CrossOver tools the driver is built for.
 ///
 /// Both files say MacVolvo wrote them; NotProton never writes to those folders. Remove deletes
 /// only what carries MacVolvo's marker.
@@ -29,8 +30,9 @@ enum NotProton {
     private static var variantsFile:URL { support.appendingPathComponent("variants/macvolvo.conf") }
     private static var pluginsFile:URL { support.appendingPathComponent("plugins/macvolvo.conf") }
     private static let owner="Written by MacVolvo.app, which also removes it."
-    /// The variant group, which is the dropdown's label in the Compatibility page.
-    static let variantGroup="MacVolvo"
+    /// The variant groups, each a dropdown in the Compatibility page; choices from both combine.
+    static let driverGroup="MacVolvo driver"
+    static let rendererGroup="MacVolvo renderer"
 
     /// One of NotProton's Steam tools, from its registry (notproton/tools: name, build, flavor,
     /// display name, tab-separated).
@@ -87,21 +89,21 @@ enum NotProton {
     // MARK: The two files
     private static func driver(_ tool:Tool)->URL { ours.appendingPathComponent(tool.build+"/winemac.so") }
     static func variantsText(_ tools:[Tool])->String {
-        var text="# \(owner)\n# MacVolvo's Mac driver over NotProton's CrossOver runner. In a game's Properties ›\n"
-            + "# Compatibility, choose \(variantGroup) as the runner variant; MacVolvo mouse is in the same section.\n"
+        var text="# \(owner)\n# MacVolvo's driver and renderers over NotProton's CrossOver runner, chosen in a game's\n"
+            + "# Properties › Compatibility (Developer): \(driverGroup) and \(rendererGroup).\n"
         for tool in tools {
             text += """
 
             [\(tool.variant)]
             label = MacVolvo driver
-            variant = \(variantGroup)
+            variant = \(driverGroup)
             src = \(driver(tool).deletingLastPathComponent().path)
             dst = lib/wine/x86_64-unix
             build = \(tool.build)
 
             """
         }
-        return text
+        return text + extraVariants(tools)
     }
     /// Every program but Steam's own and Wine's desktop, as portable_steam.h mouselookList().
     static let mouselook="*;!steam.exe;!steamwebhelper.exe;!steamwebhelper_real.exe;!steamservice.exe;"
@@ -114,12 +116,12 @@ enum NotProton {
         let requires=tools.map { "requires = \(driver($0).path)" }.joined(separator:"\n")
         return """
         # \(owner)
-        # MacVolvo's mouse in a game's Properties › Compatibility (Developer). Needs the \(variantGroup)
-        # runner variant, which carries MacVolvo's driver.
+        # MacVolvo's mouse and game profiles in a game's Properties › Compatibility (Developer).
+        # The mouse needs the \(driverGroup) variant; a profile needs MacVolvo DXMT.
 
         [NOTPROTON_MACVOLVO_MOUSE]
         label = MacVolvo mouse
-        description = Raw mouse input from MacVolvo’s driver, each click after the movement before it. Choose the \(variantGroup) runner variant too.
+        description = Raw mouse input from MacVolvo’s driver, each click after the movement before it. Choose MacVolvo driver as a runner variant too.
         \(requires)
         \(toolLines)
         env = WINEMAC_MOUSELOOK=\(mouselook)
@@ -154,7 +156,7 @@ enum NotProton {
         choice = 0 = Every update
         default = 1000
 
-        """
+        """ + profileRows(tools)
     }
 
     // MARK: Add, update, remove
@@ -169,6 +171,7 @@ enum NotProton {
         for tool in tools {
             try fm.createDirectory(at:driver(tool).deletingLastPathComponent(),withIntermediateDirectories:true)
             try replace(driver(tool)) { try fm.copyItem(at:resources.appendingPathComponent("NotProton/\(tool.build)/winemac.so"),to:$0) }
+            try replace(dxmtTree(tool)) { try fm.copyItem(at:bundledDXMT(resources,tool),to:$0) }
         }
         for file in [variantsFile,pluginsFile] { try fm.createDirectory(at:file.deletingLastPathComponent(),withIntermediateDirectories:true) }
         try write(variantsText(tools),to:variantsFile)
@@ -183,6 +186,8 @@ enum NotProton {
     }
     /// After an update of MacVolvo: puts its current driver and rows in place, if added.
     static func refresh(resources:URL) {
+        // Deadlock can save Vulkan again from its Video settings; its profile keeps it on DirectX 11.
+        if installedProfiles.contains(.deadlock) { keepDeadlockOnDirectX11() }
         guard case .added=status(resources),!isCurrent(resources:resources) else { return }
         try? add(resources:resources)
     }
@@ -191,7 +196,8 @@ enum NotProton {
         let tools=supported(resources)
         return !tools.isEmpty && (try? String(contentsOf:variantsFile,encoding:.utf8)) == variantsText(tools)
             && (try? String(contentsOf:pluginsFile,encoding:.utf8)) == pluginsText(tools)
-            && tools.allSatisfy { fm.contentsEqual(atPath:driver($0).path,andPath:resources.appendingPathComponent("NotProton/\($0.build)/winemac.so").path) }
+            && tools.allSatisfy { fm.contentsEqual(atPath:driver($0).path,andPath:resources.appendingPathComponent("NotProton/\($0.build)/winemac.so").path)
+                && fm.contentsEqual(atPath:dxmtTree($0).path,andPath:bundledDXMT(resources,$0).path) }
     }
     /// The first version made a Steam tool of its own (notproton-macvolvo-*) and a settings file.
     private static func removeEarlierTool() {
@@ -236,7 +242,7 @@ enum NotProton {
             if fm.fileExists(atPath:url.path) { _ = try fm.replaceItemAt(url,withItemAt:temp) } else { try fm.moveItem(at:temp,to:url) }
         } catch { try? fm.removeItem(at:temp);throw error }
     }
-    private static func failure(_ message:String)->NSError {
+    static func failure(_ message:String)->NSError {
         NSError(domain:"MacVolvo.NotProton",code:1,userInfo:[NSLocalizedDescriptionKey:message])
     }
 }

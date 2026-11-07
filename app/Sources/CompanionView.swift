@@ -22,6 +22,8 @@ struct CompanionView:View {
                         statusPanel
                         VStack(spacing:12) { actions }
                         if !model.notice.isEmpty { LauncherNotice(text:model.notice) }
+                        renderersPanel
+                        profilesPanel
                         mousePanel
                         advancedPanel
                     }.frame(maxWidth:LauncherStyle.contentWidth).padding(.top,34)
@@ -105,9 +107,59 @@ struct CompanionView:View {
             if !model.notProtonCurrent {
                 LauncherPrimaryAction(title:"Update",action:model.addToNotProton).keyboardShortcut(.defaultAction)
             }
-            LauncherNotice(text:"In Steam, open a game’s Properties › Compatibility and keep NotProton’s CrossOver. Under Developer, choose \u{201C}\(NotProton.variantGroup)\u{201D} as the runner variant and turn on \u{201C}MacVolvo mouse\u{201D}, with High-precision if you like. Restart Steam after adding or removing \(Brand.name).",symbol:"gamecontroller")
+            LauncherNotice(text:"In Steam, open a game’s Properties › Compatibility and keep NotProton’s CrossOver. Under Developer, choose \u{201C}MacVolvo driver\u{201D}, a \u{201C}MacVolvo renderer\u{201D} if you like (with the matching graphics backend), and turn on \u{201C}MacVolvo mouse\u{201D}. Restart Steam after changing anything here.",symbol:"gamecontroller")
             Button("Remove from Steam…",role:.destructive) { confirmRemove=true }
                 .buttonStyle(.borderless).foregroundStyle(.red).font(LauncherStyle.font(13,.medium))
+        }
+    }
+
+    // MARK: Renderers
+    private var renderersPanel:some View {
+        LauncherPanel(inset:16) {
+            VStack(alignment:.leading,spacing:12) {
+                VStack(alignment:.leading,spacing:2) {
+                    Text("Renderers").font(LauncherStyle.font(14,.semibold))
+                    Text("Offered per game under \u{201C}MacVolvo renderer\u{201D}, next to NotProton’s own. Pick the matching graphics backend for the game too.")
+                        .font(LauncherStyle.font(12)).foregroundStyle(.secondary).fixedSize(horizontal:false,vertical:true)
+                }
+                StatusLine(.good,"MacVolvo DXMT: included with \(Brand.name). Use it with DXMT as the graphics backend.")
+                if let version=model.d3dmetalVersion {
+                    HStack(alignment:.top,spacing:12) {
+                        StatusLine(.good,"Apple D3DMetal \(version), from your Game Porting Toolkit. Use it with D3DMetal as the graphics backend.")
+                        Button("Remove",action:model.removeGPTK).buttonStyle(.borderless).foregroundStyle(.red).font(LauncherStyle.font(12,.medium))
+                    }
+                    Button("Choose Another Game Porting Toolkit…",action:model.chooseGPTK).buttonStyle(.bordered).buttonBorderShape(.capsule).controlSize(.small)
+                        .disabled(model.importingGPTK)
+                } else {
+                    StatusLine(.pending,model.importingGPTK ? "Checking Apple’s signature and copying D3DMetal…" :
+                        "Apple D3DMetal: uses your own Game Porting Toolkit, which Apple doesn’t let \(Brand.name) include. Download it from Apple, then choose its \u{201C}Evaluation environment for Windows games\u{201D} image.",
+                               button:model.importingGPTK ? nil : "Choose Game Porting Toolkit…",action:model.chooseGPTK)
+                }
+            }
+        }
+    }
+
+    // MARK: Game profiles
+    private var profilesPanel:some View {
+        LauncherPanel(inset:16) {
+            VStack(alignment:.leading,spacing:10) {
+                VStack(alignment:.leading,spacing:2) {
+                    Text("Game profiles").font(LauncherStyle.font(14,.semibold))
+                    Text("Each one you install appears as a row for that game in Steam’s Compatibility settings. They tune MacVolvo DXMT.")
+                        .font(LauncherStyle.font(12)).foregroundStyle(.secondary).fixedSize(horizontal:false,vertical:true)
+                }
+                ForEach(NotProton.Profile.allCases) { profile in
+                    HStack(alignment:.center,spacing:12) {
+                        VStack(alignment:.leading,spacing:2) {
+                            Text(profile.title).font(LauncherStyle.font(13,.semibold))
+                            Text(profile.detail).font(LauncherStyle.font(12)).foregroundStyle(.secondary).fixedSize(horizontal:false,vertical:true)
+                        }
+                        Spacer(minLength:12)
+                        Toggle(profile.title,isOn:Binding(get:{ model.profiles.contains(profile) },set:{ model.setProfile(profile,$0) }))
+                            .labelsHidden().toggleStyle(.switch).tint(LauncherStyle.accent)
+                    }
+                }
+            }
         }
     }
 

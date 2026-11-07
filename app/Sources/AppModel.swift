@@ -62,7 +62,7 @@ final class AppModel {
     /// Standard's input stays. Steam carries it from when it opens, like the HUD.
     enum MouseInput:String, CaseIterable { case standard, classic, highPrecision="high-precision" }
     var mouseInput=MouseInput(rawValue:UserDefaults.standard.string(forKey:"mouseInput") ?? "") ?? .standard {
-        didSet { UserDefaults.standard.set(mouseInput.rawValue,forKey:"mouseInput");NotProton.updateSettings(notProtonSettings) }
+        didSet { UserDefaults.standard.set(mouseInput.rawValue,forKey:"mouseInput") }
     }
     /// At most how many times a second the game is sent the mouse's movement (worker: launch
     /// --mouse-rate). The window driver adds up what comes in between, so none is lost, only later.
@@ -74,24 +74,32 @@ final class AppModel {
         var perSecond:Int? { Int(rawValue) }
     }
     var mouseRate=MouseRate(rawValue:UserDefaults.standard.string(forKey:"mouseRate") ?? "") ?? .all {
-        didSet { UserDefaults.standard.set(mouseRate.rawValue,forKey:"mouseRate");NotProton.updateSettings(notProtonSettings) }
+        didSet { UserDefaults.standard.set(mouseRate.rawValue,forKey:"mouseRate") }
     }
     /// MacVolvo in NotProton's Steam (NotProton.swift): its status, as Settings last checked.
     var notProton=NotProton.Status.notInstalled
-    var notProtonSettings:String { NotProton.settings(mouse:mouseInput,rate:mouseRate) }
-    func checkNotProton() { notProton=NotProton.status(resources) }
+    var notProtonCurrent=false
+    /// What the driver reported about the High-precision mouse in the latest game (NotProton.swift).
+    var mouseStatus:NotProton.MouseStatus?
+    func checkNotProton() {
+        notProton=NotProton.status(resources)
+        notProtonCurrent=NotProton.isCurrent(resources:resources)
+        mouseStatus=NotProton.mouseStatus()
+    }
     func addToNotProton() {
+        let wasAdded:Bool={ if case .added=notProton { return true };return false }()
         do {
-            try NotProton.add(resources:resources,settings:notProtonSettings)
-            notice=NotProton.steamRunning ? "Added. Quit and reopen Steam, then choose \u{201C}MacVolvo\u{201D} in Steam › Settings › Compatibility." :
-                "Added. Open Steam and choose \u{201C}MacVolvo\u{201D} in Steam › Settings › Compatibility."
+            try NotProton.add(resources:resources)
+            notice=wasAdded ? "Updated. Games you start from now on use it." :
+                (NotProton.steamRunning ? "Added. Quit and reopen Steam to see MacVolvo in your games’ Compatibility settings." :
+                    "Added. MacVolvo is now in your games’ Compatibility settings in Steam.")
         } catch { notice=error.localizedDescription }
         checkNotProton()
     }
     func removeFromNotProton() {
         do {
             try NotProton.remove()
-            notice=NotProton.steamRunning ? "Removed. Quit and reopen Steam so it forgets the tool." : "Removed from Steam."
+            notice=NotProton.steamRunning ? "Removed. Quit and reopen Steam so its Compatibility settings no longer show MacVolvo." : "Removed from Steam."
         } catch { notice=error.localizedDescription }
         checkNotProton()
     }
@@ -218,7 +226,7 @@ final class AppModel {
         service=SetupService(root:selectedRoot,helper:Bundle.main.bundleURL.appendingPathComponent("Contents/Helpers/ow2-setup"))
         release=configuration
         // A newer MacVolvo brings a newer driver and run script for NotProton's Steam.
-        NotProton.refresh(resources:resources,settings:notProtonSettings)
+        NotProton.refresh(resources:resources)
     }
     func receive(_ value: [String:Any]) {
         guard let name=value["stage"] as? String else { return }
@@ -290,11 +298,29 @@ final class AppModel {
         // Opened from the disk image: move to Applications before anything else.
         if AppLocation.needsMove(Bundle.main.bundleURL) { prepareMove();return }
         if automaticUpdates { checkForUpdates(manual:false) }
+        // MacVolvo for NotProton needs no setup of its own: no worker, no Steam install.
+        guard windowsSteam else { checkNotProton();return }
+        startWindowsSteam(autoLaunch:true)
+    }
+    /// What the main window is. By default MacVolvo for NotProton (CompanionView): it installs,
+    /// updates and configures MacVolvo's driver and mouse for NotProton's macOS Steam, and
+    /// launches nothing. For troubleshooting, Settings › Advanced in that window switches to
+    /// MacVolvo's own Windows Steam in its own Wine environment (SetupView), and back.
+    var windowsSteam=UserDefaults.standard.bool(forKey:"windowsSteamMode") {
+        didSet { UserDefaults.standard.set(windowsSteam,forKey:"windowsSteamMode") }
+    }
+    func useWindowsSteam(_ on:Bool) {
+        guard on != windowsSteam,!busy else { return }
+        sheet=nil;notice=""
+        windowsSteam=on
+        if on { startWindowsSteam(autoLaunch:false) } else { checkNotProton() }
+    }
+    private func startWindowsSteam(autoLaunch:Bool) {
         screen = .checking
         perform {
             guard self.release != nil else { throw SetupFailure(code:"release_unavailable") }
             let retired=self.retireOlderCopies()
-            try await self.route(autoLaunch:true)
+            try await self.route(autoLaunch:autoLaunch)
             if let old=retired.first,self.notice.isEmpty {
                 self.notice="The old \(old.url.deletingPathExtension().lastPathComponent) app is in the Trash now. \(Brand.name) replaces it; your game and sign-in are kept."
             }
@@ -758,7 +784,7 @@ final class AppModel {
         }
     }
     func reopen() {
-        guard !busy && clientInstalled && sheet == nil else { return }
+        guard windowsSteam && !busy && clientInstalled && sheet == nil else { return }
         perform {
             // A Dock click while Steam or a game already runs shows this
             // window (Settings, Help, About) instead of hiding behind them.
@@ -778,6 +804,7 @@ final class AppModel {
         Task { try? await refresh() }
     }
     func syncSession() {
+        guard windowsSteam else { checkNotProton();return }
         refreshGames()
         guard !isPreview && !busy && screen == .running else { return }
         busy=true
@@ -954,8 +981,13 @@ final class AppModel {
             while busy { cancel(); try? await Task.sleep(for:.milliseconds(100)) }
             busy=true; notice=""
             defer { busy=false }
-            do { _ = try await service.run("uninstall",event:receive) }
-            catch { uninstall = .failed((error as? SetupFailure ?? SetupFailure(code:"unexpected_setup_error")).message);return }
+            // MacVolvo in NotProton's Steam: only MacVolvo's own files; NotProton and Steam stay.
+            do { try NotProton.remove() } catch { uninstall = .failed(error.localizedDescription);return }
+            // MacVolvo's own Steam (troubleshooting), only when it was ever set up here.
+            if fm.fileExists(atPath:root.path) {
+                do { _ = try await service.run("uninstall",event:receive) }
+                catch { uninstall = .failed((error as? SetupFailure ?? SetupFailure(code:"unexpected_setup_error")).message);return }
+            }
             // The game folder is in the Trash. Now remove what lives outside it:
             // the single-instance lock folder, saved defaults, then the app itself.
             let lockDirectory=fm.urls(for:.cachesDirectory,in:.userDomainMask)[0].appendingPathComponent(Brand.bundleIdentifier)

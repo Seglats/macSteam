@@ -29,6 +29,10 @@ struct SetupView: View {
                     Spacer(minLength:28)
                     VersionStatus(model:model).padding(.bottom,12)
                     HStack(spacing:12) {
+                        if model.windowsSteam {
+                            FooterTile(title:"NotProton",symbol:"arrow.uturn.backward") { model.useWindowsSteam(false) }.disabled(model.busy)
+                                .help("Back to MacVolvo for NotProton and the macOS Steam app")
+                        }
                         FooterTile(title:"Settings",symbol:"gearshape") { model.sheet = .settings }.disabled(model.screen == .moveApp)
                         FooterTile(title:"Help & FAQ",symbol:"questionmark.circle") { model.makeReport();model.sheet = .help }
                         FooterTile(title:"About",symbol:"info.circle") { model.sheet = .about }
@@ -54,7 +58,7 @@ struct SetupView: View {
     }
     private var subtitle:String {
         switch model.screen {
-        case .welcome: return "Set up Steam, then install Counter-Strike 2 or Deadlock."
+        case .welcome: return "For troubleshooting: Windows Steam in \(Brand.name)’s own Wine environment, apart from NotProton."
         case .moveApp:
             if let copy=model.installedCopy { return "Version \(copy.version) is in your Applications folder. Open it from there; this disk image is ejected for you." }
             return "\(Brand.name) runs from your Applications folder. It copies itself there, ejects this disk image and opens again."
@@ -142,7 +146,6 @@ struct SetupView: View {
             }
         case .ready, .running:
             VStack(spacing:16) {
-                GamePicker(model:model)
                 if model.lowStorage { storageWarning }
                 PerformanceTip()
                 if !model.firstMatchTipDismissed { FirstMatchTip { model.firstMatchTipDismissed=true } }
@@ -219,13 +222,8 @@ struct SetupView: View {
         case .installer:
             LauncherPrimaryAction(title:"Continue",action:model.finishInstaller).keyboardShortcut(.defaultAction).disabled(model.busy)
         case .ready, .running:
-            if model.installedGames.contains(model.selectedGame) {
-                LauncherPrimaryAction(title:"Play \(model.selectedGame.title)",action:model.play).keyboardShortcut(.defaultAction).disabled(model.busy)
-                // Steam on its own: the store, library, friends, settings.
-                ClientAction(title:"Open Steam",secondary:true,action:model.launch).disabled(model.busy)
-            } else {
-                ClientAction(title:"Open Steam",action:model.launch).keyboardShortcut(.defaultAction).disabled(model.busy)
-            }
+            // MacVolvo's own Steam, for troubleshooting: games start from Steam's Library.
+            ClientAction(title:"Open Steam",action:model.launch).keyboardShortcut(.defaultAction).disabled(model.busy)
         case .driveMissing:
             LauncherPrimaryAction(title:"Try Again",action:model.recheck).keyboardShortcut(.defaultAction).disabled(model.busy)
             Button("Set Up on This Mac Instead",action:model.useThisMac).buttonStyle(.borderless).disabled(model.busy)
@@ -304,51 +302,6 @@ struct FirstMatchTip: View {
             .background(LauncherStyle.accent.opacity(0.09),in:RoundedRectangle(cornerRadius:10,style:.continuous))
     }
 }
-// The Play screen's choice of game, remembered (AppModel.selectedGame). Each tile says
-// whether Steam has installed it; one that isn't says how to get it.
-struct GamePicker: View {
-    @Bindable var model:AppModel
-    @Environment(\.colorScheme) private var scheme
-    private let tick=Timer.publish(every:15,on:.main,in:.common).autoconnect()
-    var body:some View {
-        VStack(spacing:12) {
-            HStack(spacing:10) {
-                ForEach(AppModel.Game.allCases) { game in
-                    VStack(alignment:.leading,spacing:8) {
-                        tile(game)
-                        LaunchResolutionPicker(gameName:game.title,resolution:model.resolution(for:game),main:MainDisplay.current,
-                                               disabled:model.busy || model.running == .game) { model.chooseResolution($0,for:game) }
-                            .font(LauncherStyle.font(12)).padding(.leading,4)
-                        Toggle("Fullscreen",isOn:Binding(get:{ model.fullscreen(game) },set:{ model.setFullscreen(game,$0) }))
-                            .toggleStyle(.switch).controlSize(.small).font(LauncherStyle.font(12)).padding(.leading,4)
-                            .disabled(model.busy || model.running == .game).accessibilityLabel("\(game.title) fullscreen")
-                    }
-                }
-            }
-            Text("Launch options also apply when you press Play in Steam.")
-                .font(LauncherStyle.font(12)).foregroundStyle(.secondary)
-            if !model.installedGames.contains(model.selectedGame) {
-                LauncherNotice(text:"\(model.selectedGame.title) isn’t installed yet. Open Steam, find it in your Library (or the Store) and click Install. It appears here once it’s installed.",symbol:"arrow.down.circle")
-            }
-        }.onReceive(tick) { _ in model.refreshGames() }
-    }
-    private func tile(_ game:AppModel.Game) -> some View {
-        let selected=model.selectedGame == game, installed=model.installedGames.contains(game)
-        let shape=RoundedRectangle(cornerRadius:10,style:.continuous)
-        return Button { model.selectedGame=game } label: {
-            VStack(alignment:.leading,spacing:4) {
-                Text(game.title).font(LauncherStyle.font(14,.semibold)).foregroundStyle(.primary).lineLimit(1)
-                Label(installed ? "Installed" : "Not installed",systemImage:installed ? "checkmark.circle.fill" : "circle.dashed")
-                    .font(LauncherStyle.font(12)).foregroundStyle(.secondary)
-            }.padding(14).frame(maxWidth:.infinity,alignment:.leading)
-                .background(LauncherStyle.surface(scheme),in:shape)
-                .overlay { shape.strokeBorder(selected ? AnyShapeStyle(LauncherStyle.accent) : AnyShapeStyle(.primary.opacity(0.08)),lineWidth:selected ? 2 : 1) }
-                .contentShape(shape)
-        }.buttonStyle(.plain).disabled(model.busy)
-            .accessibilityLabel("\(game.title), \(installed ? "installed" : "not installed")").accessibilityAddTraits(selected ? .isSelected : [])
-    }
-}
-// The footer's three destinations, sized as buttons.
 struct FooterTile: View {
     let title:String
     let symbol:String

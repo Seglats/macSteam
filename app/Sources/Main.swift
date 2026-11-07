@@ -23,7 +23,7 @@ import Darwin
         window=NSWindow(contentRect:NSRect(x:0,y:0,width:600,height:800),styleMask:[.titled,.closable,.miniaturizable,.resizable],backing:.buffered,defer:false)
         window.title=Brand.name;window.isReleasedWhenClosed=false
         window.titlebarAppearsTransparent=true;window.minSize=NSSize(width:540,height:620)
-        window.contentView=NSHostingView(rootView:SetupView(model:model));window.center();window.makeKeyAndOrderFront(nil)
+        window.contentView=NSHostingView(rootView:RootView(model:model));window.center();window.makeKeyAndOrderFront(nil)
         NSApp.mainMenu=menu();NSApp.activate(ignoringOtherApps:true)
     }
     func menu()->NSMenu {
@@ -34,7 +34,6 @@ import Darwin
         app.addItem(.separator())
         add("Settings…",#selector(settings),",")
         app.addItem(.separator())
-        for game in AppModel.Game.allCases { app.addItem(playItem(game)) }
         add("Open Steam",#selector(launch),"o")
         app.addItem(.separator())
         add("Uninstall \(Brand.name)…",#selector(uninstall))
@@ -71,32 +70,21 @@ import Darwin
     func validateMenuItem(_ item:NSMenuItem)->Bool {
         if item.action == #selector(checkForUpdates) && !Brand.allowsUpdates { return false }
         // Still on the disk image: only moving to Applications, Help and About.
-        if model.screen == .moveApp,let action=item.action,[#selector(launch),#selector(forceQuit),#selector(play(_:)),#selector(settings),#selector(checkForUpdates),#selector(uninstall)].contains(action) { return false }
-        if item.action == #selector(launch) || item.action == #selector(forceQuit) { return model.clientInstalled && !model.busy }
-        if item.action == #selector(play(_:)) {
-            let game=(item.representedObject as? String).flatMap(AppModel.Game.init(rawValue:))
-            return model.clientInstalled && game.map(model.installedGames.contains) == true && !model.busy
-        }
+        if model.screen == .moveApp,let action=item.action,[#selector(launch),#selector(forceQuit),#selector(settings),#selector(checkForUpdates),#selector(uninstall)].contains(action) { return false }
+        // Opening or quitting MacVolvo's own Steam only in that troubleshooting mode.
+        if item.action == #selector(launch) || item.action == #selector(forceQuit) { return model.windowsSteam && model.clientInstalled && !model.busy }
+        if item.action == #selector(settings) && !model.windowsSteam { return false }
         if item.action == #selector(settings) || item.action == #selector(checkForUpdates) { return model.uninstall != .working }
         return true
     }
-    // Right-clicking the Dock icon: start the game, or close a frozen one.
+    // Right-clicking the Dock icon in MacVolvo's own Steam: open it, or close a frozen game.
     func applicationDockMenu(_ sender:NSApplication)->NSMenu? {
+        guard model.windowsSteam else { return nil }
         let menu=NSMenu()
-        for game in AppModel.Game.allCases { menu.addItem(playItem(game)) }
         for (title,action) in [("Open Steam",#selector(launch)),("Force Quit Game & Steam…",#selector(forceQuit))] {
             let item=NSMenuItem(title:title,action:action,keyEquivalent:"");item.target=self;menu.addItem(item)
         }
         return menu
-    }
-    /// Play <game>, in the app and Dock menus; enabled once Steam has installed it.
-    private func playItem(_ game:AppModel.Game)->NSMenuItem {
-        let item=NSMenuItem(title:"Play \(game.title)",action:#selector(play(_:)),keyEquivalent:"")
-        item.representedObject=game.rawValue;item.target=self;return item
-    }
-    @objc func play(_ sender:NSMenuItem) {
-        guard let game=(sender.representedObject as? String).flatMap(AppModel.Game.init(rawValue:)) else { return }
-        show();model.play(game)
     }
     @objc func checkForUpdates() { show();model.checkForUpdates(manual:true) }
     @objc func whatsNew() { show();model.sheet = .whatsNew }
@@ -140,5 +128,14 @@ import Darwin
         let app=NSApplication.shared,delegate=AppDelegate()
         app.setActivationPolicy(.regular);app.delegate=delegate
         withExtendedLifetime(delegate) { app.run() }
+    }
+}
+
+/// The window's content: MacVolvo for NotProton, or, for troubleshooting, MacVolvo's own Windows
+/// Steam (AppModel.windowsSteam). Moving to Applications comes first in either.
+struct RootView:View {
+    @Bindable var model:AppModel
+    var body:some View {
+        if model.windowsSteam || model.screen == .moveApp { SetupView(model:model) } else { CompanionView(model:model) }
     }
 }

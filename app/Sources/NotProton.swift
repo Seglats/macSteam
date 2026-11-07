@@ -2,22 +2,20 @@ import Foundation
 
 /// MacVolvo with NotProton (https://github.com/NotProtonNot/NotProton), which turns on Steam Play
 /// in the macOS Steam app and runs Windows games in a copy of CrossOver ("runner"). MacVolvo
-/// doesn't replace any of it. It adds itself through NotProton's own extension points:
+/// replaces nothing of it: no tool, no runner, no CrossOver. It adds options to each game's
+/// Compatibility page in Steam, through NotProton's own extension points (its conf-format.md):
 ///
-/// - a runner variant (notproton/variants/macvolvo.conf) that lays MacVolvo's Mac driver
-///   (winemac.so: raw mouse input, High-precision, fullscreen and display fixes) over the
-///   runner. NotProton builds that runner copy on first use. The driver is built from the same
-///   CrossOver sources as the runner, one per build (Resources/NotProton/<build>/winemac.so),
+/// - a runner variant, "MacVolvo" (notproton/variants/macvolvo.conf): MacVolvo's Mac driver
+///   (winemac.so: raw mouse input, High-precision, fullscreen and display fixes) laid over
+///   NotProton's runner, in a copy NotProton builds on first use. The driver is compiled from the
+///   same CrossOver sources as the runner, one per build (Resources/NotProton/<build>/winemac.so),
 ///   and the variant names its build, so NotProton never applies it to another one;
-/// - a Steam compatibility tool, "MacVolvo (CrossOver 26.3)", next to NotProton's own in
-///   compatibilitytools.d. Its run script (Resources/NotProton/run.sh) adds the variant and the
-///   mouse settings and then runs NotProton's tool unchanged. Chosen as Steam's default tool
-///   (Steam › Settings › Compatibility) it applies to every game; per game in its Properties.
+/// - plugin rows (notproton/plugins/macvolvo.conf): "MacVolvo mouse", with High-precision,
+///   Classic timing and Mouse updates under it. Each sets the driver's WINEMAC_* variables for
+///   that game only, and only for the CrossOver tools the driver is built for.
 ///
-/// The folder is named notproton-… because NotProton's hooks in Steam only handle tools named
-/// that way. NotProton removes such folders when they hold a `flavor` file or its run script,
-/// so this one has neither, as the FINALS compatibility package does. Nothing NotProton wrote
-/// is changed, and Remove deletes only what carries MacVolvo's marker.
+/// Both files say MacVolvo wrote them; NotProton never writes to those folders. Remove deletes
+/// only what carries MacVolvo's marker.
 enum NotProton {
     static let projectURL=URL(string:"https://github.com/NotProtonNot/NotProton")!
     private static let fm=FileManager.default
@@ -28,17 +26,16 @@ enum NotProton {
     static var steamTools:URL { library.appendingPathComponent("Steam/compatibilitytools.d") }
     /// MacVolvo's own folder for this, apart from the worker's data folder.
     static var ours:URL { library.appendingPathComponent("MacVolvo NotProton") }
-    static var settingsFile:URL { ours.appendingPathComponent("settings") }
     private static var variantsFile:URL { support.appendingPathComponent("variants/macvolvo.conf") }
+    private static var pluginsFile:URL { support.appendingPathComponent("plugins/macvolvo.conf") }
     private static let owner="Written by MacVolvo.app, which also removes it."
-    private static let ownerFile=".macvolvo-owner"
+    /// The variant group, which is the dropdown's label in the Compatibility page.
+    static let variantGroup="MacVolvo"
 
     /// One of NotProton's Steam tools, from its registry (notproton/tools: name, build, flavor,
     /// display name, tab-separated).
     struct Tool:Equatable {
         let name, build, flavor, display:String
-        var ourName:String { "notproton-macvolvo" + name.dropFirst("notproton".count) }
-        var ourDisplay:String { "MacVolvo (\(display))" }
         var variant:String { "macvolvo-" + build }
     }
     enum Status:Equatable {
@@ -58,7 +55,6 @@ enum NotProton {
         return text.split(separator:"\n").compactMap { line in
             let f=line.split(separator:"\t",omittingEmptySubsequences:false)
             guard f.count >= 4, f[0].hasPrefix("notproton"), valid(f[0]), valid(f[1]), valid(f[2]) else { return nil }
-            guard fm.isExecutableFile(atPath:steamTools.appendingPathComponent(String(f[0])+"/run").path) else { return nil }
             return Tool(name:String(f[0]),build:String(f[1]),flavor:String(f[2]),
                         display:String(f[3]).filter { $0 != "\"" && $0 != "\\" && !$0.isNewline })
         }
@@ -74,14 +70,12 @@ enum NotProton {
         let builds=drivers(resources)
         return tools().filter { $0.flavor == "rosetta" && builds.contains($0.build) }
     }
-    static func isAdded(_ tool:Tool)->Bool {
-        fm.fileExists(atPath:steamTools.appendingPathComponent(tool.ourName+"/"+ownerFile).path)
-    }
+    static var isAdded:Bool { owns(variantsFile) || owns(pluginsFile) }
     static func status(_ resources:URL)->Status {
         guard installed else { return .notInstalled }
         let tools=supported(resources)
         if tools.isEmpty { return .unsupported(builds:Self.tools().map(\.build)) }
-        return tools.contains(where:isAdded) ? .added(tools) : .available(tools)
+        return isAdded ? .added(tools) : .available(tools)
     }
     static var steamRunning:Bool {
         let task=Process();task.executableURL=URL(fileURLWithPath:"/usr/bin/pgrep");task.arguments=["-x","steam_osx"]
@@ -90,106 +84,146 @@ enum NotProton {
         task.waitUntilExit();return task.terminationStatus == 0
     }
 
-    /// The mouse settings the run script reads (only these names; see run.sh).
-    static func settings(mouse:AppModel.MouseInput, rate:AppModel.MouseRate)->String {
-        // Every program but Steam's own and Wine's desktop, as portable_steam.h mouselookList().
-        var lines=["WINEMAC_MOUSELOOK=*;!steam.exe;!steamwebhelper.exe;!steamwebhelper_real.exe;!steamservice.exe;"
-                   + "!steamerrorreporter.exe;!steamerrorreporter64.exe;!gameoverlayui.exe;!gameoverlayui64.exe;!explorer.exe"]
-        if mouse == .classic { lines.append("WINEMAC_INPUT_VARIANT=classic") }
-        else {
-            lines.append("WINEMAC_INPUT_VARIANT=precise")
-            if mouse == .highPrecision { lines.append("WINEMAC_RAW_SOURCE=hid") }
-            lines.append("WINEMAC_MOUSELOOK_RAW_INTERVAL_US=" + (rate.perSecond.map { String(1_000_000/$0) } ?? "0"))
-        }
-        return lines.joined(separator:"\n")+"\n"
-    }
-
-    /// Adds (or brings up to date) MacVolvo's driver, variant and tool for every supported runner.
-    static func add(resources:URL, settings:String) throws {
-        let tools=supported(resources)
-        guard !tools.isEmpty else { throw failure("NotProton has no CrossOver build this version of MacVolvo has a driver for.") }
-        guard let template=try? String(contentsOf:resources.appendingPathComponent("NotProton/run.sh"),encoding:.utf8) else {
-            throw failure("This copy of MacVolvo is missing its NotProton files. Download it again.")
-        }
-        // Refuse before writing anything when a file in MacVolvo's place isn't MacVolvo's.
-        if fm.fileExists(atPath:variantsFile.path) && !ownsVariants() { throw failure("\(variantsFile.path) wasn't written by MacVolvo, so nothing was changed.") }
+    // MARK: The two files
+    private static func driver(_ tool:Tool)->URL { ours.appendingPathComponent(tool.build+"/winemac.so") }
+    static func variantsText(_ tools:[Tool])->String {
+        var text="# \(owner)\n# MacVolvo's Mac driver over NotProton's CrossOver runner. In a game's Properties ›\n"
+            + "# Compatibility, choose \(variantGroup) as the runner variant; MacVolvo mouse is in the same section.\n"
         for tool in tools {
-            let folder=steamTools.appendingPathComponent(tool.ourName)
-            if fm.fileExists(atPath:folder.path) && !isAdded(tool) { throw failure("\(folder.path) wasn't made by MacVolvo, so nothing was changed.") }
-        }
-        try fm.createDirectory(at:ours,withIntermediateDirectories:true)
-        var variants="# \(owner)\n# MacVolvo's Mac driver over NotProton's CrossOver runner (MacVolvo › Settings › General).\n"
-        for tool in tools {
-            let driver=ours.appendingPathComponent(tool.build)
-            try fm.createDirectory(at:driver,withIntermediateDirectories:true)
-            try replace(driver.appendingPathComponent("winemac.so")) { try fm.copyItem(at:resources.appendingPathComponent("NotProton/\(tool.build)/winemac.so"),to:$0) }
-            variants += """
+            text += """
 
             [\(tool.variant)]
-            label = MacVolvo mouse and display driver
-            variant = MacVolvo
-            src = \(driver.path)
+            label = MacVolvo driver
+            variant = \(variantGroup)
+            src = \(driver(tool).deletingLastPathComponent().path)
             dst = lib/wine/x86_64-unix
             build = \(tool.build)
 
             """
         }
-        try write(settings,to:settingsFile)
-        try fm.createDirectory(at:variantsFile.deletingLastPathComponent(),withIntermediateDirectories:true)
-        try write(variants,to:variantsFile)
-        for tool in tools {
-            let folder=steamTools.appendingPathComponent(tool.ourName)
-            let stage=steamTools.appendingPathComponent(".\(tool.ourName).\(UUID().uuidString)")
-            try fm.createDirectory(at:stage,withIntermediateDirectories:true)
-            do {
-                try write(owner+"\n",to:stage.appendingPathComponent(ownerFile))
-                try write("\"manifest\"\n{\n  \"version\" \"2\"\n  \"commandline\" \"/run %verb%\"\n}\n",to:stage.appendingPathComponent("toolmanifest.vdf"))
-                try write("""
-                "compatibilitytools"
-                {
-                  "compat_tools"
-                  {
-                    "\(tool.ourName)"
-                    {
-                      "install_path" "."
-                      "display_name" "\(tool.ourDisplay)"
-                      "from_oslist" "windows"
-                      "to_oslist" "macos"
-                    }
-                  }
-                }
+        return text
+    }
+    /// Every program but Steam's own and Wine's desktop, as portable_steam.h mouselookList().
+    static let mouselook="*;!steam.exe;!steamwebhelper.exe;!steamwebhelper_real.exe;!steamservice.exe;"
+        + "!steamerrorreporter.exe;!steamerrorreporter64.exe;!gameoverlayui.exe;!gameoverlayui64.exe;!explorer.exe"
+    static func pluginsText(_ tools:[Tool])->String {
+        // Plugin env lines win over NOTPROTON_ENV_ launch options (compat_run.sh), so the update
+        // rate, a slider, is left to its NOTPROTON_ENV_ option and no row sets it. Its default is
+        // the driver's own: at most one delivery a millisecond.
+        let toolLines=tools.map { "tools = \($0.name)" }.joined(separator:"\n")
+        let requires=tools.map { "requires = \(driver($0).path)" }.joined(separator:"\n")
+        return """
+        # \(owner)
+        # MacVolvo's mouse in a game's Properties › Compatibility (Developer). Needs the \(variantGroup)
+        # runner variant, which carries MacVolvo's driver.
 
-                """,to:stage.appendingPathComponent("compatibilitytool.vdf"))
-                let run=stage.appendingPathComponent("run")
-                try write(template.replacingOccurrences(of:"@NP_TOOL@",with:tool.name).replacingOccurrences(of:"@VARIANT@",with:tool.variant),to:run)
-                try fm.setAttributes([.posixPermissions:0o755],ofItemAtPath:run.path)
-                if fm.fileExists(atPath:folder.path) { try fm.removeItem(at:folder) }
-                try fm.moveItem(at:stage,to:folder)
-            } catch { try? fm.removeItem(at:stage);throw error }
+        [NOTPROTON_MACVOLVO_MOUSE]
+        label = MacVolvo mouse
+        description = Raw mouse input from MacVolvo’s driver, each click after the movement before it. Choose the \(variantGroup) runner variant too.
+        \(requires)
+        \(toolLines)
+        env = WINEMAC_MOUSELOOK=\(mouselook)
+        env = WINEMAC_INPUT_VARIANT=precise
+        env = WINEMAC_RAW_STATUS=$HOME/Library/Application Support/MacVolvo NotProton/hid-status.json
+
+        [NOTPROTON_MACVOLVO_HIGH_PRECISION]
+        label = High-precision
+        description = Reads your mouse directly, skipping macOS’s mouse layer. macOS asks to allow Input Monitoring for Steam.
+        depends = NOTPROTON_MACVOLVO_MOUSE
+        \(toolLines)
+        env = WINEMAC_RAW_SOURCE=hid
+        env = WINEMAC_RAW_REQUEST=1
+
+        [NOTPROTON_MACVOLVO_CLASSIC]
+        label = Classic timing
+        description = The older mouse timing. Try it if MacVolvo mouse feels different to you.
+        depends = NOTPROTON_MACVOLVO_MOUSE
+        \(toolLines)
+        env = WINEMAC_INPUT_VARIANT=classic
+
+        [NOTPROTON_ENV_WINEMAC_MOUSELOOK_RAW_INTERVAL_US]
+        label = Mouse updates
+        description = How many times a second the game gets your mouse’s movement. Movement in between is added to the next one.
+        type = slider
+        depends = NOTPROTON_MACVOLVO_MOUSE
+        \(toolLines)
+        choice = 4000 = 250
+        choice = 2000 = 500
+        choice = 1000 = 1,000
+        choice = 500 = 2,000
+        choice = 0 = Every update
+        default = 1000
+
+        """
+    }
+
+    // MARK: Add, update, remove
+    /// Adds (or brings up to date) MacVolvo's driver, variant and rows for every supported runner.
+    static func add(resources:URL) throws {
+        let tools=supported(resources)
+        guard !tools.isEmpty else { throw failure("NotProton has no CrossOver build this version of MacVolvo has a driver for.") }
+        // Refuse before writing anything when a file in MacVolvo's place isn't MacVolvo's.
+        for file in [variantsFile,pluginsFile] where fm.fileExists(atPath:file.path) && !owns(file) {
+            throw failure("\(file.path) wasn't written by MacVolvo, so nothing was changed.")
         }
+        for tool in tools {
+            try fm.createDirectory(at:driver(tool).deletingLastPathComponent(),withIntermediateDirectories:true)
+            try replace(driver(tool)) { try fm.copyItem(at:resources.appendingPathComponent("NotProton/\(tool.build)/winemac.so"),to:$0) }
+        }
+        for file in [variantsFile,pluginsFile] { try fm.createDirectory(at:file.deletingLastPathComponent(),withIntermediateDirectories:true) }
+        try write(variantsText(tools),to:variantsFile)
+        try write(pluginsText(tools),to:pluginsFile)
+        removeEarlierTool()
     }
-    /// The mouse settings changed: the next launch reads them; Steam needn't restart.
-    static func updateSettings(_ settings:String) {
-        guard fm.fileExists(atPath:ours.path) else { return }
-        try? write(settings,to:settingsFile)
-    }
-    /// Removes only what carries MacVolvo's marker: its tools, its variant file and its folder.
+    /// Removes only what carries MacVolvo's marker: the two files and MacVolvo's folder.
     static func remove() throws {
-        for name in (try? fm.contentsOfDirectory(atPath:steamTools.path)) ?? [] where name.hasPrefix("notproton-macvolvo") {
-            let folder=steamTools.appendingPathComponent(name)
-            if fm.fileExists(atPath:folder.appendingPathComponent(ownerFile).path) { try fm.removeItem(at:folder) }
-        }
-        if ownsVariants() { try fm.removeItem(at:variantsFile) }
+        for file in [variantsFile,pluginsFile] where owns(file) { try fm.removeItem(at:file) }
+        removeEarlierTool()
         if fm.fileExists(atPath:ours.path) { try fm.removeItem(at:ours) }
     }
-    /// After an update of MacVolvo: puts its current driver and run script in place, if added.
-    static func refresh(resources:URL, settings:String) {
-        guard case .added=status(resources) else { return }
-        try? add(resources:resources,settings:settings)
+    /// After an update of MacVolvo: puts its current driver and rows in place, if added.
+    static func refresh(resources:URL) {
+        guard case .added=status(resources),!isCurrent(resources:resources) else { return }
+        try? add(resources:resources)
+    }
+    /// Whether what's in place is what this copy of MacVolvo brings.
+    static func isCurrent(resources:URL)->Bool {
+        let tools=supported(resources)
+        return !tools.isEmpty && (try? String(contentsOf:variantsFile,encoding:.utf8)) == variantsText(tools)
+            && (try? String(contentsOf:pluginsFile,encoding:.utf8)) == pluginsText(tools)
+            && tools.allSatisfy { fm.contentsEqual(atPath:driver($0).path,andPath:resources.appendingPathComponent("NotProton/\($0.build)/winemac.so").path) }
+    }
+    /// The first version made a Steam tool of its own (notproton-macvolvo-*) and a settings file.
+    private static func removeEarlierTool() {
+        for name in (try? fm.contentsOfDirectory(atPath:steamTools.path)) ?? [] where name.hasPrefix("notproton-macvolvo") {
+            let folder=steamTools.appendingPathComponent(name)
+            if fm.fileExists(atPath:folder.appendingPathComponent(".macvolvo-owner").path) { try? fm.removeItem(at:folder) }
+        }
+        try? fm.removeItem(at:ours.appendingPathComponent("settings"))
     }
 
-    private static func ownsVariants()->Bool {
-        (try? String(contentsOf:variantsFile,encoding:.utf8))?.hasPrefix("# "+owner) == true
+    // MARK: The mouse report
+    /// What MacVolvo's driver said about the High-precision mouse in the latest game that used it
+    /// (WINEMAC_RAW_STATUS; cocoa_app.m hid_write_status). macOS gives Input Monitoring to the app
+    /// that started the game, Steam here, and only the game can ask.
+    struct MouseStatus:Decodable, Equatable {
+        let access:String       // granted, denied, unknown
+        let open:Int            // IOHIDManagerOpen's result, 0 when the mice opened
+        let mice:Int            // mice open (trackpads aren't counted)
+        let reporting:Bool      // one has sent movement: the game reads the mouse directly
+        let process:String
+        let time:TimeInterval
+        var date:Date { Date(timeIntervalSince1970:time) }
+    }
+    static var mouseStatusFile:URL { ours.appendingPathComponent("hid-status.json") }
+    static func mouseStatus()->MouseStatus? {
+        guard let data=try? Data(contentsOf:mouseStatusFile),data.count < 4096 else { return nil }
+        return try? JSONDecoder().decode(MouseStatus.self,from:data)
+    }
+
+    // MARK: Files
+    private static func owns(_ file:URL)->Bool {
+        (try? String(contentsOf:file,encoding:.utf8))?.hasPrefix("# "+owner) == true
     }
     private static func write(_ text:String, to url:URL) throws {
         try replace(url) { try Data(text.utf8).write(to:$0) }

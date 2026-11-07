@@ -72,11 +72,9 @@ def build(output,workspace,runtime_archive,icon=None,identity=None,variant='dxmt
     (resources/'release.json').write_text(json.dumps(release,separators=(',',':'))+'\n')
     shutil.copy2(ROOT/'docs/candidate-parity-contract.json',resources/'candidate-parity-contract.json')
     # NotProton (app/Sources/NotProton.swift): MacVolvo's Mac driver for NotProton's CrossOver runner,
-    # one folder per CrossOver build it was compiled for, taken from the runtime it ships, plus
-    # the Steam tool's run script.
+    # one folder per CrossOver build it was compiled for, taken from the runtime it ships.
     if not evaluation:
         notproton=resources/'NotProton';notproton.mkdir()
-        shutil.copy2(ROOT/'app/Resources/NotProton/run.sh',notproton/'run.sh')
         with tempfile.TemporaryDirectory() as folder:
             run('/usr/bin/tar','-xzf',runtime_archive,'-C',folder,NOTPROTON_DRIVER)
             for build in NOTPROTON_BUILDS:

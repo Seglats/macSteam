@@ -206,4 +206,35 @@ extension NotProton {
         guard (try? task.run()) != nil else { return false }
         task.waitUntilExit();return task.terminationStatus == 0
     }
+
+    // MARK: NotProton's own D3DMetal
+    /// The D3DMetal in NotProton's CrossOver for that build, if it has one: offered by NotProton itself
+    /// with D3DMetal as the graphics backend, no MacVolvo renderer needed.
+    static func runnerD3DMetalVersion(_ tool:Tool)->String? {
+        let framework=support.appendingPathComponent("runners/crossover-\(tool.build)/CrossOver/lib64/apple_gptk/external/D3DMetal.framework")
+        for plist in ["Resources/Info.plist","Versions/A/Resources/Info.plist"] {
+            if let info=NSDictionary(contentsOf:framework.appendingPathComponent(plist)),
+               info["CFBundleIdentifier"] as? String == "com.apple.D3DMetal",let version=info["CFBundleShortVersionString"] as? String { return version }
+        }
+        return nil
+    }
+
+    // MARK: Restarting Steam
+    /// The Steam app NotProton patched, which loads NotProton when opened: NotProton's own setting,
+    /// else /Applications/Steam.app (SupportPaths.Steam.app in NotProton).
+    static var steamApp:URL {
+        let path=CFPreferencesCopyAppValue("steamAppPath" as CFString,"com.notproton.NotProton" as CFString) as? String
+        return URL(fileURLWithPath:path ?? "/Applications/Steam.app")
+    }
+    /// Asks Steam to quit the way NotProton does (steam://exit), waits up to 30 seconds, then opens
+    /// it again. Never forces it: a game or download in progress keeps Steam open, and false comes back.
+    static func restartSteam()->Bool {
+        if steamRunning {
+            _ = tool("/usr/bin/open",["-g","steam://exit"])
+            for _ in 0..<60 where steamRunning { Thread.sleep(forTimeInterval:0.5) }
+            guard !steamRunning else { return false }
+            Thread.sleep(forTimeInterval:1)
+        }
+        return tool("/usr/bin/open",[steamApp.path])
+    }
 }

@@ -185,11 +185,13 @@ enum NotProton {
         if fm.fileExists(atPath:ours.path) { try fm.removeItem(at:ours) }
     }
     /// After an update of MacVolvo: puts its current driver and rows in place, if added.
-    static func refresh(resources:URL) {
+    /// Brings what's in Steam up to this copy of MacVolvo, in place. True when it changed anything,
+    /// which Steam only sees after a restart.
+    @discardableResult static func refresh(resources:URL)->Bool {
         // Deadlock can save Vulkan again from its Video settings; its profile keeps it on DirectX 11.
         if installedProfiles.contains(.deadlock) { keepDeadlockOnDirectX11() }
-        guard case .added=status(resources),!isCurrent(resources:resources) else { return }
-        try? add(resources:resources)
+        guard case .added=status(resources),!isCurrent(resources:resources) else { return false }
+        return (try? add(resources:resources)) != nil
     }
     /// Whether what's in place is what this copy of MacVolvo brings.
     static func isCurrent(resources:URL)->Bool {

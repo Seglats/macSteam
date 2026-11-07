@@ -20,6 +20,8 @@ import Foundation
         case "remove": try NotProton.remove()
         case "cs2": try NotProton.setProfile(.cs2,installed:true,resources:res);try NotProton.add(resources:res)
         case "deadlock": try NotProton.setProfile(.deadlock,installed:true,resources:res)
+        case "refresh": out["changed"]=NotProton.refresh(resources:res)
+        case "runnerd3d": out["d3dmetal"]=NotProton.supported(res).first.flatMap(NotProton.runnerD3DMetalVersion) ?? "none"
         default: break
         }
     } catch { out["error"]=error.localizedDescription }
@@ -146,6 +148,26 @@ class NotProtonOptions(unittest.TestCase):
         self.assertFalse(self.variants.exists() or self.plugins.exists())
         self.assertFalse((self.lib / 'MacVolvo NotProton').exists())
         self.assertTrue((notprotons / 'run').exists())
+
+    def test_a_newer_driver_is_updated_in_place_and_says_so_once(self):
+        self.run_tool('add')
+        self.assertEqual(self.run_tool('refresh'), {'status': 'added', 'current': True, 'changed': False})
+        (self.resources / 'NotProton/26.3.0.39832/winemac.so').write_bytes(b'driver v2')
+        self.assertEqual(self.run_tool('refresh'), {'status': 'added', 'current': True, 'changed': True})
+        self.assertEqual((self.lib / 'MacVolvo NotProton/26.3.0.39832/winemac.so').read_bytes(), b'driver v2')
+        self.assertEqual(self.run_tool('refresh')['changed'], False)
+
+    def test_refresh_never_adds_what_was_not_added(self):
+        self.assertEqual(self.run_tool('refresh'), {'status': 'available', 'current': False, 'changed': False})
+
+    def test_reads_the_d3dmetal_notprotons_crossover_has(self):
+        self.assertEqual(self.run_tool('runnerd3d')['d3dmetal'], 'none')
+        resources = self.lib / 'notproton/runners/crossover-26.3.0.39832/CrossOver/lib64/apple_gptk/external/D3DMetal.framework/Versions/A/Resources'
+        resources.mkdir(parents=True)
+        subprocess.run(['plutil', '-create', 'xml1', str(resources / 'Info.plist')], check=True)
+        for key, value in (('CFBundleIdentifier', 'com.apple.D3DMetal'), ('CFBundleShortVersionString', '4.0b3')):
+            subprocess.run(['plutil', '-insert', key, '-string', value, str(resources / 'Info.plist')], check=True)
+        self.assertEqual(self.run_tool('runnerd3d')['d3dmetal'], '4.0b3')
 
     def test_without_notproton_it_says_so(self):
         (self.lib / 'notproton/tools').unlink()

@@ -53,6 +53,10 @@ struct CompanionView:View {
             Button("Cancel",role:.cancel) {}
             Button("Remove",role:.destructive,action:model.removeFromNotProton)
         } message: { Text("Removes MacVolvo’s options from your games’ Compatibility settings, and its driver. NotProton, CrossOver, Steam and your games stay as they are; games that used MacVolvo run on NotProton’s CrossOver as before.") }
+        .alert("Restart Steam now?",isPresented:$model.askRestartSteam) {
+            Button("Later",role:.cancel) {}
+            Button("Restart Steam",action:model.restartSteam).keyboardShortcut(.defaultAction)
+        } message: { Text("Steam reads \(Brand.name)’s options when it starts, so it shows the change after a restart. Steam is asked to quit as usual; if a game or download is running, it stays open.") }
         .alert("Use MacVolvo’s own Steam?",isPresented:$confirmWindowsSteam) {
             Button("Cancel",role:.cancel) {}
             Button("Continue") { model.useWindowsSteam(true) }
@@ -107,9 +111,13 @@ struct CompanionView:View {
             if !model.notProtonCurrent {
                 LauncherPrimaryAction(title:"Update",action:model.addToNotProton).keyboardShortcut(.defaultAction)
             }
-            LauncherNotice(text:"In Steam, open a game’s Properties › Compatibility and keep NotProton’s CrossOver. Under Developer, choose \u{201C}MacVolvo driver\u{201D}, a \u{201C}MacVolvo renderer\u{201D} if you like (with the matching graphics backend), and turn on \u{201C}MacVolvo mouse\u{201D}. Restart Steam after changing anything here.",symbol:"gamecontroller")
-            Button("Remove from Steam…",role:.destructive) { confirmRemove=true }
-                .buttonStyle(.borderless).foregroundStyle(.red).font(LauncherStyle.font(13,.medium))
+            LauncherNotice(text:"In Steam, open a game’s Properties › Compatibility and keep NotProton’s CrossOver. Under Developer, choose \u{201C}MacVolvo driver\u{201D}, a \u{201C}MacVolvo renderer\u{201D} if you like (with the matching graphics backend), and turn on \u{201C}MacVolvo mouse\u{201D}. To use them for every game, save them as NotProton’s defaults for CrossOver 26.3.",symbol:"gamecontroller")
+            HStack(spacing:18) {
+                Button(model.restartingSteam ? "Restarting Steam…" : "Restart Steam",action:model.restartSteam)
+                    .buttonStyle(.borderless).font(LauncherStyle.font(13,.medium)).disabled(model.restartingSteam)
+                Button("Remove from Steam…",role:.destructive) { confirmRemove=true }
+                    .buttonStyle(.borderless).foregroundStyle(.red).font(LauncherStyle.font(13,.medium))
+            }
         }
     }
 
@@ -130,6 +138,10 @@ struct CompanionView:View {
                     }
                     Button("Choose Another Game Porting Toolkit…",action:model.chooseGPTK).buttonStyle(.bordered).buttonBorderShape(.capsule).controlSize(.small)
                         .disabled(model.importingGPTK)
+                } else if let version=model.runnerD3DMetal {
+                    StatusLine(.good,"Apple D3DMetal \(version): included with NotProton’s CrossOver. Choose D3DMetal as the graphics backend; no MacVolvo renderer needed.")
+                    Button(model.importingGPTK ? "Checking Apple’s signature and copying D3DMetal…" : "Use a Newer Game Porting Toolkit…",action:model.chooseGPTK)
+                        .buttonStyle(.bordered).buttonBorderShape(.capsule).controlSize(.small).disabled(model.importingGPTK)
                 } else {
                     StatusLine(.pending,model.importingGPTK ? "Checking Apple’s signature and copying D3DMetal…" :
                         "Apple D3DMetal: uses your own Game Porting Toolkit, which Apple doesn’t let \(Brand.name) include. Download it from Apple, then choose its \u{201C}Evaluation environment for Windows games\u{201D} image.",

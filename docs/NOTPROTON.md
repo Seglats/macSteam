@@ -39,6 +39,10 @@ The variants:
   4. swaps the copy in
 
   A bad image changes nothing.
+- **NotProton's own D3DMetal:** NotProton's CrossOver already has one
+  (`runners/crossover-<build>/CrossOver/lib64/apple_gptk`). The window shows it as available
+  (`runnerD3DMetalVersion`); it needs no MacVolvo renderer, only D3DMetal as the backend.
+  Importing a Game Porting Toolkit is for a newer D3DMetal than that.
 - **Graphics backend:** choose NotProton's matching backend for the game (DXMT or D3DMetal).
 
 The rows:
@@ -94,6 +98,9 @@ NotProton builds a runner copy with the driver on that game's first launch.
 - **Who needs the permission:** NotProton usually runs the game's Wine directly from its
   script, a child of Steam, so macOS gives Input Monitoring to **Steam**. MacVolvo never asks
   for itself in this mode.
+- **No button can ask for Steam:** macOS only adds an app to Input Monitoring after it asks, and
+  Steam's real bundle (`Steam.AppBundle/Steam`, the responsible process for games) is a folder
+  Settings' + can't pick. The first game started with High-precision asks.
 - **The prompt:** with `WINEMAC_RAW_REQUEST=1` the driver calls `IOHIDRequestAccess` while the
   answer is undecided, so macOS shows the prompt for Steam. A new answer applies from the next
   launch.
@@ -119,7 +126,24 @@ Advanced › MacVolvo's own Steam switches the window to the old setup (`SetupVi
 troubleshooting: Windows Steam in MacVolvo's own Wine environment, with Open Steam and no game
 picker. The **NotProton** tile there switches back.
 
+## Updating and restarting Steam
+
+- **In place:** a newer MacVolvo rewrites its files over the old ones (`NotProton.refresh`, at
+  launch and every few seconds while the window is open). Nothing has to be removed first.
+  NotProton stamps each variant runner with its files' sizes and times, so it rebuilds it on the
+  next launch.
+- **Restart:** Steam reads plugin and variant files when it starts. After any change, if Steam is
+  running, the window asks to restart it (`NotProton.restartSteam`): `steam://exit` as NotProton
+  does, up to 30 seconds, then it opens NotProton's patched Steam app (its `steamAppPath`
+  setting, else `/Applications/Steam.app`). It never forces Steam to quit.
+
+## Separate compatibility tool: not possible
+
+NotProton's Compatibility page shows its options, and so MacVolvo's rows, only for the tools in
+`notproton/tools`. The NotProton app rebuilds that list from the CrossOver runners it installed,
+so any other tool (the first version's `notproton-macvolvo-*`) gets none of them. For every game,
+save the MacVolvo choices as NotProton's defaults for that CrossOver version instead.
+
 ## Caveats
 
-- Steam reads plugin and variant files when it starts, so restart it after Add or Remove.
 - Not yet tried in a game through Steam.

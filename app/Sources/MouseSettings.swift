@@ -57,7 +57,11 @@ struct MousePanel:View {
     @ViewBuilder private var status:some View {
         if appAccess != .allowed {
             StatusLine(.problem,"Needs Input Monitoring. Turn on \(Brand.name) in System Settings › Privacy & Security › Input Monitoring. Until then, the mouse works as Standard does.",
-                       button:"Open System Settings") { NSWorkspace.shared.open(InputMonitoring.privacySettings) }
+                       button:appAccess == .undecided ? "Allow…" : "Open System Settings") {
+                // Undecided: macOS's own prompt, which also adds MacVolvo to the list. Decided: only the player can change it.
+                if appAccess == .undecided { InputMonitoring.ask() } else { NSWorkspace.shared.open(InputMonitoring.privacySettings) }
+                refresh()
+            }
         } else if !mouseConnected {
             StatusLine(.warning,"\(Brand.name) has Input Monitoring, but no mouse is connected. A trackpad works as Standard does.")
         } else {
@@ -141,8 +145,7 @@ struct SteamMouseStatus:View {
                 StatusLine(.warning,"Steam has Input Monitoring, but no mouse was connected (\(when)). A trackpad works as Standard does.")
             }
         } else {
-            StatusLine(.pending,"Turn on High-precision for a game in Steam (Properties › Compatibility › MacVolvo mouse), then start it. macOS asks to allow Input Monitoring for Steam, since Steam starts your games; it works from the next launch. This shows how it went.",
-                       button:"Open System Settings") { NSWorkspace.shared.open(InputMonitoring.privacySettings) }
+            StatusLine(.pending,"No game has used High-precision yet. In Steam, choose MacVolvo driver and turn on MacVolvo mouse › High-precision for a game, then start it: macOS asks to allow Input Monitoring for Steam then, since Steam starts your games. Steam only appears in System Settings after that, and it works from the next launch. This shows how it went.")
         }
     }
 }

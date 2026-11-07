@@ -30,6 +30,11 @@ RESOURCES=('Wordmark.png','WordmarkDark.png')
 MINGW_CLANG=ROOT/'runtime/toolchains/llvm-mingw-20261006-ucrt-macos-universal/bin/x86_64-w64-mingw32-clang'
 def run(*args):subprocess.run([str(a) for a in args],check=True)
 def sha(p):return hashlib.sha256(p.read_bytes()).hexdigest()
+# The runtime's Mac driver is compiled from the CrossOver 26.3 sources (docs/UPSTREAM-RECALL.md),
+# so it also fits NotProton's runner of that build, named as NotProton names the runner folder.
+NOTPROTON_DRIVER='lib/wine/x86_64-unix/winemac.so'
+NOTPROTON_BUILDS=('26.3.0.39832',)
+
 def build(output,workspace,runtime_archive,icon=None,identity=None,variant='dxmt'):
     if variant not in ('dxmt','gptk4'):raise ValueError('Unknown app variant')
     evaluation=variant=='gptk4'
@@ -66,6 +71,17 @@ def build(output,workspace,runtime_archive,icon=None,identity=None,variant='dxmt
     run('/bin/cp','-c',runtime_archive,resources/release['runtimeArchive'])
     (resources/'release.json').write_text(json.dumps(release,separators=(',',':'))+'\n')
     shutil.copy2(ROOT/'docs/candidate-parity-contract.json',resources/'candidate-parity-contract.json')
+    # NotProton (app/Sources/NotProton.swift): MacVolvo's Mac driver for NotProton's CrossOver runner,
+    # one folder per CrossOver build it was compiled for, taken from the runtime it ships, plus
+    # the Steam tool's run script.
+    if not evaluation:
+        notproton=resources/'NotProton';notproton.mkdir()
+        shutil.copy2(ROOT/'app/Resources/NotProton/run.sh',notproton/'run.sh')
+        with tempfile.TemporaryDirectory() as folder:
+            run('/usr/bin/tar','-xzf',runtime_archive,'-C',folder,NOTPROTON_DRIVER)
+            for build in NOTPROTON_BUILDS:
+                (notproton/build).mkdir()
+                shutil.copy2(Path(folder)/NOTPROTON_DRIVER,notproton/build/'winemac.so')
     # Notices from the actual reviewed runtime; kept readable without extraction.
     with tempfile.TemporaryDirectory() as folder:
         run('/usr/bin/tar','-xzf',runtime_archive,'-C',folder,'licenses')

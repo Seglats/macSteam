@@ -133,6 +133,7 @@ The DMG opens as a fixed Finder window with the app, an Applications shortcut
 and a background drawn by `scripts/dmg_background.swift`. dmgbuild writes that
 layout without scripting Finder; `--plain` skips it.
 
+For playing from the macOS Steam app through NotProton, see [NOTPROTON.md](NOTPROTON.md).
 For syncing with Recall, merging Mac driver patches, building `winemac.so` and deriving
 a runtime without the full pipeline, see [UPSTREAM-RECALL.md](UPSTREAM-RECALL.md).
 

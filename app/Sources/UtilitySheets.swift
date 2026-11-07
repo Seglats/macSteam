@@ -118,9 +118,9 @@ struct SettingsSheet:View {
             }
             // Steam or a game may have opened or closed while the player was away,
             // and the microphone been turned on or off in System Settings.
-            .onAppear { model.checkRunning() }
+            .onAppear { model.checkRunning();model.checkNotProton() }
             .onReceive(NotificationCenter.default.publisher(for:NSApplication.didBecomeActiveNotification)) { _ in
-                model.checkRunning();microphoneAccess=Microphone.access;inputMonitoring=InputMonitoring.access
+                model.checkRunning();model.checkNotProton();microphoneAccess=Microphone.access;inputMonitoring=InputMonitoring.access
             }
             .alert("Use the High-precision mouse?",isPresented:$explainHighPrecision) {
                 Button("Cancel",role:.cancel) {}
@@ -167,6 +167,7 @@ struct SettingsSheet:View {
             if Brand.allowsUpdates { updates }
             steam
             mouse
+            notProton
         case .display:
             display
             resetDisplay
@@ -339,6 +340,47 @@ struct SettingsSheet:View {
                 mouseRate
                 if let running=model.running { closeFirst(running,"the mouse") }
             }
+        }
+    }
+    /// MacVolvo in the macOS Steam app through NotProton (NotProton.swift): a Steam compatibility
+    /// tool that runs games in NotProton's CrossOver with MacVolvo's Mac driver and the mouse
+    /// settings above. Nothing here replaces NotProton, and Remove takes back only MacVolvo's files.
+    private var notProton:some View {
+        LauncherPanel(inset:16) {
+            VStack(alignment:.leading,spacing:8) {
+                HStack(alignment:.center,spacing:12) {
+                    VStack(alignment:.leading,spacing:2) {
+                        Text("NotProton").font(LauncherStyle.font(14,.semibold))
+                        Text(notProtonDetail).font(LauncherStyle.font(12)).foregroundStyle(.secondary).fixedSize(horizontal:false,vertical:true)
+                    }
+                    Spacer(minLength:12)
+                    switch model.notProton {
+                    case .notInstalled:
+                        Button("Get NotProton") { NSWorkspace.shared.open(NotProton.projectURL) }.buttonStyle(.bordered).buttonBorderShape(.capsule)
+                    case .unsupported:
+                        EmptyView()
+                    case .available:
+                        Button("Add to Steam",action:model.addToNotProton).buttonStyle(.bordered).buttonBorderShape(.capsule)
+                    case .added:
+                        Button("Remove",action:model.removeFromNotProton).buttonStyle(.bordered).buttonBorderShape(.capsule)
+                    }
+                }
+                if case .added=model.notProton {
+                    Divider().padding(.vertical,4)
+                    note("Use it for every game","In Steam › Settings › Compatibility, choose \u{201C}MacVolvo\u{201D} as the default tool. To use it for one game, choose it in the game’s Properties › Compatibility. Mouse settings above apply from the next launch.")
+                    if model.mouseInput == .highPrecision {
+                        note("High-precision in Steam","Here Steam starts your games, so macOS asks for Input Monitoring for Steam rather than for \(Brand.name). Allow it in System Settings › Privacy & Security › Input Monitoring.")
+                    }
+                }
+            }
+        }
+    }
+    private var notProtonDetail:String {
+        switch model.notProton {
+        case .notInstalled: return "Play from the macOS Steam app with Steam Play. Install NotProton, open it once, then come back here."
+        case .unsupported(let builds): return "\(Brand.name)’s driver is built for CrossOver 26.3. NotProton uses \(builds.isEmpty ? "no CrossOver yet" : builds.joined(separator:", "))."
+        case .available(let tools): return "Adds \(tools.map { "\u{201C}\($0.ourDisplay)\u{201D}" }.joined(separator:" and ")) to the macOS Steam app: NotProton’s CrossOver with \(Brand.name)’s mouse and display fixes."
+        case .added(let tools): return "Added to Steam as \(tools.map { "\u{201C}\($0.ourDisplay)\u{201D}" }.joined(separator:" and "))."
         }
     }
     /// Mouse › Advanced (AppModel.MouseRate), closed until the player opens it: how many times a

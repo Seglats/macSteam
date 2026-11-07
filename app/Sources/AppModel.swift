@@ -62,7 +62,7 @@ final class AppModel {
     /// Standard's input stays. Steam carries it from when it opens, like the HUD.
     enum MouseInput:String, CaseIterable { case standard, classic, highPrecision="high-precision" }
     var mouseInput=MouseInput(rawValue:UserDefaults.standard.string(forKey:"mouseInput") ?? "") ?? .standard {
-        didSet { UserDefaults.standard.set(mouseInput.rawValue,forKey:"mouseInput") }
+        didSet { UserDefaults.standard.set(mouseInput.rawValue,forKey:"mouseInput");NotProton.updateSettings(notProtonSettings) }
     }
     /// At most how many times a second the game is sent the mouse's movement (worker: launch
     /// --mouse-rate). The window driver adds up what comes in between, so none is lost, only later.
@@ -74,7 +74,26 @@ final class AppModel {
         var perSecond:Int? { Int(rawValue) }
     }
     var mouseRate=MouseRate(rawValue:UserDefaults.standard.string(forKey:"mouseRate") ?? "") ?? .all {
-        didSet { UserDefaults.standard.set(mouseRate.rawValue,forKey:"mouseRate") }
+        didSet { UserDefaults.standard.set(mouseRate.rawValue,forKey:"mouseRate");NotProton.updateSettings(notProtonSettings) }
+    }
+    /// MacVolvo in NotProton's Steam (NotProton.swift): its status, as Settings last checked.
+    var notProton=NotProton.Status.notInstalled
+    var notProtonSettings:String { NotProton.settings(mouse:mouseInput,rate:mouseRate) }
+    func checkNotProton() { notProton=NotProton.status(resources) }
+    func addToNotProton() {
+        do {
+            try NotProton.add(resources:resources,settings:notProtonSettings)
+            notice=NotProton.steamRunning ? "Added. Quit and reopen Steam, then choose \u{201C}MacVolvo\u{201D} in Steam › Settings › Compatibility." :
+                "Added. Open Steam and choose \u{201C}MacVolvo\u{201D} in Steam › Settings › Compatibility."
+        } catch { notice=error.localizedDescription }
+        checkNotProton()
+    }
+    func removeFromNotProton() {
+        do {
+            try NotProton.remove()
+            notice=NotProton.steamRunning ? "Removed. Quit and reopen Steam so it forgets the tool." : "Removed from Steam."
+        } catch { notice=error.localizedDescription }
+        checkNotProton()
     }
     /// Chooses High-precision and, the first time, shows macOS's Input Monitoring prompt.
     func turnOnHighPrecision() {
@@ -198,6 +217,8 @@ final class AppModel {
         root=selectedRoot
         service=SetupService(root:selectedRoot,helper:Bundle.main.bundleURL.appendingPathComponent("Contents/Helpers/ow2-setup"))
         release=configuration
+        // A newer MacVolvo brings a newer driver and run script for NotProton's Steam.
+        NotProton.refresh(resources:resources,settings:notProtonSettings)
     }
     func receive(_ value: [String:Any]) {
         guard let name=value["stage"] as? String else { return }

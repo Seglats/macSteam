@@ -139,7 +139,7 @@ struct CompanionView:View {
                     Button("Choose Another Game Porting Toolkit…",action:model.chooseGPTK).buttonStyle(.bordered).buttonBorderShape(.capsule).controlSize(.small)
                         .disabled(model.importingGPTK)
                 } else if let version=model.runnerD3DMetal {
-                    StatusLine(.good,"Apple D3DMetal \(version): included with NotProton’s CrossOver. Choose D3DMetal as the graphics backend; no MacVolvo renderer needed.")
+                    StatusLine(.good,"Apple D3DMetal \(version): included with NotProton’s CrossOver. Choose D3DMetal as the graphics backend and keep MacVolvo renderer on Default, which is NotProton’s own D3DMetal. It gets an entry of its own only if you import a newer Game Porting Toolkit.")
                     Button(model.importingGPTK ? "Checking Apple’s signature and copying D3DMetal…" : "Use a Newer Game Porting Toolkit…",action:model.chooseGPTK)
                         .buttonStyle(.bordered).buttonBorderShape(.capsule).controlSize(.small).disabled(model.importingGPTK)
                 } else {

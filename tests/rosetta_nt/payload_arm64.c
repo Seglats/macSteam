@@ -98,9 +98,124 @@ static const u32 SCAT_HEAD[6] = {0x53077c00u, 0x33010000u, 0x53067c00u,
 #define IS_BL(w)         (((w) & 0xfc000000u) == 0x94000000u)  /* bl <thunk>                */
 static const u32 IRET_INSERT[4] = {0x36280091u, 0xd1000836u, 0xd2801237u, 0xd4200060u};
 
+/* --- r19: the direct-syscall fast path --------------------------------------
+ *
+ * Ground truth: ring capture 2026-11-07 (probe run under macfinals-39) — see
+ * R19_SYSCALL_FASTPATH.md. A direct x86 `syscall` with an invalid class (the
+ * game: rax=0xffffffff and Windows SSNs, ~32k/s) takes the full Rosetta
+ * exception round trip (~16-18 us). CORRECTED MODEL: the per-page thunk
+ * (entry page+0x200, class dispatch page+0xb10, brk #5 trap page+0xeb8) is
+ * installed by Rosetta via a path that NEVER flows through the append
+ * stream — 0 brk#5/svc words in ~900k captured words across 7 processes —
+ * so no append-time matcher can see it. What DOES flow through the stream
+ * is the PER-SITE emission for each translated `syscall` instruction
+ * (32 hits in the probe ring, all byte-stable):
+ *
+ *   ldrb w22,[x22]      394002d6  ; compat-mode byte check (internal)
+ *   tst  w22,#1         720002df
+ *   <hint>              d500401f
+ *   b.eq                54000001  ; placeholder, relocated to the compat path
+ *   movz x28,#A,lsl#32  d2c00..c  ; x86 RIP carrier (A,B fixed per image,
+ *   movk x28,#B,lsl#16  f2a00..c  ; C varies per site)
+ *   movk x28,#C         f280..c
+ *   bl   #0             94000000  ; placeholder, relocated to the thunk
+ *
+ * (The R19 design note's "mov w0,<eax>" was the GUEST's own preceding mov,
+ * not template — there is no w0 materialisation.) The chain anchors on the
+ * movz x28,lsl#32 carrier (Rd=28 + lsl#32 only ever appears here; x28 is
+ * Rosetta-internal) and inserts the divert in front of the bl — the exact
+ * insert-before-bl shape the production iret chain uses (the bl's later
+ * relocation is unaffected, proven by iret):
+ *
+ *   (v6 geometry — r21, 2026-11-08, capsite3 arena dumps)
+ *
+ * GROUND TRUTH #2: a Rosetta fixup pass writes a 26-bit immediate at
+ * stream offset X — the PRE-insert cursor, the position where the emitter
+ * recorded the bl's fixup — as a read-modify-write that preserves the
+ * word's top 6 bits. Two different words sat at X in two dumps: adr
+ * (100000db) became 13ffe81e, nop (d503201f) became d7ffe7de — both
+ * UNDEFINED encodings, both exactly "26-bit patch over top-6-preserved
+ * original". Whatever occupies X becomes garbage; executing it is the
+ * r20-era translator assert (EXC_BAD_INSTRUCTION -> ExceptionServer.cpp,
+ * exit 132). The x26 immediates survived untouched in 24/24 dumped copies.
+ * So v6 NEVER EXECUTES X (X = cursor when the bl arrives):
+ *
+ *   X-4   b #+8          14000002  behind-cursor overwrite of the last
+ *                               site word (read-back verified first) —
+ *                               jumps the fall-through from X-4 to X+4
+ *   X+0   bl #0          94000000  SACRIFICIAL: absorbs the fixup patch
+ *                               (26-bit RMW over a real bl = a valid
+ *                               relocated bl); dead on the divert path,
+ *                               IS the bail target
+ *   X+4   <replayed site word>     verbatim: restores the x28 carrier
+ *                               (and guest-rax state if that was last)
+ *   X+8   movz x26,#stub
+ *   X+12  movk x26,#stub,16
+ *   X+16  movk x26,#stub,32   no pc-relative word anywhere (replication
+ *   X+20  movk x26,#stub,48   preserves immediates, 24/24 dumps)
+ *   X+24  blr x26        d63f0340  divert; lr = X+28
+ *   X+28  b #-28         17fffff9  bail: back to X = the REAL relocated bl
+ *   X+32  (the emitter's own bl lands here: unrelocated, dead code)
+ *
+ * Fall-through enters the b at X-4 and skips X. A stream copy rebuilt from
+ * emitter intent drops the whole edit (pure stock, fail-closed); a copy
+ * that preserves our words never executes X either. Bail = br x30 lands on
+ * the b at X+28 -> X, whose patch made it the exact relocated bl stock
+ * would have had, with lr = X+4 exactly as stock — byte-identical slowpath
+ * entry, no brk#5, no exception server.
+ *
+ * The class is a RUNTIME value at the site (no w0 materialisation), so the
+ * divert lands at every direct-syscall site including Wine's own
+ * class-1/2/3 sites; the stub's guard turns those back in ~10 instructions.
+ *
+ * The stub (ntfix_macfast) first replicates the thunk entry's save (x0-x15
+ * -> ctx+0x10..0x8f, NZCV -> +0x90, x17 -> +0x98, LR -> +0x8; at the site
+ * the ctx slots hold stale values), then performs EXACTLY Wine's
+ * sigsys_handler semantics: frame->rcx = RIP_sig (x28, set by the site's
+ * movz/movk carrier), frame->rip = +0xb, frame->eflags = compose(parked
+ * NZCV, parked x17), restore_flags per TF, RCX_sig = frame, R11_sig =
+ * eflags, then resumes at Wine's __wine_syscall_dispatcher_prolog_end
+ * (published by a Wine patch at 0x7ffe1008, read once natively by the
+ * driver into ctl[35]) via the same runtime entry the thunk's own return
+ * uses: table[0](ctx, lr, rip) installs the TB entry at ctx+0x8; restore
+ * regs; ret into it. Guards (g_ctl, target published and canonical, class
+ * 0/7, TEB self-pointer, frame != 0, instrumentation_callback == 0) run
+ * BEFORE the save and touch only Rosetta-internal x22-x25 — bail = br x30
+ * re-executes the untouched bl with the original machine state. */
+#define IS_SYSC_MOVZ_X28(w)   (((w) & 0xffe0001fu) == 0xd2c0001cu) /* movz x28,#,lsl32 */
+#define IS_SYSC_MOVK16_X28(w) (((w) & 0xffe0001fu) == 0xf2a0001cu) /* movk x28,#,lsl16 */
+#define IS_SYSC_MOVK0_X28(w)  (((w) & 0xffe0001fu) == 0xf280001cu) /* movk x28,# */
+/* ctl: [32] inserts  [33] DISARM (driver sets 1)  [34] chain misses
+ *      [35] published prolog_end value (driver reads 0x7ffe1008 natively)
+ *      [36] stub ENGAGED count (entry installed, dispatcher entered) */
+#define CTL_SYSC_INS    32u
+#define CTL_SYSC_DISARM 33u
+#define CTL_SYSC_MISS   34u
+#define CTL_SYSC_TARGET 35u
+#define CTL_SYSC_HIT    36u
+/* r19 diagnostics: stub entries (inline atomic — pre-save, x22-x25 only) and
+ * clean bails at 5 (counted post-dispatch, guest state parked in ctx). Early
+ * guard bails at 99 = entries - hits - bail5s. */
+#define CTL_SYSC_ENTERED 37u
+#define CTL_SYSC_BAIL5   39u
+/* r21b base census, v2: Wine cycles ~275k distinct bufobj bases through the
+ * append path (first-8-exact was useless), but they cluster in a handful of
+ * arenas. [48..71] = 8 x (2MB bucket = base>>21, appends, inserts);
+ * [47] = appends in buckets beyond the 8th. [72] = rotating index,
+ * [73..80] = the LAST 8 raw bases that took a v6 insert — where chains
+ * physically land, to compare against where executed code lives. */
+#define CTL_BASE_OVF  47u
+#define CTL_BASE_TAB  48u
+#define CTL_INS_IDX   72u
+#define CTL_INS_BASES 73u
+#define CTL_LAST_X    46u   /* r21b: last chain's physical address (set in insert8) */
+
+void ntfix_macfast(void);  /* naked stub, defined at the end of the file */
+
 enum { ST_IDLE = 0, ST_SCAT_HEAD, ST_SCAT_MSR, ST_SCAT_TAIL, ST_GATH_ARMED, ST_GATH_TAIL, ST_GATH_PUSH,
        ST_IRET_CS, ST_IRET_DESC, ST_IRET_ADD, ST_IRET_MOVK, ST_IRET_PUSH2,
-       ST_IRET_POP1, ST_IRET_POP2, ST_IRET_BL };
+       ST_IRET_POP1, ST_IRET_POP2, ST_IRET_BL,
+       ST_SYSC_MOVZ, ST_SYSC_MOVK };
 
 /* r13: the table used to be 16 slots claimed for life by the first 16
  * buffer objects seen. A Wine process has gone through all 16 before its
@@ -119,6 +234,7 @@ struct slot {
     u32 S, A;    /* scatter: source flags reg, dead lsr temp */
     u32 D, T;    /* gather: compose reg, dead lsr temp */
     u32 budget;  /* words left before giving up (fail-open to IDLE) */
+    u32 sysc_last; /* r21: last site-family word before the bl (the replay) */
     u64 key;     /* bufobj pointer, written only under the lock */
     u64 last;    /* last cursor seen: a backwards step = buffer reused */
 };
@@ -194,6 +310,33 @@ static void ctl_inc(u64 i) {
 #else
     if (g_ctl) g_ctl[i] += 1;
 #endif
+}
+
+/* r21b base census v2 — see the CTL_BASE_TAB comment. base_note runs on
+ * EVERY append: an 8-slot scan of already-hot ctl memory, nothing else
+ * touches those slots. Deliberately NOT atomic: a lost increment under a
+ * race costs a miscount, never a wrong bucket. */
+static void base_note(u64 base) {
+    u64 bucket = base >> 21, *tab;
+    int i;
+    if (!g_ctl) return;
+    tab = &g_ctl[CTL_BASE_TAB];
+    for (i = 0; i < 8; i++) {
+        if (tab[i * 3] == bucket) { tab[i * 3 + 1]++; return; }
+        if (tab[i * 3] == 0) { tab[i * 3] = bucket; tab[i * 3 + 1] = 1; return; }
+    }
+    g_ctl[CTL_BASE_OVF]++;
+}
+/* insert tally + last-8 insert-base ring for a base already bucketed */
+static void base_tally_insert(u64 base) {
+    u64 bucket = base >> 21, *tab;
+    int i;
+    if (!g_ctl) return;
+    tab = &g_ctl[CTL_BASE_TAB];
+    for (i = 0; i < 8; i++)
+        if (tab[i * 3] == bucket) { tab[i * 3 + 2]++; break; }
+    i = (int)(g_ctl[CTL_INS_IDX]++ & 7u);
+    g_ctl[CTL_INS_BASES + i] = base;
 }
 
 /* atomic ring slot claim. r13: the ring WRAPS (index masked, RING_WORDS is
@@ -315,6 +458,45 @@ static int insert4(u64 *bo, const u32 *w4) {
     return 1;
 }
 
+/* r19: the 3-word divert + 8-byte stub literal (5 words); anchor (brk #5)
+ * still to come at cur+20 — which is exactly what the adr targets. */
+/* r21 v6: the divert that never touches the poisoned slot. Ground truth
+ * (capsite3 dumps, 2026-11-08): a Rosetta fixup pass writes a 26-bit
+ * immediate at the stream position where the emitter recorded the bl —
+ * the PRE-insert cursor X — read-modify-write (top 6 bits preserved).
+ * Every earlier shape put our first word exactly at X, first in the
+ * fall-through path: the patch turned it into an UNDEFINED encoding, and
+ * executing that copy was the on-and-off translator assert. The fix is
+ * geometry, not encoding: X gets a SACRIFICIAL bl #0 (post-patch it is a
+ * correctly relocated bl, and dead either way), the entry `b` at X-4
+ * (behind-cursor overwrite of the last site word, read-back verified)
+ * jumps OVER X, the replayed site word restores what the b displaced,
+ * and the blr's lr lands on a `b` back to X — the bail path re-runs the
+ * real relocated bl, the exact stock slowpath. Copies rebuilt from
+ * emitter intent drop all of it (pure stock, fail-closed); copies that
+ * keep our words never execute X. The movz/movk x26 immediates were
+ * untouched in every dumped copy (24/24). */
+static int insert8(u64 *bo, u64 addr, u32 lastw) {
+    u64 cur = bo[1], lim = bo[2];
+    u32 *p, *prev;
+    if (cur + 36 > lim) return 0;   /* the insert + the bl itself */
+    prev = (u32 *)(u64)(bo[0] + cur - 4);
+    if (*prev != lastw) return 0;   /* not the site word: never touch it */
+    prev[0] = 0x14000002u;                                  /* b #+8 (to X+4) */
+    p = (u32 *)(u64)(bo[0] + cur);
+    p[0] = 0x94000000u;                                       /* sacrificial bl #0 (absorbs the X fixup) */
+    p[1] = lastw;                                             /* replayed site word (restores x28/x0) */
+    p[2] = 0xd2800000u | (((u32)addr           & 0xffffu) << 5) | 26u; /* movz x26,#   */
+    p[3] = 0xf2a00000u | ((((u32)(addr >> 16)) & 0xffffu) << 5) | 26u; /* movk x26,#,16*/
+    p[4] = 0xf2c00000u | ((((u32)(addr >> 32)) & 0xffffu) << 5) | 26u; /* movk x26,#,32*/
+    p[5] = 0xf2e00000u | ((((u64)addr >> 48)  & 0xffffu) << 5) | 26u; /* movk x26,#,48*/
+    p[6] = 0xd63f0340u;                                       /* blr x26 (lr = the bail b) */
+    p[7] = 0x17fffff9u;                                       /* b #-28 (back to the real bl) */
+    bo[1] = cur + 32;
+    if (g_ctl) g_ctl[46] = (u64)p;   /* r21b: the PHYSICAL chain address (X) */
+    return 1;
+}
+
 void ntfix_init(u32 *ring, u32 ring_words, u64 *ctl) {
     (void)ring_words;
     g_ring = ring;
@@ -331,6 +513,7 @@ static void step(struct slot *s, u64 *bo, u32 w);
 void ntfix_append(u64 *bo, u32 w, u64 *ctl, u32 *ring) {
     struct slot *s;
     if (!g_ctl && ctl) { g_ctl = ctl; g_ring = ring; g_ring_at = 0; }
+    base_note(bo[0]);   /* r21b census: which buffers this path emits into */
 
     /* r13 timing experiment: burn cycles in the hook with every chain
      * disarmed. If Steam still crashes, the crash is translation-latency
@@ -358,7 +541,18 @@ void ntfix_append(u64 *bo, u32 w, u64 *ctl, u32 *ring) {
     else if (MSR_NZCV(w)) ctl_inc(19);
     else if (IRET_LDRH_CS(w)) ctl_inc(20);
     {
-        int head = MOVZ_0x202(w) || MOVZ_0(w) || IRET_LDRH_CS(w);
+        /* r21 (2026-11-08): the sysc arm is BACK, re-anchored on fresh
+         * capture ground truth (capsite carrier, ring 76367). The chain in
+         * the stream is movn/movz w0 (the guest rax) + movz/movk x28 +3
+         * words + bl #0; the r19-era ldrb/tst/hint/b.eq prefix does NOT
+         * appear at file-backed sites, so the anchor is the movz x28,lsl#32
+         * carrier alone. The r19 insert fired but never engaged (entered 0)
+         * — leading hypothesis: every examined host had ctl[35]=0 (no Wine
+         * target), so the stub's own guards bailed; this re-arm tests that
+         * in a controlled carrier: entered>0 with no Wine = the divert
+         * landed and executed, bailing fail-closed to the stock bl. */
+        int head = MOVZ_0x202(w) || MOVZ_0(w) || IRET_LDRH_CS(w) ||
+                   (IS_SYSC_MOVZ_X28(w) && !(g_ctl && g_ctl[33]));
         s = slot_for((u64)bo, bo[1], head);
         if (!s) { if (head) ctl_inc(16); return; }  /* no slot: observed, never matched */
     }
@@ -383,6 +577,11 @@ static void idle_word(struct slot *s, u32 w) {
     else if (MOVZ_0(w) && !(g_ctl && g_ctl[29])) { s->state = ST_SCAT_HEAD; s->phase = 0; }
     else if (IRET_LDRH_CS(w) && !(g_ctl && g_ctl[15])) {
         s->state = ST_IRET_CS; s->budget = 4;
+    }
+    /* r21: the syscall-site arm — see the head-predicate note above */
+    else if (IS_SYSC_MOVZ_X28(w) && !(g_ctl && g_ctl[33])) {
+        s->state = ST_SYSC_MOVZ; s->budget = 6;
+        s->sysc_last = w;   /* no movk follows: this is the X-4 replay word */
     }
 }
 
@@ -531,6 +730,38 @@ static void step(struct slot *s, u64 *bo, u32 w) {
         s->state = ST_IDLE;  /* one-shot: bl seen or budget gone, done */
         break;
 
+    /* --- r19/r21 syscall-site chain: the per-site emission for a translated
+     * `syscall` (movz x28,lsl#32 carrier, movk/movk address words, bl to the
+     * thunk — see the block comment above). Address words are family-matched
+     * (the emitter may skip zero halves), the bl ends it; the divert goes in
+     * front of the bl and the chain is done (one emission per site). r21:
+     * sysc_last remembers the newest site word so insert8 can verify and
+     * replay the one sitting at X-4. */
+    case ST_SYSC_MOVZ:
+        if (IS_SYSC_MOVK16_X28(w) || IS_SYSC_MOVK0_X28(w)) { s->state = ST_SYSC_MOVK; s->budget = 3; s->sysc_last = w; }
+        else if (IS_BL(w)) {
+            u64 stub = (u64)&ntfix_macfast;
+            inslog(6, bo, w, 0, 0);
+            if (insert8(bo, stub, s->sysc_last)) {
+                ctl_inc(CTL_SYSC_INS); note_event(6); base_tally_insert(bo[0]);
+            } else ctl_inc(CTL_SYSC_MISS);
+            s->state = ST_IDLE;
+        }
+        else if (!--s->budget) { ctl_inc(CTL_SYSC_MISS); idle_word(s, w); }
+        break;
+    case ST_SYSC_MOVK:
+        if (IS_BL(w)) {
+            u64 stub = (u64)&ntfix_macfast;
+            inslog(6, bo, w, 0, 0);
+            if (insert8(bo, stub, s->sysc_last)) {
+                ctl_inc(CTL_SYSC_INS); note_event(6); base_tally_insert(bo[0]);
+            } else ctl_inc(CTL_SYSC_MISS);
+            s->state = ST_IDLE;
+        }
+        else if (IS_SYSC_MOVK16_X28(w) || IS_SYSC_MOVK0_X28(w)) { s->sysc_last = w; /* stay: address words */ }
+        else if (!--s->budget) { ctl_inc(CTL_SYSC_MISS); idle_word(s, w); }
+        break;
+
     default:
         s->state = ST_IDLE;
     }
@@ -581,4 +812,528 @@ void ntfix_decompose(u64 f, u64 *nzcv_out, u64 *shadow_out) {
     s |= ((f >> 8) & 1ull) << 4;              /* TF  -> shadow 4 (orig: (f>>4)&0x10) */
     s |= ((f >> 14) & 1ull) << 5;             /* NT  -> shadow 5  (r9 fix) */
     *shadow_out = s;
+}
+
+/* --- r19: ntfix_macfast, the syscall divert stub (naked arm64) ---------------
+ *
+ * Reached by `blr x26` at X+24 of the v6 insert in front of the SITE's bl
+ * to the thunk (see the r19 block comment at the top of the file). Entry
+ * state: x18 = ctx (UNTAGGED — normal translated code; every deref works
+ * either way under TBI), x0 = syscall number (the guest's own rax, its
+ * materialisation replayed at X+4), x28 = RIP_sig (the site's movz/movk
+ * carrier, replayed at X+4), x30 = lr = X+28 — the bail `b #-28` back to
+ * X, which the fixup patch has turned into the site's REAL relocated bl
+ * (r21: the insert never executes X itself; the pre-v6 shapes put live
+ * words there and the patch made them undefined — the translator assert).
+ * The ctx shadow
+ * slots do NOT hold the guest yet — the thunk's entry save never ran — so
+ * the stub performs it first, replicating the thunk entry at page+0x200:
+ * x0-x15 -> ctx+0x10..0x8f, NZCV -> +0x90, x17 -> +0x98, LR -> +0x8.
+ *
+ * Performs EXACTLY Wine's sigsys_handler semantics (signal_x86_64.c:2937,
+ * verified against source, not from notes):
+ *   frame->rcx = RIP_sig; frame->rip = RIP_sig + 0xb
+ *   frame->eflags = EFL_sig; frame->restore_flags = 0 (DWORD)
+ *   RCX_sig = frame; R11_sig = eflags        (the syscall instruction's
+ *                                             architectural rcx/r11 effects)
+ *   if TF: EFL_sig &= ~0x100; restore_flags |= CONTEXT_CONTROL
+ *   RIP_sig = __wine_syscall_dispatcher_prolog_end_ptr
+ * EFL_sig = compose(parked NZCV, parked shadow) — the same ntfix_compose the
+ * exception server's own converter uses (we own it), so parity is exact by
+ * construction, NT included. The CW Hack 24265 mxcsr dance forces the restored
+ * MXCSR to equal the live one; our path never captures/restores FPU state, so
+ * the live value persists — identical outcome, nothing to replicate.
+ *
+ * Resume replicates the page epilogue at page+0x2560 (0x102e85560-0x102e8560c
+ * in sys-8): record pc -> ctx+0x1d0, in-runtime byte ctx+0x208, call
+ * table[0](ctx, lr, x86 RIP) — runtime+0x5964 installs the TB entry at
+ * ctx+0x8 — clear the byte, and if ctx+0x8 changed, the verbatim restore of
+ * 0x102e855dc: parked NZCV, parked x17, all GPR slots, x30 from ctx+0x8,
+ * untag x18 (no-op untagged), ret.
+ * The epilogue's pending-event branch (ctx+0x1c8 -> mach_msg wait) is NOT
+ * replicated: nothing raised an exception here, and a pending event stays
+ * pending until the next checkpoint (a brk or epilogue — microseconds at the
+ * game's 32k syscalls/s). Accepted in R19.
+ *
+ * Guards (side-effect-free, any failure -> br x30 = re-run the stock bl):
+ *   g_ctl present; ctl[35] published and canonical user VA
+ *   class 0 or 7 only (1/2/3 are real macOS syscalls — never diverted)
+ *   TPIDRRO_EL0 -> TEB, [TEB+0x30]==TEB, frame=[TEB+0x378] != 0
+ *   [TEB+0x330] slot canonical (bail otherwise). Since r21f an installed
+ *   callback is NOT a bail: like sigsys_handler we OR RESTORE_FLAGS_
+ *   INSTRUMENTATION into frame->restore_flags (THE FINALS installs one).
+ *   Since r21e: TF live (x17 bit4 or ctx+0x444) → bail to stock.
+ * The guards touch only x22-x25 (Rosetta-internal; the site template itself
+ * clobbers x22). x30 does NOT survive the Rosetta runtime call (and the
+ * restore block re-loads it from ctx+0x8), so it is parked at [sp,#-16]
+ * before the save: the guard bail branches while lr is still pristine, the
+ * late bail pops it into x27 AFTER the restore's x30 load and br x27. Bail
+ * safety: before the save it
+ * is exact by construction; after it, the no-entry case runs the full
+ * restore block FIRST (un-doing every live clobber — compose and the
+ * runtime call own x0/x1/x19+) and then branches to the bl with the
+ * original machine state, leaving only idempotent frame writes and the ctx
+ * register edits the stock handler would make anyway. */
+/* arm64-callable ctl_inc for the naked stub (ctl_inc itself is static and
+ * may be inlined away; this one keeps a stable symbol). x0 = ctl index. */
+void ntfix_ctl_hit(u64 i) { ctl_inc(i); }
+
+__attribute__((naked)) void ntfix_macfast(void)
+{
+    __asm__ volatile(
+        /* guards: BEFORE the save, guest-visible x0-x15 and NZCV are live —
+         * only Rosetta-internal x22-x25 are touched (never restored by any
+         * exit; the site template itself clobbers x22). */
+        "   adrp x22, _g_ctl@PAGE\n"
+        "   ldr  x22, [x22, _g_ctl@PAGEOFF]\n"
+        "   cbz  x22, 99f\n"
+        "   add  x24, x22, #0x128\n"          /* &ctl[37] (ldaxr: no imm) */
+        "97: ldaxr x23, [x24]\n"
+        "   add  x23, x23, #1\n"
+        "   stxr  w25, x23, [x24]\n"
+        "   cbnz w25, 97b\n"
+        /* r21c: per-guard bail histogram — one byte per guard in ctl[40]
+         * (+0x140): b0 no-target b1 non-canonical b2 class b3 TPIDRRO-null
+         * b4 TEB-self b5 no-frame b6 instrumentation-cb. Non-atomic byte
+         * counts (races only smear totals); x22-x25 only, all dead on the
+         * bail paths, g_ctl re-derived where x22 no longer holds it. */
+        "   ldr  x25, [x22, #0x118]\n"        /* x25 = ctl[35] target  */
+        "   cbnz x25, 11f\n"
+        "   ldrb w23, [x22, #0x140]\n"
+        "   add  w23, w23, #1\n"
+        "   strb w23, [x22, #0x140]\n"
+        "   b    99f\n"
+        "11: lsr  x24, x25, #47\n"
+        "   cbz  x24, 12f\n"                  /* canonical user VA     */
+        "   ldrb w23, [x22, #0x141]\n"
+        "   add  w23, w23, #1\n"
+        "   strb w23, [x22, #0x141]\n"
+        "   b    99f\n"
+        "12: and  w22, w0, #0x07000000\n"
+        "   cbz  w22, 14f\n"
+        "   movz w24, #0x0700, lsl #16\n"
+        "   cmp  w22, w24\n"
+        "   b.eq 14f\n"                       /* only class 0 / 7      */
+        "   ldrb w23, [x22, #0x142]\n"
+        "   add  w23, w23, #1\n"
+        "   strb w23, [x22, #0x142]\n"
+        "   b    99f\n"
+        "14: mrs  x22, TPIDRRO_EL0\n"
+        "   bic  x22, x22, #7\n"
+        "   cbnz x22, 15f\n"
+        "   adrp x24, _g_ctl@PAGE\n"
+        "   ldr  x24, [x24, _g_ctl@PAGEOFF]\n"
+        "   ldrb w23, [x24, #0x143]\n"
+        "   add  w23, w23, #1\n"
+        "   strb w23, [x24, #0x143]\n"
+        "   b    99f\n"
+        /* r21c/ais6: TPIDRRO in our setup is the native PTHREAD TEB
+         * (mac_gsbase_switching=0 — %gs truth comes from exec regions, the
+         * cthread self never moves to the TEB), so the old single-hop
+         * [TPIDRRO+0x30]==TPIDRRO check bailed on EVERY entry (20039/20043
+         * incl. hot loops — the byte wrapped 78x). Measured:
+         * [pthread+0x30] = 0x7ffc0000 = the Windows TEB (page-aligned,
+         * top-down from 0x7ffe0000; confirmed against %gs:0x30 by the
+         * probe). Two-hop resolution, fail-closed: candidate validated
+         * (nonzero, canonical, page-aligned) BEFORE its deref, then its
+         * self-pointer must match. */
+        "15: ldr  x23, [x22, #0x30]\n"
+        "   cmp  x23, x22\n"
+        "   b.eq 16f\n"                       /* TPIDRRO IS the TEB     */
+        "   cbz  x23, 19f\n"                  /* candidate TEB checks   */
+        "   lsr  x24, x23, #47\n"
+        "   cbnz x24, 19f\n"                  /* canonical user VA      */
+        "   tst  x23, #0xfff\n"
+        "   b.ne 19f\n"                       /* TEBs are page-aligned  */
+        "   ldr  x24, [x23, #0x30]\n"
+        "   cmp  x24, x23\n"
+        "   b.ne 19f\n"                       /* [TEB+0x30]==TEB        */
+        "   mov  x22, x23\n"                  /* x22 = Windows TEB      */
+        "   b    16f\n"
+        /* TEB resolution failed — dump the pointers for the driver log
+         * (ctl[41] raw TPIDRRO, [42] bic'd base, [43] [base+0x30],
+         * [44] [base+0x378]) and count in ctl[45] (full word: ais6's byte
+         * lane wrapped at 255). x22-x24 only, x25 (live target) kept. */
+        "19: mrs  x24, TPIDRRO_EL0\n"
+        "   adrp x23, _g_ctl@PAGE\n"
+        "   ldr  x23, [x23, _g_ctl@PAGEOFF]\n"
+        "   str  x24, [x23, #0x148]\n"        /* ctl[41] raw TPIDRRO    */
+        "   str  x22, [x23, #0x150]\n"        /* ctl[42] bic'd base     */
+        "   ldr  x24, [x22, #0x30]\n"
+        "   str  x24, [x23, #0x158]\n"        /* ctl[43] [base+0x30]    */
+        "   ldr  x24, [x22, #0x378]\n"
+        "   str  x24, [x23, #0x160]\n"        /* ctl[44] [base+0x378]   */
+        "   ldr  x24, [x23, #0x168]\n"        /* ctl[45] fail count     */
+        "   add  x24, x24, #1\n"
+        "   str  x24, [x23, #0x168]\n"
+        "   ldrb w24, [x23, #0x144]\n"
+        "   add  w24, w24, #1\n"
+        "   strb w24, [x23, #0x144]\n"
+        "   b    99f\n"
+        "16: ldr  x23, [x22, #0x378]\n"       /* x23 = syscall_frame   */
+        "   cbnz x23, 17f\n"
+        "   adrp x24, _g_ctl@PAGE\n"
+        "   ldr  x24, [x24, _g_ctl@PAGEOFF]\n"
+        "   ldrb w23, [x24, #0x145]\n"
+        "   add  w23, w23, #1\n"
+        "   strb w23, [x24, #0x145]\n"
+        "   b    99f\n"
+        /* ais7: [TEB+0x330] is NEVER null under Wine — signal_start_thread
+         * stores &instrumentation_callback there (signal_x86_64.c:3212) and
+         * the dispatcher DEREFERENCES it twice ("movq 0x330(%r13),%r10;
+         * movq (%r10),%r10; test %r10,%r10; jz" :1943-1946): the slot is a
+         * pointer to the global; a callback is installed only when *slot
+         * != 0. The old single-load guard bailed on EVERY entry (ais7:
+         * guards byte6 == entered, 6/14/22/29). Same fail-closed shape as
+         * the two-hop TEB guard: canonical-check the slot before the deref;
+         * x22 (TEB) is dead past this point, borrow it. */
+        /* r21f (2026-11-09): an installed callback is no longer a bail.
+         * THE FINALS installs one (second game run on -42: entered 4.7M,
+         * hits 137, every other entry bailed here — guards byte6 wrapping
+         * every poll). sigsys_handler does NOT decline it either: it sets
+         * frame->restore_flags |= RESTORE_FLAGS_INSTRUMENTATION (0x10000,
+         * signal_x86_64.c:2954) and the dispatcher's return path enters the
+         * callback (re-reading it via [TEB+0x330], r10 = return address,
+         * :3613-3629). So: carry the callback VALUE in x24 to the
+         * restore_flags write below (0 = none). x24 is dead on the main path
+         * otherwise and callee-saved across bl _ntfix_compose. The
+         * non-canonical-slot bail (20) stays fail-closed. */
+        "17: ldr  x24, [x22, #0x330]\n"
+        "   cbz  x24, 18f\n"                  /* no slot: x24 = 0 = none */
+        "   lsr  x22, x24, #47\n"
+        "   cbnz x22, 20f\n"                  /* non-canonical slot    */
+        "   ldr  x24, [x24]\n"                /* x24 = the callback    */
+        "18:\n"
+        /* r21e TF guard (game crash 2026-11-08 19:20: STATUS_SINGLE_STEP,
+         * ExceptionAddress = published target+4 = the SECOND dispatcher
+         * instruction — a step trap after one executed instruction, so TF
+         * was live at our dispatcher entry). table[0]'s 0x59c4 TB lookup
+         * takes the ctx TF byte as a key; a step-mode entry TB traps at
+         * exactly +4. Probe (tf_syscall_probe): stock sigsys handles TF+
+         * syscall CORRECTLY (post-syscall step at the GUEST rip, rax
+         * intact) for every arming mode we can produce, and the fast path
+         * matched it byte-for-byte there — but the game's entry stepped.
+         * TF-live sites are rare (anti-debug windows) and safe on stock:
+         * DECLINE them. Live x17 bit4 (TF) or ctx+0x444 (runtime TF byte)
+         * → bail. Count ctl[40] byte7 (0x147). x17 is still LIVE here
+         * (the park to ctx+0x98 happens below).
+         * REGISTER CONTRACT (r21e-2, the hard way): x23 is the SYSCALL FRAME
+         * (label 16: [TEB+0x378]), LIVE across label 18 — the frame build
+         * below stores through it (str x28,[x23,#0x10] = frame->rcx …). The
+         * first build read the TF byte into w23 and Wine spun: every
+         * fast-path entry stored frame fields through a garbage pointer (ais
+         * probe stuck at VirtualAlloc, ~170 re-translations/s; capsite
+         * passed VACUOUSLY — its 11 entries all bail at guard 2, target
+         * unpublished, so label 18 never ran). r21f: x24 now carries the
+         * instrumentation callback to the restore_flags write, so the TF
+         * byte goes into w22 — dead from guard 7 until `mrs x22, NZCV` in
+         * the park. The bail block may clobber x23/x24 like every other
+         * guard's bail. None of tbnz/ldrb/cbz touch NZCV — the park below
+         * saves entry flags. */
+        "   tbnz x17, #4, 22f\n"              /* live shadow TF set     */
+        "   ldrb w22, [x18, #0x444]\n"        /* runtime TF byte        */
+        "   cbz  w22, 23f\n"
+        "22: adrp x23, _g_ctl@PAGE\n"
+        "   ldr  x23, [x23, _g_ctl@PAGEOFF]\n"
+        "   ldrb w24, [x23, #0x147]\n"
+        "   add  w24, w24, #1\n"
+        "   strb w24, [x23, #0x147]\n"
+        "   b    99f\n"
+        "23:\n"
+        /* park the bail target: lr does not survive the table[0] call (nor
+         * the restore's ctx+0x8 load); sp is ours until the resume */
+        "   str  x30, [sp, #-16]!\n"
+        /* the thunk entry's save (page+0x200): park guest state into ctx */
+        "   stp  x0, x1, [x18, #0x10]\n"
+        "   stp  x2, x3, [x18, #0x20]\n"
+        "   stp  x4, x5, [x18, #0x30]\n"
+        "   stp  x6, x7, [x18, #0x40]\n"
+        "   stp  x8, x9, [x18, #0x50]\n"
+        "   stp  x10, x11, [x18, #0x60]\n"
+        "   stp  x12, x13, [x18, #0x70]\n"
+        "   stp  x14, x15, [x18, #0x80]\n"
+        "   mrs  x22, NZCV\n"
+        "   str  x22, [x18, #0x90]\n"
+        "   str  x17, [x18, #0x98]\n"
+        "   str  x30, [x18, #0x8]\n"
+        /* frame + context writes, sigsys_handler parity */
+        "   str  x28, [x23, #0x10]\n"         /* frame->rcx = RIP_sig  */
+        "   add  x13, x28, #0xb\n"
+        "   str  x13, [x23, #0x70]\n"         /* frame->rip = +0xb     */
+        "   ldr  x0, [x18, #0x90]\n"          /* parked NZCV           */
+        "   ldr  x1, [x18, #0x98]\n"          /* parked shadow         */
+        "   bl   _ntfix_compose\n"
+        "   str  x0, [x23, #0x80]\n"          /* frame->eflags         */
+        "   str  x23, [x18, #0x18]\n"         /* RCX slot = frame      */
+        "   str  x0, [x18, #0x68]\n"          /* R11 slot = eflags     */
+        /* restore_flags, sigsys_handler order: = 0; |= INSTRUMENTATION if a
+         * callback is installed (r21f, x24 from guard 7); |= CONTEXT_CONTROL
+         * if TF */
+        "   mov  w13, #0\n"
+        "   cbz  x24, 3f\n"
+        "   movz w13, #1, lsl #16\n"          /* RESTORE_FLAGS_INSTRUMENTATION */
+        "3: tbz  x0, #8, 2f\n"                /* TF?                   */
+        "   orr  w13, w13, #1\n"              /* CONTEXT_CONTROL       */
+        "   ldr  x14, [x18, #0x98]\n"
+        "   bic  x14, x14, #0x10\n"           /* EFL_sig &= ~0x100     */
+        "   str  x14, [x18, #0x98]\n"
+        "2: str  w13, [x23, #0xb4]\n"         /* frame->restore_flags  */
+        /* resolve + resume: the page-epilogue call, verbatim shape */
+        "   ldr  x14, [x18, #0x8]\n"          /* baseline              */
+        "   adr  x29, .\n"
+        "   str  x29, [x18, #0x1d0]\n"        /* recorded pc           */
+        "   mov  w29, #1\n"
+        "   strb w29, [x18, #0x208]\n"        /* in-runtime byte       */
+        /* ais8: table[0]'s install is CONDITIONAL on the pending word —
+         * 0x5908 swp's ctx+0x1c8 to 0, returns the OLD value, and 0x5964
+         * takes the install path (0x59c4 → TB lookup → str ctx+0x8) only
+         * when bit9 is set in it. The epilogue's callers always have bit9
+         * queued; our calls had w=0 → no install → bail5 on every entry.
+         * Queue the continuation ourselves — fail-closed: anything already
+         * pending (word != 0) belongs to the stock flow, bail. bit0 stays
+         * clear: that path parks rip at ctx+0x1d8 and calls 0xebc4
+         * (exception-server notify), which is not our case. */
+        "   ldr  w13, [x18, #0x1c8]\n"        /* pending FLAGS — 32-bit!  */
+        "   cbz  w13, 21f\n"                  /* 0x1cc is a SEPARATE      */
+        "   adrp x23, _g_ctl@PAGE\n"          /* payload field; a 64-bit  */
+        "   ldr  x23, [x23, _g_ctl@PAGEOFF]\n"/* access reads/writes both */
+        "   str  x13, [x23, #0x130]\n"        /* (ais10: busy-bails were  */
+        "   b    5f\n"                        /* the payload, flags were  */
+        "21: mov  w13, #0x200\n"              /* 0 — zero-extended dump)  */
+        "   str  w13, [x18, #0x1c8]\n"        /* bit9: RIP continuation   */
+        "   adr  x1, 3f\n"                    /* lr = after the blr    */
+        "   mov  x2, x25\n"                   /* x86 RIP = prolog_end  */
+        "   ldr  x29, [x18]\n"
+        "   ldr  x29, [x29]\n"                /* table[0]              */
+        "   mov  x0, x18\n"
+        "   blr  x29\n"
+        "3: strb wzr, [x18, #0x208]\n"
+        "   ldr  x15, [x18, #0x8]\n"
+        "   cmp  x15, x14\n"
+        "   b.eq 5f\n"                        /* no entry: clean bail  */
+        "   adrp x22, _g_ctl@PAGE\n"          /* count the engage      */
+        "   ldr  x22, [x22, _g_ctl@PAGEOFF]\n"
+        "   cbz  x22, 4f\n"
+        "   mov  x0, #36\n"
+        "   bl   _ntfix_ctl_hit\n"
+        "4:\n"
+        /* restore block 0x102e855dc, verbatim; x30 = the installed entry */
+        "   ldp  x29, x17, [x18, #0x90]\n"
+        "   msr  NZCV, x29\n"
+        "   ldp  x14, x15, [x18, #0x80]\n"
+        "   ldp  x12, x13, [x18, #0x70]\n"
+        "   ldp  x10, x11, [x18, #0x60]\n"
+        "   ldp  x8, x9, [x18, #0x50]\n"
+        "   ldp  x6, x7, [x18, #0x40]\n"
+        "   ldp  x4, x5, [x18, #0x30]\n"
+        "   ldp  x2, x3, [x18, #0x20]\n"
+        "   ldp  x0, x1, [x18, #0x10]\n"
+        "   ldr  x30, [x18, #0x8]\n"
+        "   ldr  x27, [sp], #16\n"            /* drop parked target    */
+        "   and  x18, x18, #0x7fffffffffffffff\n"
+        "   ret\n"
+        /* clean bail: the same restore un-does every live clobber (compose
+         * and the runtime call own x0/x1/x19+), then the site's bl re-runs
+         * with the original machine state — stock thunk path. */
+        "5: adrp x22, _g_ctl@PAGE\n"
+        "   ldr  x22, [x22, _g_ctl@PAGEOFF]\n"
+        "   cbz  x22, 6f\n"
+        "   mov  x0, #39\n"                   /* count the late bail    */
+        "   bl   _ntfix_ctl_hit\n"
+        "6: ldp  x29, x17, [x18, #0x90]\n"
+        "   msr  NZCV, x29\n"
+        "   ldp  x14, x15, [x18, #0x80]\n"
+        "   ldp  x12, x13, [x18, #0x70]\n"
+        "   ldp  x10, x11, [x18, #0x60]\n"
+        "   ldp  x8, x9, [x18, #0x50]\n"
+        "   ldp  x6, x7, [x18, #0x40]\n"
+        "   ldp  x4, x5, [x18, #0x30]\n"
+        "   ldp  x2, x3, [x18, #0x20]\n"
+        "   ldp  x0, x1, [x18, #0x10]\n"
+        "   ldr  x30, [x18, #0x8]\n"
+        "   ldr  x27, [sp], #16\n"            /* bail target back      */
+        "   and  x18, x18, #0x7fffffffffffffff\n"
+        "   br   x27\n"
+        /* guard-7 fail (ais7): slot null-canonical check failed or a real
+         * instrumentation callback is installed — histogram byte 6 and the
+         * stock trap. Reached only by branch; the pass path is at 18. */
+        "20: adrp x23, _g_ctl@PAGE\n"
+        "   ldr  x23, [x23, _g_ctl@PAGEOFF]\n"
+        "   ldrb w24, [x23, #0x146]\n"
+        "   add  w24, w24, #1\n"
+        "   strb w24, [x23, #0x146]\n"
+        "   b    99f\n"
+        "99: br   x30\n"                      /* guards: lr untouched  */
+    );
+}
+
+/* --- r20: ntfix_trapfast — the FINISHED-THUNK syscall divert (naked arm64) ---
+ *
+ * The r19 stream insert above never fired (entered 0 in-process; and the
+ * ring's ldrb/tst/b.eq lead-in does not exist in the finished code — Rosetta
+ * transforms the append stream before emission, so anything inserted there is
+ * guesswork). The r20 approach does not touch the stream at all: the driver
+ * (hooklib) patches each FINISHED 16K thunk region directly, where every word
+ * is verifiable beforehand.
+ *
+ * Ground truth (three thunks, byte-identical across the full 16K; dumps in
+ * /tmp/rosetta-re/sys-*.bin, 2026-11-07):
+ *   +0x200  strict entry: stp x0,x1..x14,x15 -> ctx+0x10..0x8f; mrs NZCV;
+ *           stp x29,x17 -> ctx+0x90; str x30 -> ctx+0x8; orr x18,#bit63
+ *           (b2410252); b -> +0x2b10 (word 14000a38 at +0x230)
+ *   +0x2b10 class dispatch: and w23,w0,#0x07000000; lsr #24; cmp 1 -> Mach,
+ *           2 -> BSD, 3 -> machdep; ANYTHING ELSE (classes 0 and 7 — the
+ *           invalid-class traffic Wine's sigsys_handler sees today):
+ *   +0x2b30 b +0x2eb8   (word 140000e2 — the ONLY branch to the trap in the
+ *           whole region)
+ *   +0x2eb8 brk #0x5 (d42000a0); b +0x400 (17ffff51)   — the trap
+ *   +0x2ec0 12 words of 0xfffffc90 padding (dead, nothing references it)
+ *
+ * The driver writes, in the region's last 4K page:
+ *   +0x2ec0  adr x27,#-8        (10ffffdb; x27 = &brk#5)
+ *   +0x2ec4  movz/movk x26 x4   (the same constant formulas insert8 uses,
+ *                                assembler-proven)
+ *   +0x2ed8  br x26             (d61f0340) -> ntfix_trapfast
+ * and then swaps the single word at +0x2b30 to b +0x2ec0 (140000fc). One
+ * aligned word: every concurrent thread sees either the stock branch (-> the
+ * untouched trap, today's behaviour) or the trampoline — no torn state. Bail
+ * at ANY point = br x27 = run the original brk #5: fail-closed by keeping
+ * the trap itself intact.
+ *
+ * Entry state here is the state the r19 stub was ORIGINALLY designed for:
+ * the strict entry's save has already run — guest x0-x15 parked at
+ * ctx+0x10..0x8f, NZCV at +0x90, x17 at +0x98, the site's return at ctx+0x8,
+ * x18 tagged — and dispatch left x0 = syscall number, x28 = post-syscall
+ * x86 RIP (set by the site carrier, untouched since). So no save here: only
+ * guards -> frame writes -> the epilogue-style dispatch -> restore.
+ * Guards touch only Rosetta-internal x22-x25 (the dispatch itself already
+ * clobbers w23/w16) plus the entered counter at ctl[37] (ldaxr/stxr; x18 is
+ * the platform register, not usable as a scratch). ctl[33] (the
+ * MACFINALS_NT_OFF=syscall kill switch) is checked LIVE so an already-patched
+ * thunk can be disarmed without un-patching pages that may be executing.
+ * Clean-bail path (dispatch installed no TB entry) counts ctl[39] and runs
+ * the stock trap — the frame writes it already made are idempotent, the
+ * context slot writes are overwritten by the stock handler. */
+__attribute__((naked)) void ntfix_trapfast(void)
+{
+    __asm__ volatile(
+        "   adrp x22, _g_ctl@PAGE\n"
+        "   ldr  x22, [x22, _g_ctl@PAGEOFF]\n"
+        "   cbz  x22, 99f\n"
+        "   add  x24, x22, #0x128\n"          /* &ctl[37] (ldaxr: no imm) */
+        "97: ldaxr x23, [x24]\n"
+        "   add  x23, x23, #1\n"
+        "   stxr  w25, x23, [x24]\n"
+        "   cbnz w25, 97b\n"
+        "   ldr  x23, [x22, #0x108]\n"        /* ctl[33] disarm          */
+        "   cbnz x23, 99f\n"
+        "   ldr  x25, [x22, #0x118]\n"        /* x25 = ctl[35] target    */
+        "   cbz  x25, 99f\n"
+        "   lsr  x24, x25, #47\n"
+        "   cbnz x24, 99f\n"                  /* canonical user VA       */
+        "   and  w22, w0, #0x07000000\n"
+        "   cbz  w22, 1f\n"
+        "   movz w24, #0x0700, lsl #16\n"
+        "   cmp  w22, w24\n"
+        "   b.ne 99f\n"                       /* only class 0 / 7        */
+        "1: mrs  x22, TPIDRRO_EL0\n"
+        "   bic  x22, x22, #7\n"
+        "   cbz  x22, 99f\n"
+        "   ldr  x23, [x22, #0x30]\n"
+        "   cmp  x23, x22\n"
+        "   b.ne 99f\n"                       /* [TEB+0x30]==TEB         */
+        "   ldr  x23, [x22, #0x378]\n"        /* x23 = syscall_frame     */
+        "   cbz  x23, 99f\n"
+        "   ldr  x24, [x22, #0x330]\n"
+        "   cbnz x24, 99f\n"                  /* instrumentation cb      */
+        /* park the bail target: x27 does not survive the runtime call */
+        "   str  x27, [sp, #-16]!\n"
+        /* frame + context writes — sigsys_handler parity; the save already
+         * ran at the entry, the ctx slots hold the guest state */
+        "   str  x28, [x23, #0x10]\n"         /* frame->rcx = RIP_sig    */
+        "   add  x13, x28, #0xb\n"
+        "   str  x13, [x23, #0x70]\n"         /* frame->rip = +0xb       */
+        "   ldr  x0, [x18, #0x90]\n"          /* parked NZCV             */
+        "   ldr  x1, [x18, #0x98]\n"          /* parked shadow           */
+        "   bl   _ntfix_compose\n"
+        "   str  x0, [x23, #0x80]\n"          /* frame->eflags           */
+        "   str  x23, [x18, #0x18]\n"         /* RCX slot = frame        */
+        "   str  x0, [x18, #0x68]\n"          /* R11 slot = eflags       */
+        "   mov  w13, #0\n"
+        "   tbz  x0, #8, 2f\n"                /* TF?                     */
+        "   mov  w13, #1\n"                   /* CONTEXT_CONTROL         */
+        "   ldr  x14, [x18, #0x98]\n"
+        "   bic  x14, x14, #0x10\n"           /* EFL_sig &= ~0x100       */
+        "   str  x14, [x18, #0x98]\n"
+        "2: str  w13, [x23, #0xb4]\n"         /* frame->restore_flags    */
+        /* resolve + resume: the page-epilogue call, verbatim shape */
+        "   ldr  x14, [x18, #0x8]\n"          /* baseline                */
+        "   adr  x29, .\n"
+        "   str  x29, [x18, #0x1d0]\n"        /* recorded pc             */
+        "   mov  w29, #1\n"
+        "   strb w29, [x18, #0x208]\n"        /* in-runtime byte         */
+        /* ais8: queue the RIP continuation — see ntfix_macfast; without
+         * bit9 in ctx+0x1c8, 0x5908's swp returns 0 and 0x5964 installs
+         * nothing. 32-bit only: ctx+0x1cc is a separate payload field. */
+        "   ldr  w13, [x18, #0x1c8]\n"        /* pending flags (32-bit)  */
+        "   cbnz w13, 5f\n"                   /* busy → clean bail       */
+        "   mov  w13, #0x200\n"
+        "   str  w13, [x18, #0x1c8]\n"        /* bit9: RIP continuation  */
+        "   adr  x1, 3f\n"                    /* lr = after the blr      */
+        "   mov  x2, x25\n"                   /* x86 RIP = prolog_end    */
+        "   ldr  x29, [x18]\n"
+        "   ldr  x29, [x29]\n"                /* table[0]                */
+        "   mov  x0, x18\n"
+        "   blr  x29\n"
+        "3: strb wzr, [x18, #0x208]\n"
+        "   ldr  x15, [x18, #0x8]\n"
+        "   cmp  x15, x14\n"
+        "   adrp x23, _g_ctl@PAGE\n"          /* ais10: post-call ctx+0x8 */
+        "   ldr  x23, [x23, _g_ctl@PAGEOFF]\n"/* at ctl[38] (last writer  */
+        "   str  x15, [x23, #0x130]\n"        /* wins; busy-bail also     */
+        "   b.eq 5f\n"                        /* no entry: clean bail    */
+        "   adrp x22, _g_ctl@PAGE\n"          /* count the engage        */
+        "   ldr  x22, [x22, _g_ctl@PAGEOFF]\n"
+        "   cbz  x22, 4f\n"
+        "   mov  x0, #36\n"
+        "   bl   _ntfix_ctl_hit\n"
+        "4:\n"
+        /* restore block 0x102e855dc, verbatim; x30 = the installed entry */
+        "   ldp  x29, x17, [x18, #0x90]\n"
+        "   msr  NZCV, x29\n"
+        "   ldp  x14, x15, [x18, #0x80]\n"
+        "   ldp  x12, x13, [x18, #0x70]\n"
+        "   ldp  x10, x11, [x18, #0x60]\n"
+        "   ldp  x8, x9, [x18, #0x50]\n"
+        "   ldp  x6, x7, [x18, #0x40]\n"
+        "   ldp  x4, x5, [x18, #0x30]\n"
+        "   ldp  x2, x3, [x18, #0x20]\n"
+        "   ldp  x0, x1, [x18, #0x10]\n"
+        "   ldr  x30, [x18, #0x8]\n"
+        "   ldr  x27, [sp], #16\n"            /* drop parked target      */
+        "   and  x18, x18, #0x7fffffffffffffff\n"
+        "   ret\n"
+        /* clean bail: restore un-does every live clobber, then the
+         * ORIGINAL brk #5 runs — exactly today's stock behaviour */
+        "5: adrp x22, _g_ctl@PAGE\n"
+        "   ldr  x22, [x22, _g_ctl@PAGEOFF]\n"
+        "   cbz  x22, 6f\n"
+        "   mov  x0, #39\n"                   /* count the late bail     */
+        "   bl   _ntfix_ctl_hit\n"
+        "6: ldp  x29, x17, [x18, #0x90]\n"
+        "   msr  NZCV, x29\n"
+        "   ldp  x14, x15, [x18, #0x80]\n"
+        "   ldp  x12, x13, [x18, #0x70]\n"
+        "   ldp  x10, x11, [x18, #0x60]\n"
+        "   ldp  x8, x9, [x18, #0x50]\n"
+        "   ldp  x6, x7, [x18, #0x40]\n"
+        "   ldp  x4, x5, [x18, #0x30]\n"
+        "   ldp  x2, x3, [x18, #0x20]\n"
+        "   ldp  x0, x1, [x18, #0x10]\n"
+        "   ldr  x30, [x18, #0x8]\n"
+        "   ldr  x27, [sp], #16\n"            /* bail target back        */
+        "   and  x18, x18, #0x7fffffffffffffff\n"
+        "   br   x27\n"                       /* the original trap       */
+        "99: br   x27\n"                      /* guards: nothing done    */
+    );
 }

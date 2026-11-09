@@ -1,0 +1,91 @@
+--- a/dlls/ntdll/unix/loader.c
++++ b/dlls/ntdll/unix/loader.c
+@@ -856,8 +856,10 @@
+ static const char * const wine_diag_names[DIAG_COUNTERS] =
+ {
+     "segv", "pagefault", "raise", "xgetbv", "cetnop", "trap", "usr1",
+-    "misreport", "wx", "exec", "guard", "writewatch", "unhandled", "mprotect", "mmap"
++    "misreport", "wx", "exec", "guard", "writewatch", "unhandled", "mprotect", "mmap",
++    "sigsys", "tryfixed-fail"
+ };
++LONG64 wine_diag_sigsys[2][4096];
+ 
+ static UINT64 syscall_log_now_ns(void)
+ {
+@@ -978,6 +980,7 @@
+ {
+     static LONG64 last_count[SYSCALL_LOG_TABLES][4096], last_time[SYSCALL_LOG_TABLES][4096];
+     static LONG64 last_diag[DIAG_COUNTERS];
++    static LONG64 last_sigsys[2][4096];
+     UINT64 last_bsd = 0, last_mach = 0, last_faults = 0, last_csw = 0, last_pageins = 0;
+     char name[32], line[4096];
+ 
+@@ -1075,6 +1078,25 @@
+             syscall_log_append( line, sizeof(line), &pos, " %s#%04x=%.1f+%.1f", busy[i].name,
+                                 (unsigned int)(busy[i].id & 0xffff), busy[i].user / 1e6, busy[i].system / 1e6 );
+ #endif
++        {
++            struct syscall_log_entry direct[4] = {{0}};
++
++            for (idx = 0; idx < 2; idx++)
++                for (num = 0; num < 4096; num++)
++                {
++                    LONG64 c = __atomic_load_n( &wine_diag_sigsys[idx][num], __ATOMIC_RELAXED );
++                    if (c != last_sigsys[idx][num]) syscall_log_top( direct, 4, idx, num, c - last_sigsys[idx][num] );
++                    last_sigsys[idx][num] = c;
++                }
++            if (direct[0].value)
++            {
++                syscall_log_append( line, sizeof(line), &pos, " | sigsys:" );
++                for (i = 0; i < 4 && direct[i].value; i++)
++                    syscall_log_append( line, sizeof(line), &pos, " %s=%lld",
++                                        syscall_log_name( direct[i].idx, direct[i].num, name, sizeof(name) ),
++                                        (long long)direct[i].value );
++            }
++        }
+         if (nrare)
+         {
+             syscall_log_append( line, sizeof(line), &pos, " | rare:" );
+--- a/dlls/ntdll/unix/signal_x86_64.c
++++ b/dlls/ntdll/unix/signal_x86_64.c
+@@ -2941,6 +2941,10 @@
+     struct syscall_frame *frame = get_syscall_frame();
+ 
+     TRACE_(seh)("SIGSYS, rax %#llx, rip %#llx.\n", RAX_sig(ucontext), RIP_sig(ucontext));
++    wine_diag_count( DIAG_SIGSYS );
++    if (wine_diag_enabled)
++        __atomic_fetch_add( &wine_diag_sigsys[(RAX_sig(ucontext) >> 12) & 1][RAX_sig(ucontext) & 0xfff], 1,
++                            __ATOMIC_RELAXED );
+ 
+     frame->rip = RIP_sig(ucontext) + 0xb;
+     frame->rcx = RIP_sig(ucontext);
+--- a/dlls/ntdll/unix/unix_private.h
++++ b/dlls/ntdll/unix/unix_private.h
+@@ -337,7 +337,7 @@
+ {
+     DIAG_SEGV, DIAG_PAGEFAULT, DIAG_RAISE, DIAG_XGETBV, DIAG_CETNOP, DIAG_TRAP, DIAG_USR1,
+     DIAG_VF_MISREPORT, DIAG_VF_WX, DIAG_VF_EXEC, DIAG_VF_GUARD, DIAG_VF_WRITEWATCH, DIAG_VF_UNHANDLED,
+-    DIAG_MPROTECT, DIAG_MMAP, DIAG_COUNTERS
++    DIAG_MPROTECT, DIAG_MMAP, DIAG_SIGSYS, DIAG_TRYFIXED_FAIL, DIAG_COUNTERS
+ };
+ struct wine_diag_lock_stats
+ {
+@@ -347,6 +347,8 @@
+ };
+ extern int wine_diag_enabled;
+ extern LONG64 wine_diag_counts[DIAG_COUNTERS];
++/* direct `syscall` instructions from Windows code (SIGSYS), by service table and number */
++extern LONG64 wine_diag_sigsys[2][4096];
+ extern struct wine_diag_lock_stats wine_diag_vm_lock;
+ extern UINT64 wine_diag_now_ns(void);
+ 
+--- a/dlls/ntdll/unix/virtual.c
++++ b/dlls/ntdll/unix/virtual.c
+@@ -691,6 +691,7 @@
+     else
+     {
+         /* above the top of the host address space is taken too, not out of memory */
++        wine_diag_count( DIAG_TRYFIXED_FAIL );
+         errno = (ret == KERN_NO_SPACE || ret == KERN_INVALID_ADDRESS ? EEXIST : ENOMEM);
+         ptr = MAP_FAILED;
+     }

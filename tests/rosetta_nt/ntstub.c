@@ -359,6 +359,11 @@ static void dump_jit(void) {
          (unsigned long long)total);
 }
 
+/* r19: kill -USR1 on a HUNG run dumps the JIT pages from inside (task_for_pid
+ * is unavailable without sudo). Not async-signal-safe — the process is being
+ * dissected, not kept. */
+static void usr1_dump(int sig) { (void)sig; dump_jit(); }
+
 /* --- fresh check code: brand-new anon pages, translated AFTER install ----- */
 typedef unsigned long (*check_fn)(void);
 
@@ -652,6 +657,15 @@ int main(void) {
         return 2;
     }
 
+    /* r19: SIGUSR1 → JIT dump (for hung-run dissection) */
+    {
+        struct sigaction su;
+        memset(&su, 0, sizeof su);
+        su.sa_handler = usr1_dump;
+        sigemptyset(&su.sa_mask);
+        sigaction(SIGUSR1, &su, NULL);
+    }
+
     /* HOOKLIB=1: the injectable dylib (hooklib.c) already installed the
      * append hook and — when its image was mapped — the converters, at dyld
      * time, before main. This run only exercises the checks against that
@@ -722,6 +736,8 @@ int main(void) {
         *(uint64_t *)(dp + CTR_TI_OFF) = 0;
         *(uint64_t *)(dp + CTX_TI_OFF) = 0;
         memset(dp + CTL_APPEND_OFF, 0, 12 * 8);          /* payload ctl block */
+        if (getenv("NO_SYSC"))                            /* r19 chain off (control) */
+            *(uint64_t *)(dp + CTL_APPEND_OFF + 33 * 8) = 1;
         ring = mmap(NULL, 0x80000, PROT_READ | PROT_WRITE,
                     MAP_ANON | MAP_PRIVATE, -1, 0);
         if (ring == MAP_FAILED) { logf("=== abort: ring mmap FAILED\n"); return 2; }

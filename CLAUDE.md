@@ -8,6 +8,14 @@ not maintained here.
 ## Goals
 
 - Make THE FINALS launch and play.
+- **The Rosetta syscall storm must be fixed for this to count as working** (Rasmus,
+  2026-11-07): the game's direct x86 `syscall`s (~32k/s) each cost ~16–22 µs under
+  Rosetta's brk#5 → exception-server → SIGSYS detour (≈ 0.5–0.7 of a CPU core; Proton
+  ~2 µs). Routing them straight into Wine's dispatcher is a *requirement for success*,
+  not an optimization — "the project may fail, but it cannot succeed without this."
+  The mechanism is the r20 finished-thunk patch, currently **quarantined** after two
+  kernel panics (see `tests/rosetta_nt/NOTES.md`, "r20 (2026-11-07)"). Reviving it is
+  mandatory; the *method* is constrained (below).
 - Keep the Wine runtime built from source (CrossOver 26.3 Wine plus our patches) so it
   can actually be changed.
 - Extensive, useful logging. Play starts the game directly, with game-only debug logging
@@ -50,17 +58,40 @@ risk of tuning for the canary is accepted as slim.
   processes, no debugger entitlement, no loader daemon), guarded fail-closed so an
   unrecognised Rosetta build deactivates the hook instead of corrupting translation, and
   scoped to `POPF`/`PUSHF`/`IRET` flag handling only.
+- **Scope extended 2026-11-02 (Rasmus): the x86 `syscall` instruction.** THE FINALS issues ~32,000
+  direct syscalls a second (rax=0xffffffff); under Rosetta each goes brk #5 → exception server →
+  emulated SIGSYS → Wine (~16 µs; Proton ~2 µs). The hook may route that invalid-class `syscall`
+  path straight into Wine's dispatcher instead, with **exactly the behaviour Wine's
+  `sigsys_handler` gives today** (same registers, same resume point). Same constraints:
+  in-process, fail-closed, nothing else in Rosetta changed. `tests/rosetta_nt/R17_PERFORMANCE.md`.
+- **Method constraint, 2026-11-07 (after two kernel panics):** `mach_vm_read_overwrite`
+  on a translated anonymous exec region PANICKED the kernel, twice, deterministically
+  (NOTES.md "r20 (2026-11-07)"). Until individually re-proven, **no `mach_vm_*` copy or
+  protection call may touch translated mappings** — that includes `mach_vm_write`,
+  `mach_vm_read_overwrite` and `mach_vm_protect` on JIT/thunk pages. Reading translated
+  memory must use direct user-space loads behind a SIGSEGV/SIGBUS recovery handler
+  (worst case a catchable signal). Region *metadata* walks
+  (`mach_vm_region_recurse`) have a long clean history and stay allowed. Any write
+  primitive that changes page protection needs Rasmus's explicit per-tier sign-off
+  first — panic risk is real and now twice-paid.
 
-## Current status (2026-11-02)
+## Current status (2026-11-07)
+
+**Start with `tests/rosetta_nt/NEXT_SESSION.md`**: current build, open problems, next steps and
+the rules learned this session. Its top section covers the 2026-11-07 kernel panics (r20
+scanner quarantined; runtime `macfinals-40` installed and clean of that code) and the
+mandatory-safe revival plan.
 
 - **The S12 skin fix (missing arms/limbs) ships as a d3d12 layer since runtime `macfinals-20` /
   `macfinals-21`.** `d3d12_layer/` sits between the game and GPTK's d3d12.dll (byte-identical,
-  under the `d3d12_gptk` name) and clamps unsafe dynamic array reads in DXIL before D3DMetal
-  translates it — structural construct matching, no shader list, GPTK and game files untouched.
-  Wine resolves builtins by the PE's internal export name, so the real GPTK PE must stay outside
-  `lib/wine/x86_64-windows/` (a placeholder there reserves the name in the prefix); layout and
-  history in `tests/rosetta_nt/R15_SKIN_CURVE.md`. Probe-verified on `macfinals-21`; the in-game
-  check (skins have limbs) is still pending. `MACFINALS_SKIN_FIX=0` disables the rewrite.
+  under the `d3d12_gptk` name) and rewrites DXIL before D3DMetal translates it: a local array
+  filled from the constant buffer and read with a dynamic index becomes a direct constant-buffer
+  read, 0 out of range (what vkd3d-proton does). Structural construct matching, no shader list,
+  GPTK and game files untouched. Since `macfinals-27` it wraps every device version (the game
+  uses ID3D12Device12). Wine resolves builtins by the PE's internal export name, so the real GPTK
+  PE must stay outside `lib/wine/x86_64-windows/` (a placeholder there reserves the name in the
+  prefix); layout and history in `tests/rosetta_nt/R15_SKIN_CURVE.md`. **Limbs confirmed back in
+  game on `macfinals-27`.** `MACFINALS_SKIN_FIX=0` disables the rewrite.
 - **Newest runtime `macfinals-31`** (2026-11-02): skin fix (Proton-equivalent constant-buffer
   rewrite; limbs confirmed back on `macfinals-27`), Wine fix for macOS `IP_RECVTOS` control
   messages (Steam's TOS assert and its in-game minidumps are gone; that dump could hang the game
@@ -208,6 +239,15 @@ again on 2026-11-01. Check the `runtimes/macfinals-N` paths in the log too.
 (`dlls/ntdll/heap.c`, `heap_set_debug_flags`) that look exactly like a process started under a
 debugger, and the anti-cheat quits with "disallowed tool" (2026-11-02). `+seh` changed the
 game's behaviour too. `tests/finals_bisect/launch_main.sh DEBUG=max` is the safe maximum.
+
+To stop a leftover MacFinals wineserver (probes and `launch_main.sh` refuse to start while one
+runs), `wineserver -k` needs the prefix, or it targets `~/.wine` instead:
+
+```sh
+root="$HOME/Library/Application Support/MacFinals"
+WINEPREFIX="$root/environment" "$root/runtimes/macfinals-31/bin/wineserver" -k
+pgrep -fl 'MacFinals/runtimes/.*/wineserver' || echo none
+```
 
 Steam records each game exit in `drive_c/Program Files (x86)/Steam/logs/gameprocess_log.txt`,
 which is useful when game debug logging was off. E111000D only appears in logs when it is on.

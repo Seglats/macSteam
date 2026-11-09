@@ -134,6 +134,23 @@ WINE_PATCHES = [
     # log the exception (code, fault address), the thread's start address and its stacks.
     # Seen in THE FINALS at usr1_handler's first read of its signal context.
     'wine-nested-exception-diag.patch',
+    # macOS signal contexts carry the AVX state (Rosetta included), but Wine never read it
+    # (XState_sig is NULL on macOS): exception and suspended-thread contexts had no YMM upper
+    # halves and continuing from an exception did not restore them. Proton does. THE FINALS
+    # crashed with AVX advertised (tests/windows_probe/avx_state_probe.c shows the gap).
+    'wine-macos-avx-signal-context.patch',
+    # Diagnostics only (WINE_SYSCALL_LOG): count direct `syscall` instructions from Windows code
+    # by number (Wine's SIGSYS path; ~16 us each under Rosetta, 2 us on Proton) and failed
+    # fixed-address mappings (anon_mmap_tryfixed). Output only.
+    'wine-diag-sigsys-tryfixed.patch',
+    # Diagnostics only: the direct syscalls' full rax (THE FINALS' are outside the service
+    # tables), and no name lookup past a table's end.
+    'wine-diag-sigsys-rax.patch',
+    # Publish __wine_syscall_dispatcher_prolog_end_ptr at 0x7ffe1008 (next to the existing
+    # 0x7ffe1000 dispatcher slot) so the in-process Rosetta syscall fast path
+    # (tests/rosetta_nt, R19) can redirect a direct `syscall` straight into Wine's
+    # dispatcher with sigsys_handler semantics. Harmless without the hook.
+    'wine-syscall-fastpath-publish.patch',
 ]
 
 

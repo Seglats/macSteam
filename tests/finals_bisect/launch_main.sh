@@ -13,9 +13,13 @@
 #   launch_main.sh msync avx             + WINEMSYNC=1, ROSETTA_ADVERTISE_AVX=1
 #   launch_main.sh app                   everything the app sets (should reproduce E111000D)
 #   RUNTIME=macfinals-17 HOOK=0 DEBUG=quiet|full|max launch_main.sh ...
+#   APP=774801 launch_main.sh ...       Crab Champions (the canary) instead of THE FINALS
+#   APP=steam launch_main.sh ...        Steam only, no game
 #
 # DEBUG=max logs as much as is safe and, after the session, collects Steam's logs and dumps,
 # macOS crash reports, the D3DMetal cache listing and the macOS log next to the Wine log.
+# PERF=1 adds per-process performance counters (10 a second) in that folder's perf/.
+# For FPS measurements pass avx: the app advertises AVX by default, this script does not.
 #
 # Quit the MacFinals app, Steam and the game first. Logs go to tests/finals_bisect/logs/.
 emulate -LR zsh
@@ -80,15 +84,49 @@ print -r -- "log: $log"
 [[ -z ${DRYRUN:-} ]] || { /bin/cat "$log"; /bin/rm -f "$log"; exit 0; }
 steam="$root/environment/drive_c/Program Files (x86)/Steam/steam.exe"
 steamdir="$root/environment/drive_c/Program Files (x86)/Steam"
+# Steam's window is black unless its browser runs through the app's stand-in steamwebhelper.exe
+# (--in-process-gpu; scripts/portable_steam.h steamWindowFix). A Steam update puts its own helper
+# back; the app repairs that on every start, so do the same here, with the newest app's stand-in.
+/usr/bin/python3 -I - "$steamdir/bin/cef/cef.win64" "${here:h:h}/runtime/build" <<'EOF' || exit 1
+import hashlib, os, re, shutil, sys
+cef, build = sys.argv[1:]
+mark = 'steamwebhelper_real.exe'.encode('utf-16-le')
+def stand_in(p): return os.path.isfile(p) and mark in open(p, 'rb').read()
+apps = [d for d in os.listdir(build) if re.fullmatch(r'MacFinals-\d+\.app', d)] if os.path.isdir(build) else []
+src = None
+for d in sorted(apps, key=lambda d: -int(re.findall(r'\d+', d)[0])):
+    p = os.path.join(build, d, 'Contents/Resources/steamwebhelper.exe')
+    if stand_in(p): src = p; break
+helper, real = os.path.join(cef, 'steamwebhelper.exe'), os.path.join(cef, 'steamwebhelper_real.exe')
+if not os.path.isfile(helper): sys.exit(0)            # Steam still bootstrapping
+if not src: print('no stand-in steamwebhelper.exe in runtime/build; Steam may draw black', file=sys.stderr); sys.exit(0)
+h = lambda p: hashlib.sha256(open(p, 'rb').read()).hexdigest()
+if not stand_in(helper):                               # Steam's own helper: it becomes the real one
+    if os.path.exists(real): os.remove(real)
+    os.replace(helper, real); shutil.copy2(src, helper)
+    print('steam window fix: stand-in helper put back (Steam had replaced it)')
+elif not os.path.isfile(real) or stand_in(real):
+    print('steam window fix: real helper missing; start Steam once from the app to repair', file=sys.stderr)
+elif h(helper) != h(src):
+    shutil.copy2(src, helper); print('steam window fix: stand-in helper updated')
+EOF
 started=$(/bin/date '+%Y-%m-%d %H:%M:%S')
 marker="$here/logs/.start-$$"; : > "$marker"
+out=${log%.log}; /bin/mkdir -p "$out"
+# PERF=1: every Wine process writes 10 lines a second to $out/perf/wine.<pid> (our ntdll's
+# WINE_SYSCALL_LOG): syscall counts and time, Mach/BSD syscalls, page faults, context
+# switches, exception and fault counters, the busiest threads' CPU. Output only.
+if [[ -n ${PERF:-} ]]; then
+  /bin/mkdir -p "$out/perf"; env+=(WINE_SYSCALL_LOG="$out/perf/wine")
+  { print -r -- "runtime ${engine:t}; on: ${(k)on:-none}"; print -rl -- $env; print } > "$log"
+fi
+launch=(-applaunch ${APP:-2073850}); [[ ${APP:-} != steam ]] || launch=()
 /usr/bin/env -i $env "$engine/bin/wine" "$steam" -no-cef-sandbox -noverifyfiles \
-  -applaunch 2073850 >> "$log" 2>&1
+  $launch >> "$log" 2>&1
 status=$?
 
 # Collect what other components wrote during the session next to the Wine log, in
 # ${log%.log}/. Only files written since the session started; nothing is deleted.
-out=${log%.log}; /bin/mkdir -p "$out"
 print -r -- "wine exited with $status at $(/bin/date '+%Y-%m-%d %H:%M:%S')" > "$out/session.txt"
 /usr/bin/find "$steamdir/logs" -type f -newer "$marker" -exec /bin/cp -p {} "$out/" \; 2>/dev/null
 /bin/mkdir -p "$out/steam-dumps"

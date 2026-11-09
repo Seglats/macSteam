@@ -60,7 +60,9 @@ not fault, context-injected NT does not survive resume.
 
 ## ⛔ THE CRASH — never repeat
 
-`mprotect(PROT_READ|WRITE|EXEC)` on libRosettaRuntime's file-backed TEXT page,
+**Two separate kernel-level failure classes, both on macOS 27.0 (26A428):**
+
+1. `mprotect(PROT_READ|WRITE|EXEC)` on libRosettaRuntime's file-backed TEXT page,
 called from inside a translated process, **wedges the calling thread unkillably
 in the kernel**; on 2026-10-31 ~00:35 the whole machine froze and needed a forced
 power-off (unclean restart, log cut mid-activity at 00:35:22, no panic file —
@@ -73,6 +75,22 @@ comment and the removed test live in jitdump.c history.
 Consequence: the planned "patch the emitters in libRosettaRuntime TEXT" route is
 dead on this OS build. Developer Mode / dev-tools authorization is NOT the
 blocker — the failure is a kernel deadlock before any policy verdict.
+
+2. **mach_vm_read_overwrite on translated anonymous EXEC mappings can PANIC the
+kernel** (2026-11-07, twice, deterministic: ntstub gate runs at 18:20:00 and
+18:21:16, both forced reboots). Kernel data abort far=0x14 — a NULL+0x14 deref
+inside the read path — panicked task = the hooked process itself (pid 5216
+ntstub), faulting user frame `scan_patch_thunks+494` = the `callq
+_mach_vm_read_overwrite` reading a 256K chunk of an anon exec region at
+dyld-constructor time, with translation live and a second mach client
+(converter_poll) querying in parallel. Panic copies kept in
+`/tmp/rosetta-re/panics/` (until /tmp cleanup). sysdump's reads never hit it —
+but sysdump read 4K at a time, post-startup, as the process's only mach client;
+that precedent does NOT generalise. **Treat every mach_vm_* call that touches
+translated mappings (read included) as panic-capable until re-proven**; the
+safe alternative for reads is direct user-space loads behind a SIGBUS/SIGSEGV
+recovery handler (own address space, worst case is a catchable signal).
+Details: "r20 (2026-11-07)" section below.
 
 ## Remaining safe surfaces
 
@@ -617,6 +635,64 @@ macfinals-7, verifies).
 Open: whether THE FINALS' own process tolerates the append hook's cost — it is
 also a heavy translator. Its 4 s gameDebug run was fine.
 
+## r20 (2026-11-07) — KERNEL PANIC: the thunk scanner is quarantined
+
+Context: r19's stream-insert never fired (`entered 0`; the ring template does
+not exist in finished code). r20 pivoted to patching the FINISHED 16K thunk
+regions directly: trampoline into the 12-word dead padding at +0x2ec0, redirect
+the single trap-feeding branch at +0x2b30, trap itself left intact so every
+bail is stock SIGSYS (fail-closed). All offsets signature-verified against
+three byte-identical ground-truth thunks; payload stub `ntfix_trapfast`
+otool-verified; `host_payload_test` PASS. The driver (`scan_patch_thunks` in
+hooklib.c) walks anon exec regions and reads them in 256K chunks via
+`mach_vm_read_overwrite` looking for the trap pair.
+
+**First in-process run of the scanner panicked the kernel. Twice.** ntstub gate
+runs at 18:20:00 and 18:21:16; both panics identical modulo ASLR slide:
+
+- `Kernel data abort`, `far: 0x14` (NULL+0x14 kernel deref), macOS 27.0 26A428.
+- `Panicked task … pid 5216: ntstub` — the hooked process, from dyld's
+  constructor chain (image 464 = dyld).
+- Panicked thread user frames: `[463,7646] = scan_patch_thunks+494` and
+  `[463,3537] = macfinals_hook_init+2017`; 463 = hooklib x86_64 UUID
+  78bf95bd. `scan_patch_thunks+494` is the return address of `callq
+  _mach_vm_read_overwrite` (0x1dd9 in the shipped build) — **the READ panicked,
+  not the write path; hot_write never executed**.
+- Second ntstub thread was blocked in `converter_poll+102` (its own
+  mach query) — two mach clients live at once.
+- Kernel regs at fault: x0=8, x1=0x8000, x9=0x11, x10=0x8000,
+  x12=0x3b9aca00 (=1e9), x2=0x3009xxxx-ish — TXM/pmap-flavoured values, deep
+  in the copy path, not trap-argument shaped.
+- Panic files: `/tmp/rosetta-re/panics/` (copies of the originals, which the OS
+  deletes after ingestion). No hook log existed — /tmp/rosetta-re had been
+  cleaned, so the run's own logf output is lost.
+
+Why sysdump never hit it (it read the same kind of regions): 4K reads vs 256K;
+ran post-startup as the only mach client vs constructor-time with translation
+and a second mach query live. The bug window is somewhere in that difference —
+exact trigger unknown, and unknowable without another panic-per-experiment
+ladder, which is Rasmus's call to budget, not ours.
+
+**State after quarantine:**
+- hooklib.c gates the whole r20 feature behind `MACFINALS_THUNK_PATCH=1`
+  (default OFF, logs why). Scanner, trampoline build and thunk_poll all inside
+  the gate. Rebuilt 2026-11-07.
+- The **write path never ran and is still unproven** — but after a read-only
+  API panicked us, mach_vm_write / mach_vm_protect / sys_icache_invalidate on
+  translated exec mappings must be presumed at least as dangerous until a
+  consented tier ladder says otherwise.
+- Residual risk that SHIPS: `converter_poll`'s `refresh_fastpath_target` uses
+  mach_vm_region_recurse + mach_vm_read_overwrite at 0x7ffe1008 (macfinals-40).
+  It is one 8-byte read at a checked-readable fixed address — every probe and
+  game run so far clean — but it is the same API family. Flagged, kept.
+- Installed runtime macfinals-40 contains NO r20 code (verified: its hook has
+  no scanner strings) — the shipped runtime cannot panic from this bug.
+- If r20 is ever revived: reads must go through direct user-space loads with a
+  SIGBUS/SIGSEGV recovery handler (no kernel vm call), and each write-side
+  primitive needs its own cowtest-style tier with pre-logged steps and
+  Rasmus's explicit crash-budget sign-off. Panic risk is now 2 known classes;
+  see "⛔ THE CRASH".
+
 ## Tooling in this directory
 
 - `ntstub.c` — the milestone-2/3/4 hook harness (r8: NT fixups live via the
@@ -657,3 +733,625 @@ also a heavy translator. Its 4 s gameDebug run was fine.
   the ring disassembler used for the milestone-4 trace.
 - Analysis artifacts (this build only): /tmp/rosetta-re/{text.asm, libRosettaRuntime,
   jit-*.bin/.txt/.asm}. Regenerate with jitdump after a macOS update.
+
+## thunkmap probe (2026-11-07, later) — thunks are hidden from direct reads
+
+`thunkmap.c` (new): standalone translated probe, zero mach copy calls —
+region walk (metadata) + direct loads behind a sigsetjmp SIGSEGV/SIGBUS
+recovery handler. Two findings, both durable:
+
+1. **The safe-read design works.** Run 1 died SIGSEGV (process only, machine
+   fine) poking PROT_NONE-current regions with direct loads; filtering to
+   cur-prot-readable regions, run 2 completed the full walk (325 regions,
+   0 faults). Direct-load probing of translated memory is safe and stable.
+2. **Direct loads are BLIND to the thunks.** After translating live syscalls
+   (trigger verified running), the trap pair exists in NO readable region —
+   not the 186 MB JIT arena, not anywhere. Run 1's 16K exec regions whose
+   pages fault on every direct load are where finished thunks live:
+   **Rosetta maps JIT/thunk pages PROT_NONE against the process's own
+   loads.** The only reader that has ever seen them is the kernel copy path
+   (sysdump). Consequence: the r20 page-patch needs mach reads (panic-class
+   call, sysdump shape vs 256K constructor shape distinction unproven) AND a
+   wholly unproven write primitive on PROT_NONE TXM pages. A mach-read probe
+   of the hidden regions (sysdump shape, step-logged) was prepared and
+   BLOCKED pending Rasmus's explicit approval — correct call, the trigger
+   conditions of the 2026-11-07 panic are unknown.
+
+Alternative mechanism now on the table (no page writes at all): intercept the
+brk#5 Mach exception in-process (thread-level exception port on translated
+threads), recognise the syscall-thunk register shape, and reply with a
+redirected PC into ntfix_trapfast (payload execution from translated threads
+is already proven by the NT hook). Non-matching faults forward to Rosetta's
+original handler untouched — fail-closed by construction. Feasibility probe
+(own thread, exception port, observe one brk#5) uses only mach port calls,
+outside both known crash classes.
+
+## exctest (2026-11-07, evening) — exception-port interception is DEAD for brk#5
+
+`exctest.c`: hand-rolled EXCEPTION_STATE_IDENTITY|MACH_EXCEPTION_CODES handler
+on our own port, mach-port calls only (nothing in either crash class).
+Results, in order:
+
+- **The mechanism works under Rosetta**: a null write from translated code
+  (`*(volatile int*)0 = 42`) ARRIVES at a thread-level port as EXC_BAD_ACCESS
+  (type 1, codes [0, 0x600000000], flavor 4 / 14 words). Registration,
+  delivery and reply all function. (Probe bugs found and fixed en route: both
+  marker stores wrote (%rdi) so marker1 was invisible; the reply must MOVE the
+  kernel's send-once right — COPY_SEND gets MACH_SEND_INVALID_TYPE and leaves
+  the faulting thread suspended forever, i.e. a hang, not a crash.)
+- **The brk#5 of an invalid-class `syscall` arrives at NEITHER thread- nor
+  task-level ports** (both installed, kr SUCCESS; trigger verified running
+  through the stock SIGSYS path both times). TXM recognizes Rosetta's syscall
+  trap in translated code and vectors it straight to the in-process
+  exceptionserver thread outside the user exception chain (the panic stackshot
+  showed that server as a thread of our own pid). Exception-port interception
+  cannot see it. **Route closed.**
+- Side observation: thread_get_exception_ports from a translated caller
+  returns garbage fields (mask/behavior/flavor look like addresses in the
+  0x30-0x3xxxxxx runtime range) — the MIG round-trip for that call is broken
+  under translation; do not trust it for introspection.
+
+Remaining live routes for the syscall fastpath:
+1. **r19 revival, capture-first (recommended, safe):** r19 failed matching an
+   ASSUMED append-stream template for syscall sites. The ring-capture mode
+   (shipped, read-only, ran for the pushf/popf work) can record the TRUE
+   stream form while a fresh syscall site translates; an insert at the site
+   then goes through Rosetta's own JIT writer — no PROT_NONE reads, no page
+   writes, nothing in either crash class. Caveat: thunks themselves may be
+   template-memcpy'd (three byte-identical instances) rather than streamed;
+   but the SITE code (movz x28 chain + bl thunk, known from finished dumps)
+   must be streamed at first translation — that is the insert target.
+2. **mach-read + write ladder (fallback, needs Rasmus's explicit per-tier
+   sign-off):** sysdump-shaped 4K reads of the hidden regions, then a COW
+   write tier. Panic-class calls; blocked since 2026-11-07 afternoon.
+
+## r21 (2026-11-08) — the stream insert WORKS: mechanism found, v6 geometry, clean ×8
+
+The r19 revival ran capture-first as planned. Outcome: **the divert chain now
+lands, executes, and bails byte-cleanly in the carrier** — `capsite` ×8:
+exit 0 every run, all markers exact, stub entered 11/12, zero translator
+asserts. Along the way the r20-era mystery (why inserts corrupted TBs) got a
+complete mechanical answer.
+
+### Ground truth at file-backed sites (capsite + ring)
+
+The site emission has NO ldrb/tst/b.eq prefix (that lead-in only appeared in
+the Wine-side probe ring): `movn/movz w0` (guest rax) + `movz x28,#A,lsl#32`
++ `movk x28,#B,lsl#16` + `movk x28,#C` + `bl #0`. The matcher re-armed on
+the movz-x28 carrier alone (payload `IS_SYSC_MOVZ_X28`; the r19-era prefix
+anchor never existed at these sites).
+
+### THE MECHANISM (capsite3 arena dumps — the answer to every mystery)
+
+A Rosetta fixup pass writes a **26-bit immediate at stream offset X = the
+cursor when the bl was emitted (the PRE-insert cursor)**, as a
+read-modify-write preserving the word's top 6 bits. Proof by two different
+words sitting at X in two dumps: `adr` 100000db → **13ffe81e**, `nop`
+d503201f → **d7ffe7de** — both undefined encodings, both exactly
+"26-bit patch over top-6-preserved original". So:
+
+- Whatever word occupies X becomes garbage when the fixup lands.
+- Executing it = EXC_BAD_INSTRUCTION = the r20-era ExceptionServer assert
+  (exit 132) — reproduced deterministically. This was NEVER a
+  "pc-relative rewrite on replication"; replication only spreads copies.
+- r19's `entered=0` was the same bug seen from the other side: the insert's
+  word 0 sat at X, died before its own branch.
+- Our x26 immediates survived untouched in **24/24** dumped copies. Only
+  offset X is poisoned.
+
+### v6 geometry (`insert8` in payload_arm64.c): never execute X
+
+```
+X-4   b #+8          14000002  behind-cursor overwrite of the last site word
+                               (read-back verified first: *prev == sysc_last,
+                               else no insert — fail-closed)
+X+0   bl #0          94000000  SACRIFICIAL: absorbs the fixup patch (26-bit
+                               RMW over a real bl = a valid relocated bl)
+X+4   <replayed site word>     restores the x28 carrier / guest-rax state
+X+8   movz x26,#stub           4 constant words, no pc-relative anywhere
+X+24  blr x26        d63f0340  divert; lr = X+28
+X+28  b #-28         17fffff9  bail: back to X = the REAL relocated bl
+X+32  (emitter's own bl lands here: unrelocated, dead)
+```
+
+Bail = `br x30` (stub guard exit) → the b at X+28 → X, whose patch made it
+the exact relocated bl stock would have had — lr = X+4 exactly as stock,
+slowpath entry byte-identical, no brk#5, no exception server. The stub's
+park/guard/late-bail edits (x30-based) work verbatim with this entry state.
+
+### Evidence
+
+- `capsite` ×8 (hooklib + `MACFINALS_HOOK_RING=1 DISABLE_AOT=1`): exit 0,
+  12/12 marker lines exact per run, `entered 11`, no asserts.
+- Per run: 5 inserts (kind-6 events, ring positions 36..504), 5 chain
+  misses — the misses are REAL (valid-class) syscall sites whose stream
+  shape doesn't match (extra words before the bl); insert8's `*prev`
+  verification declines them → stock. Fail-closed working as designed.
+- capsite3 scan-0: **36/36 intact chain copies** across arenas. Every copy:
+  b at X-4, **a valid relocated bl at X** (per-copy immediates 97ffe7c9 /
+  97ffe785 / 97ffe81e — same imm26 low bits as the v2-era undefined stomps,
+  proving the top-6-preserving RMW over OUR 0x94000000), replay, x26 chain,
+  blr, bail-b, dead 94000000 at X+32. Two copies' bl target page+0x200 (the
+  strict thunk entry per r20 ground truth), one +0x204 — Rosetta's own
+  per-copy fixup arithmetic, i.e. exactly what a stock bl there would carry.
+
+### The `13ffe000` "stomps" are Rosetta's fixup TABLE (benign)
+
+capsite3's stomp mask `(w & 0xfffff000)==0x13ffe000` also fires ~198× in a
+data region (e.g. 0x10c6a0e50) on words shaped `[u64 pointer][u64 imm26]` —
+that is the fixup table itself (pointer to the stream slot, value to patch).
+Mask coincidence, not corruption.
+
+### Scanner caution (diagnostic-tool only)
+
+capsite3's arena scan is only stable while translation is QUIESCENT. During
+active JIT churn (scan gen-1, right after site executions): one run died
+exit 77 on an unguarded load (context dump — fixed with a per-page
+recovery point), one still exited 77 (a fault escaped the page guard), and
+one HUNG with SIGALRM never delivered — the walker was wedged
+uninterruptibly, almost certainly in `mach_vm_region_recurse` on a VM being
+restructured underneath it. Not a new crash class (no panic, killable), but
+don't region-walk during translation storms, and don't ship a scanner that
+does. The 2026-11-07 "region walks stay allowed" rule now carries this
+caveat: allowed, but not concurrent with heavy JIT activity.
+
+### Build lesson (cost an hour): the stale lipo slice
+
+A failed hooklib x86_64 build + `lipo -create` silently ships the PREVIOUS
+slice. `2>&1 | head` ate the error. Since then: builds capture stderr to a
+file and check rc, and the finished dylib is byte-verified — the payload's
+insert8 code block and the macfast entry bytes must be found in
+hooklib.dylib before any test run ("a failed payload build leaves the old
+payload_blob.h" — same failure shape, now guarded on both sides).
+
+## r21b (2026-11-08, afternoon) — in-Wine: chains are PLACED but never EXECUTE
+
+Carrier success (r21) did not carry over. In a Wine process the matcher fires,
+insert8 places complete, correctly-addressed v6 chains — and `entered` stays 0.
+Full record below; nothing crashed at any point in this session.
+
+### Setup (exact, reproducible)
+
+```sh
+root="$HOME/Library/Application Support/MacFinals"
+env WINEPREFIX="$root/environment" WINEDEBUG=-all \
+  DYLD_INSERT_LIBRARIES="$PWD/tests/rosetta_nt/hooklib.dylib" \
+  MACFINALS_HOOK_RING=1 MACFINALS_SYSC_DUMP=1 DISABLE_AOT=1 \
+  "$root/runtimes/macfinals-40/bin/wine" runtime/build/probe/direct-syscall-probe.exe
+```
+
+Probe output unchanged: ntdll QPC 39 ns/call, direct `syscall` 18 809 ns/call
+(≈ the known ~16-19 µs stock cost — the divert never engaged, semantics intact).
+Kill the leftover wineserver after each run (CLAUDE.md recipe); rc=137 on the
+harness timeout is that kill, not a failure in the dump.
+
+### What works in the Wine process
+
+- The hook installs in every Wine process (constructor passes, DISABLE_AOT
+  honored), no translator asserts, no crashes, clean atexit dumps ×3 pids.
+- **The append hook sees Wine's syscall sites.** Ring/inslog decode (earlier
+  today): 30 x28-carrier sites in one window, all carrying the compat prefix
+  (`…tst…; d500401f` (hint); `54000001` (b.eq)) immediately before the
+  `movz x28` carrier — capsite's file-backed sites LACK that prefix. Matcher
+  arms on them and insert8 fires (kind-6 events, `thunks`-line inserts).
+- **Complete v6 chains exist in the process at exit.** syscdump (arena scan at
+  atexit, page-guarded direct loads — no mach_vm_* on translated mappings):
+  - pid 7994 (exe): 144 chains; pid 8001 (wineboot): 212; pid 9810 (probe):
+    144; pid 9819: 212; pid 9826: 264.
+  - Every chain is word-for-word correct: `…54000261 (b.ne) d2cdfffc
+    (carrier) f2bffe7c (movk16) | 14000002 (b #+8 at X-4) 97ffxxxx (patched
+    relocated bl at X) <replay> d2825c1a f2a1039a f2c0005a f2e0001a (x26
+    quad = stub addr) d63f0340 (blr) 17fffff9 (bail b) 94000000 (dead emitter
+    bl at X+32)`.
+  - Stub address decodes to payload_base + 0x12e0 = `ntfix_macfast` — the
+    divert target is exactly right.
+  - The sacrificial bl at X absorbed Rosetta's fixup patch in every copy
+    (97ffxxxx, valid bl), same as capsite. Mechanism holds in Wine.
+
+### What does NOT work — the central finding
+
+`entered = 0` in every run (capsite under identical evidence had entered=11).
+The chains are placed in a region that never executes:
+
+- **ALL chain copies live in ONE region: `0x200014000`, prot 7 (RWX)** — the
+  SAME FIXED ADDRESS in every process (exe, wineboot, probe, different pids).
+  A fixed per-process low RWX arena = Rosetta's persistent emission/stream
+  buffer, not where executed TBs come from.
+- **A stock-site census (added this session: movz-x28 carrier + movk(s) +
+  bl, no chain) finds copies elsewhere**: 116 sites (pid 9810) in region
+  `0x20869b000`, **prot 3 = RW, NOT currently executable** (max_protection
+  includes exec), size 544 768 B. pid 9819: 91 sites at `0x20869a000`;
+  pid 9826: 161 at `0x20869b000`. Same picture every process: chains in the
+  fixed 0x200014000 RWX arena, unchained stock copies in a ~0x20869xxxx
+  RW(max-exec) region.
+- **No scanned exec region contains chains OR stock sites.** So where the
+  EXECUTED TBs live is unknown: either materialized from metadata (not from
+  the staged bytes), in regions the scan filter skips (named regions,
+  submaps, >512 MB, non-readable-at-scan), or torn down before atexit.
+- Working theory (UNPROVEN, next thing to test): the append hook at
+  libRosettaRuntime+0x18a0 covers ONE emission path. Single-threaded capsite
+  emits through it and executes what it wrote (chains in exec arenas,
+  entered>0). Wine's multi-threaded JIT (8 slots in the events line) uses a
+  second path — the 0x20869xxxx copies — and the executed TBs derive from
+  that, dropping our inserted words.
+
+### The published target (ctl[35]) — PLAUSIBLE, still unverified
+
+Log prints decimal: 208 812 694 and 208 809 694 across runs = **0xc723a96 /
+0xc722ede**. These differ between runs by a base-sized delta — consistent
+with the PE-side `ntdll.dll` base being ASLR'd per run plus a fixed
+prolog_end offset (sigsys_handler sets the GUEST rip, so the pointer's value
+must be a PE VA; PE images on this prefix load low, ~0xc7xxxxx). So the
+publish patch is probably working. VERIFY with
+`runtime/build/probe/read-dispatch-page.exe` (reads 0x7ffe1008 Windows-side;
+compare against the live ntdll base) before ever letting the stub engage on
+it — a wrong-but-canonical target jumps to garbage with no guard to catch it.
+
+### Tooling notes / bugs found while measuring
+
+- **STOCK census lines print the header but NO words** (lines end at
+  "words:"). The words loop in the same dprintf block produced nothing; HIT
+  lines in the same function print words fine. Cause unknown — debug before
+  trusting STOCK line content (the region/counter data is still valid).
+- **Counts may be inflated by region revisits**: consecutive identical STOCK
+  lines at the same address (2–4×) suggest mach_vm_region_recurse revisited
+  the region (or genuine multi-copy emission). HIT lines also cluster 4×
+  identical word-content. Dedupe before quoting absolute numbers; the
+  region SPLIT (chains here / stock there) is unaffected either way.
+- Census numbering cosmetic: all lines say "STOCK 0" (the <24 print cap
+  tests the region-tallied total, which is 0 during the scan). Fix when
+  touching the file.
+- syscdump at atexit is reliable in Wine processes (3 pids, no wedge) —
+  consistent with the "scan only when quiescent" rule. One pid (9816,
+  1392 regions, 0 chains) = a hook-bearing child with no syscall sites.
+- inslog ctx-zeros + ring_at misalignment explained (harmless): sites land
+  at the START of recycled buffers (cursor < 26 words → zero context window)
+  and concurrent JIT threads interleave records (ring_at pollution). Not
+  corruption — the ring itself is sound.
+
+### Crash ledger for this work (all of it, one place)
+
+- r20 `mach_vm_read_overwrite` on translated anon exec region: **kernel
+  panic ×2** (2026-11-07) — quarantined, forbidden class.
+- In-place W+X on Rosetta file-backed pages: freeze (2026-10-31) — forbidden.
+- capsite3 mid-JIT-churn scans: exit 77 / uninterruptible walker hang
+  (killable, no panic) — tool limitation; scan only when quiescent.
+- r21b session: ZERO crashes, zero asserts, clean exits everywhere.
+- Never reproduced since v6: the v2-v5 "corrupt word → translator assert
+  exit 132" class (sacrificial-bl design eliminated it, 8/8 capsite + all
+  Wine runs clean).
+
+### Open questions (in priority order)
+
+1. Where do EXECUTED TBs live in a Wine process? (region-list dump of the
+   full arena map; relax the unnamed-only/512 MB filters; find a known
+   site's executed copy; compare capsite vs Wine region maps side by side.)
+2. Is the 0x20869xxxx prot-3 family the source of executed TBs (second
+   emission path), or dead staging? Do its stock copies carry the compat
+   prefix (= Wine-site family) or not (= another family)?
+3. Is ctl[35] 0xc723a96/0xc722ede really PE-ntdll prolog_end?
+   (read-dispatch-page.exe; must be settled before engagement.)
+4. If executed TBs bypass the append-hook path entirely: the insert must
+   move (different hook point or post-materialization touch) — that is a
+   design change; surface to Rasmus before building it.
+
+### Next session's first moves
+
+1. Extend syscdump: dump the region LIST (addr/size/prot/named?) for exec-
+   capable regions instead of only scanning; run probe; compare against
+   capsite's map (capsite3's scan already logs per-hit regions).
+2. Fix the STOCK words-print bug; re-run census; check stock copies for the
+   compat prefix.
+3. read-dispatch-page.exe under the same env; compare 0x7ffe1008 value with
+   the probe-side ntdll base.
+
+## r21c (2026-11-08, evening) — the chain EXECUTES inside Wine; the dispatcher return clobbers rdx
+
+Setup unchanged from r21b (macfinals-40 wine, DYLD_INSERT hooklib,
+MACFINALS_HOOK_RING=1, DISABLE_AOT=1, payload v6 + census v2). Four results,
+in causal order:
+
+1. **Published target verified correct (read_dispatch_page.exe).** The
+   hook publishes `prolog_end` = unix-ntdll.so dispatcher entry + 0x24 at
+   0x7ffe1008. In-process probe: dispatcher 0x208809670, prolog_end
+   0x208809694, both inside the **unix .so** (in-ntdll:0 — correct; the
+   Windows-side ntdll base is 0x6ffffff30000, unrelated). The earlier
+   "suspicious 0xc723a96" was a decimal/hex misread of the %llx log.
+   R21b open question 3 is CLOSED.
+
+2. **capsite4 / capsite5: the second-emitter switch is neither threads nor
+   (outside Wine) anon backing.** capsite4 with 1/4/8 threads → entered
+   11/44/88 (perfect scaling). capsite5 (single site memcpy'd to an anon
+   RWX page, file-backed warm call first) → ins 1, entered 4: the ANON
+   copy's emission went through the hooked append AND its chain executed.
+2b. **anon_invalid_site.exe (ais3): the same holds INSIDE a Wine process.**
+   Probe pid 80788: 12 polls at ins 38 miss 0 entered 0 (the 38 = startup
+   PE-ntdll stub chains), then at the anon call: **ins 40, entered 2 — the
+   first chain executions ever recorded inside Wine.** An anon-memory
+   syscall site inside Wine uses the hooked emitter and its chain RUNS.
+   The switch that hides Wine's PE-image sites from us is therefore
+   per-image/per-mapping, NOT per-process — same process, anon site runs
+   its chain, PE-image sites' executed TBs still bypass us.
+
+3. **The ais3 crash DECODED (corrected after source work — the first read of
+   this run was wrong): the chain never reached the dispatcher.** The exit
+   line reads `entered 2 hits 0 bail5 0`; `hits` (ctl[36]) counts stubs that
+   actually ENGAGED (table[0] installed a TB entry) — so BOTH stub entries
+   took the early-guard `99:` bail, re-ran the stock bl, and everything the
+   probe experienced afterwards was the STOCK path. The crash itself:
+   `page fault on write to 0x8 at 0x7E0021` = the probe's second marker
+   store (`movq %r8, 8(%rdx)`) with rdx=0 — and that is stock Wine-macOS
+   behaviour, not ours: sigsys_handler sets `frame->restore_flags = 0`
+   (signal_x86_64.c:2953), the dispatcher body zeroes edx in its XState
+   prologue (`xorl %edx,%edx`, :3390), and `__wine_syscall_dispatcher_
+   return` restores rax/rcx-from-frame/rdx/r8-r11 ONLY when restore_flags
+   has CONTEXT_INTEGER (:3592-3612) — with 0 it returns via `ret` leaving
+   rdx/r8/r9/r10 clobbered. `bad_syscall` (:3665) returns 0xC000001C in
+   rax, no exception. So Wine's emulated raw syscall diverges from real
+   Windows (which preserves rdx etc.) — a PRE-EXISTING upstream-Wine
+   divergence, orthogonal to the hook, tolerated by the game on the stock
+   path today. **No resume-contract redesign is needed**; the blocking
+   question is simply: which guard bails? (ais3 probe also relied on rdx
+   surviving — real-HW semantics — which the stock path never provided.)
+
+4. **Per-process counter timeline (corrects an earlier misread): every
+   Wine process converges to ins 40–58 miss 0 entered 0** (services.exe 58,
+   probe exe 38→40). The `ins 0 miss 29–51` values that looked anomalous
+   are the ring writer's FIRST 648-byte snapshot (50 ms after install):
+   during early startup ~30–50 matchers arm and expire (miss = fail-open,
+   stock stream), before the insert stream starts. Tooling: the bin files
+   are APPEND-mode — the first snapshot is trustworthy, snapshots written
+   during process teardown are recycled-page junk (ins 8732579476 etc.).
+   Authoritative counters are the log's `sysc poll` / `sysc at exit` lines.
+
+### r21c conclusions
+
+- Chains placed by insert8 DO execute when the site's mapping uses the
+  hooked emitter: Mach-O text (capsite), anon page outside Wine (capsite5),
+  anon page inside Wine (ais3 — the stub was entered twice). Only Wine's
+  PE-image mappings divert the EXECUTED TBs to the unhooked second path
+  (r21b finding, unchanged). **CORRECTED by ais5 (below): PE-image sites DO
+  execute their chains — the r21b "second emitter" framing was wrong for
+  PE images; it applies to ANON mappings (ais4/ais6: the anon copy never
+  enters the stub).**
+- ais3's crash is stock-path behaviour (rdx clobber via restore_flags=0);
+  our stub bailed at its guards before doing anything. Also recorded:
+  Wine's emulated raw syscall clobbers rdx/r8/r9/r10 (pre-existing
+  divergence from real Windows; the stock path the game runs on today has
+  it too).
+
+### r21d (2026-11-08, night) — THE FAST PATH WORKS IN WINE: hits, resume, 33 ns/call
+
+ais4→ais12 arc, one blocking defect per run, each fixed within the existing
+design (no mechanism changes — guard corrections and one missing
+precondition):
+
+1. **ais5/ais6: chains from PE-image sites EXECUTE in Wine, every call,
+   hot loops included.** site1 (a plain function in the exe, `mov eax,-1;
+   syscall` + rdi markers) enters the stub on every spaced AND every hot
+   call (20000-loop). No tier-up, no re-emission: the r21b "never execute"
+   model is dead for PE images. The ANON copy of the same code never
+   enters (entered counts prove it) — second-emitter treatment belongs to
+   anon mappings, the opposite of the first reading.
+2. **Guard 5b (TEB identity) — TPIDRRO is NOT the TEB in our setup.**
+   mac_gsbase_switching=0 (exec regions carry %gs truth), so TPIDRRO_EL0
+   stays the native pthread TEB (0x7ff2063ce0e0); [pthread+0x30] = 0x7ffc0000
+   is the Windows TEB (confirmed from the Windows side: `%gs:0x30` prints
+   7ffc0000, and [TEB+0x378] = live syscall_frame). Fix: two-hop resolution,
+   fail-closed (candidate must be nonzero, canonical, page-aligned, and
+   self-pointing before it is trusted; single-hop kept for gsbase-switching
+   setups). ais6 also exposed that the histogram BYTES wrap at 256 — 5b now
+   also counts in a full word, ctl[45].
+3. **Guard 7 (instrumentation callback) — the field is never null under
+   Wine.** signal_start_thread stores &instrumentation_callback at TEB+0x330
+   (signal_x86_64.c:3212) and the dispatcher DEREFERENCES TWICE
+   (:1943-1946: r10=[TEB+0x330]; r10=[r10]; test). Fix: same two-level
+   deref, canonical-check the slot first, bail only when a real callback is
+   installed (the stock handler ORs RESTORE_FLAGS_INSTRUMENTATION into
+   restore_flags, which the stub does not model — bail stays correct).
+4. **The resume call's missing precondition — table[0] installs ONLY when
+   the pending-flags word has bit9.** 0x5908 = `swp wzr,w19,[ctx+0x1c8]`:
+   atomically CONSUMES the 32-bit pending word and returns the old value;
+   0x5964 takes the install path (0x59c4 → 0x6644 CRC32 TB-cache lookup,
+   miss → 0x5c74/translate; entry → `str [ctx+0x8]`) only when bit9 is set
+   in it. The epilogue's callers always have bit9 queued; ours had w=0 →
+   no install → the clean bail (bail5 = entered, hits 0, ais8/ais9). Fix:
+   queue the continuation ourselves — 32-BIT ONLY. **ctx+0x1c8 is a 32-bit
+   flags field; ctx+0x1cc is a SEPARATE payload field the emitter keeps
+   live state in** (eaa4: `str w21,[x0,#0x1cc]`): a 64-bit read sees the
+   payload and false-busies (ais10's c38 diagnostic: flags 0, payload
+   0x60482803); a 64-bit store ZEROES the payload (ais8/ais9 bug).
+   Correct sequence: `ldr w13,[x18,#0x1c8]; cbz→queue; str w13,#0x200`
+   (bit9; bit0 stays clear — that path parks rip at ctx+0x1d8 and calls
+   0xebc4, exception-server notify, not our case).
+5. **ais11/ais12: ENGAGED and measured.** anon-invalid-site.exe under
+   macfinals-40 + local hooklib: `entered 220043 hits 220038 bail5 0` (5
+   guard-2 = pre-publish window), every call returns rax=0xC000001C
+   (bad_syscall via the real dispatcher — byte-identical semantics), rdi
+   markers intact, and the timed hot loop: **33 ns/call** (stock 16-19 µs,
+   Proton ~2 µs). The whole chain — v6 insert → stub → guards → frame
+   writes → table[0] install → restore → `ret` into the dispatcher TB →
+   dispatcher_return — runs on every call.
+
+Tooling notes: c38 (ctl[38]) = last-writer diagnostic (busy-bail stores the
+32-bit flags zero-extended; the post-call path stores ctx+0x8); the sysc log
+line carries it as `c38`. direct-syscall-probe's own sites still never
+engage (entered 0, stock 15821 ns — its emission shape is declined by the
+matcher; the site1 shape is the proven one; timing moved into
+anon-invalid-site's TIMED loop).
+
+**Open, in order:** (a) the game's own sites are PE-image — but from ais5
+PE sites engage, so THE FINALS' 32k/s traffic should engage the same way;
+verify in-game counters. (b) Runtime macfinals-41 via add_nt_hook.py, Crab
+Champions canary, then THE FINALS with R17's measurement setup. (c) The
+5-guard-2 pre-publish window: the first ~100 ms of invalid-class traffic
+still takes the stock path (publish lag) — acceptable (today's behaviour).
+
+## r21e (2026-11-09) — the game's first-run crash diagnosed: TF guard added; x23 liveness bug found and fixed
+
+### The crash (2026-11-08 19:20:39, macfinals-41, first run on the new account)
+
+Embark crash reporter; minidump `THEIA_89989837_1424.dmp` (Temp dir, user
+`crossover`): exception `0x80000004` (STATUS_SINGLE_STEP), addr
+`0x20880b698` = **published fast-path target (prolog_end) + 4**, main thread,
+2.3 s after inner Discovery.exe start. +4 is the SECOND dispatcher
+instruction — a step trap fires after ONE executed instruction — so guest TF
+was live when the fast-path resume entered Wine's dispatcher. Single-stepping
+its own startup is classic anti-debug/anti-tamper behaviour (new-account
+first-login path; the Nov 2 runs on stock-path runtimes reached the menu, so
+the stepping window is state-dependent).
+
+The stock sigsys path is PROVEN TF-correct (source-level reading of
+`sigsys_handler` + the game surviving TF windows for weeks on stock runtimes),
+so the fix is fail-closed: **decline TF-live sites to stock.** Guard at stub
+label 18: live x17 bit 4 (TF) OR the runtime TF byte at ctx+0x444 nonzero →
+count ctl[40] byte 7 (0x147) and bail to 99 (stock). Both arming modes
+covered — the game's crash is consistent with a step-mode ENTRY TB (table[0]
+keys its TB-cache lookup on the ctx TF byte), which no probe arming mode
+produces (popfq arming sets only x17 bit 4; the probe never reproduced the
+target+4 signature).
+
+### The x23 liveness bug (the lesson of the session)
+
+First build read the TF byte into **w23**. x23 is `_g_ctl` LIVE across label
+18 (set at 0x1530 by the guard-5b block; the post-park frame build stores
+through it at 0x15f8/0x1600/0x1610/0x1614/0x1634 without reloading). Every
+fast-path entry then wrote through a garbage pointer: the ais probe spun at
+VirtualAlloc with ~170 re-translations/s (chains re-inserted, executed once,
+faulted, invalidated). **capsite passed VACUOUSLY** — all 11 carrier entries
+bail at guard 2 (no dispatcher published outside Wine), so label 18 never
+ran. Fix: the fall-through check reads into **w24** (dead after guard 7's
+last deref, never read on the main path before its next write); the bail
+block keeps x23/x24 clobbers like every other guard's bail. tbnz/ldrb/cbz
+are flags-neutral, so the entry NZCV park is untouched.
+
+Rules: (1) any insertion into ntfix_macfast needs a register-liveness audit
+of the insertion point, not just of the entry; (2) **the regression gate for
+stub changes is ais in Wine** (entered≈hits, TIMED ~35-50 ns, done), never
+capsite; (3) entered accounting: `entered = hits + g2 + TF-bails(+other)`.
+
+### Verification (all on macfinals-41 wine + local hooklib, ais env)
+
+- ais r21e-2: `entered 220043 hits 220039` — IDENTICAL to the r21d control;
+  TIMED 51 ns/call; done. Fast path parity proven.
+- TF probe (spaced-warm, VEH stepper, +seh): r21e-2 `entered 33 = hits 29 +
+  g2 2 + TF 2 (guards 0200000000000002)` — the armed call BAILS to stock;
+  no step rip anywhere in the dispatcher range. r21d control: `entered 32 =
+  hits 29 + g2 3` — the same armed call is TAKEN INTO the fast path. The
+  guard fires exactly on TF-live entries and nothing else.
+- TF-probe artifacts (pre-existing, NOT regressions): the VEH-continue
+  spiral (c00000025 → stack overflow at 0x6ffffff9xxxx = Wine unix-side
+  trampoline addresses, constant across runs) kills the probe after the
+  armed syscall on BOTH stock and hooked runs — since the first VEH version;
+  the +seh trace, not the probe's own output, is the evidence that survives.
+- ~~Engagement needs the ring writer~~ — WRONG, corrected the same day. The
+  ring (`ring_capture_on`) only starts a side thread that dumps counters;
+  the ring buffer is allocated regardless and the payload never reads the
+  switch. The "entered 0 without the ring" lines were the at-exit dumps of
+  Wine's HELPER processes: the probe itself died in the VEH spiral before
+  atexit, so without the poll thread its counters were simply never
+  printed. Same artifact behind "200 hot calls → entered 0". Rule: a
+  process that may die needs the poll thread (MACFINALS_HOOK_RING=1 or
+  `touch /tmp/rosetta-re/nt-ring`) or its counters are invisible — absence
+  of a line is not entered=0. (ais12's TIMED hot loop engages fine.)
+
+### First game run on macfinals-42 (2026-11-09 07:40, PERF=1 avx msync)
+
+Got in game, no 19:20-class crash — but **the fast path did NOT engage in
+Discovery.exe**. perf/wine.<game pid>, in play (t=30-150 s): 26k-56k
+SIGSYS/s with rax 0xffffffff counted by Wine's own sigsys_handler (stock
+path), Rosetta's exception thread at 20-34 % CPU, GameThread ~75 %. Same
+storm as R17. The game process has no hook counters (no poll thread, killed
+before atexit), so which step fails is unknown: matcher never fires at the
+game's sites (ins 0), chains placed but not executed (ins>0, entered 0 —
+the r21b class), or entered>0 and a guard bails (guard 7 = an
+instrumentation callback; the game made 24 NtSetInformationProcess calls,
+classes unlogged). Next run: `touch /tmp/rosetta-re/nt-ring` first.
+
+### Shipped
+
+Runtime **macfinals-42** (= unhooked 38 + r21e-2 hook; add_nt_hook from base
+38; embedded hook sha256 f8a2ae96116335f1… == tree hooklib), installed in
+`~/Library/Application Support/MacFinals/runtimes/`. Final ais gate on -42's
+own embedded hook: done, TIMED 52 ns/call, counters healthy.
+
+Next: Crab Champions canary on -42, then THE FINALS (`RUNTIME=macfinals-42
+PERF=1 tests/finals_bisect/launch_main.sh avx msync`) — the 19:20 crash
+should not recur; watch `sysc` counters for in-game engagement and R17
+GameThread comparison.
+
+## r21f (2026-11-09) — THE FINALS installs an instrumentation callback; guard 7 now matches sigsys_handler instead of bailing
+
+### The second game run on -42 (07:50, nt-ring switch on)
+
+The game process's own counters (hook-<pid>.log, poll thread via
+/tmp/rosetta-re/nt-ring): **entered 11,198,877, hits 137**, guards byte 6
+(guard 7, 0x146) wrapping on every poll, byte 7 (TF) = 1. So the matcher
+fires at the game's sites and the chains EXECUTE (~28k entries/s = the
+storm rate) — the in-game mechanism works — but every entry after early
+startup bailed at guard 7: **a ProcessInstrumentationCallback is installed
+in the game process.** (Who installs it is not looked into — boundary 3.)
+The single TF bail happened before the callback existed (TF guard runs
+after guard 7): the r21e guard fired once in the real game and declined, in
+the startup window where the 19:20 crash happened.
+
+### The fix (parity, no new mechanism)
+
+sigsys_handler does not decline a callback: `frame->restore_flags = 0; if
+(instrumentation_callback) |= RESTORE_FLAGS_INSTRUMENTATION (0x10000)`
+(signal_x86_64.c:2953-2954); the dispatcher return path re-reads the
+callback via [TEB+0x330] and enters it with r10 = return address
+(:3613-3629). The stub now does the same: guard 7 keeps the slot-canonical
+bail but carries the callback VALUE in x24 (0 = none); restore_flags =
+(x24 ? 0x10000 : 0) | (TF ? CONTEXT_CONTROL : 0). The TF guard's scratch
+moved w24 → w22 (dead until the park's mrs x22,NZCV). Liveness audited on
+the disassembly: x24 unwritten on the main path from 0x1598 to the cbz at
+0x161c, compose touches none of x19-x28, x23 (= syscall FRAME from label
+16 — NOT _g_ctl as the r21e comment said; corrected) untouched.
+ntfix_trapfast (quarantined r20 path only) unchanged.
+
+### Verification (throwaway prefix in the scratchpad — Steam held the main one)
+
+- New probe `tests/windows_probe/instr_cb_probe.c`: installs a callback
+  (NtSetInformationProcess class 40), warms the site, then single calls
+  with nothing between the counter reads, then 200k timed.
+  - stock (no hook): 1 callback per call, r10 = the instruction after
+    `syscall` exactly, rax c000001c, markers ok; **16,464 ns/call**.
+  - r21f: byte-identical callback behaviour (1/call, same r10, rax,
+    markers); **75 ns/call**; entered 200039 = hits 200035 + 4 guard-2
+    startup bails; guard-7 byte 0.
+- ais (no callback): entered 220043 hits 220039 — identical to r21d;
+  34 ns/call; done.
+- Probe pitfall: a naked asm site called from C gets its argument in RCX
+  (Win64 ABI), and rdi is callee-saved — the first build wrote through rdi
+  and faulted at 0x5f. ais hid this by passing rdi via an asm constraint.
+
+### Shipped
+
+Runtime **macfinals-43** (= unhooked 38 + r21f hook, embedded sha256
+4d4abaec4e269250… == tree hooklib), installed. Next: THE FINALS on -43 with
+the nt-ring switch on — expect hits ≈ entered, sigsys/s in perf to collapse
+from ~30k to ~0, Rosetta exception thread near idle, then FPS.
+
+### r21f in the game — THE STORM IS FIXED (2026-11-09 08:00, macfinals-43, PERF=1 avx msync, nt-ring on)
+
+Game process counters: **hits 10,158,397 / entered 10,159,226 (99.99 %)**,
+bail5 827 (late bails, stock fallback), guards byte 7 (TF) = 1.
+perf/wine.<game pid>, play window (t=40-130 s), vs the -42 storm run:
+
+| | -42 (storm) | -43 (fast path) |
+|---|---|---|
+| stock SIGSYS/s | 26k-56k | **1-2** |
+| Rosetta exception thread CPU | 20-34 % | **0.0 %** |
+| GameThread user / sys | 36 % / 38 % | **81 % / 5 %** |
+| context switches/s (process) | 192k | 102k |
+| segv/raise/unhandled per s | ~200 | ~200 (the game's own; unchanged) |
+
+GameThread's kernel time (the brk → exception server → SIGSYS detour) is
+gone; it now spends ~2.2x as much time running its own code, and is pegged
+(~96 % total) — the remaining limit is GameThread's translated x86 work.
+Other traffic is cheap: NtQueryPerformanceCounter 232k/s (Wine syscall, not
+SIGSYS; absent from the time ranking), MSync event ops ~93k/s at ~3 µs.
+Open lever: DISABLE_AOT=1 (the hook requires it) forces JIT translation of
+every Mach-O image in the process (Wine's unix side, x86_64 system
+libraries, D3DMetal) — its cost has never been measured.

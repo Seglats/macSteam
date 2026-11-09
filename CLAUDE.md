@@ -126,7 +126,7 @@ mandatory-safe revival plan.
   E111000D. Open questions: `tests/rosetta_nt/(removed)`. Measured differences from
   Proton beyond CPUID identity and CS/SS are tabled there, and fixing any outside
   `POPF`/`PUSHF`/`IRET` is Rasmus's decision.
-- **Rebuild the hook with the commands in `tests/rosetta_nt/NOTES.md` and stop on failure.** A failed
+- **Rebuild the hook with `tests/rosetta_nt/build_hook.sh`** (it stops on failure). A failed
   payload build leaves the old `payload_blob.h`, and `hooklib.dylib` then silently embeds it.
 - **NT handled by the in-process Rosetta hook** (`tests/rosetta_nt/`, shipped as
   `lib/macfinals-nt-hook.dylib`). `macfinals-probe` passes 4/4 inside Wine, and pushf/popf are
@@ -198,6 +198,16 @@ DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
 skip `add_nt_hook.py`.** An assembled runtime has no hook and signs the Wine executables with
 the hardened runtime, which makes dyld strip the insertion, so the app would silently ship
 without the NT fix. It adds `tests/rosetta_nt/hooklib.dylib` and re-signs those executables ad hoc.
+Build that hook with `tests/rosetta_nt/build_hook.sh` (payload → blob → both slices → signed;
+stops on the first failure, so a stale `payload_blob.h` can never be embedded).
+
+**Release builds without debug messages** use Wine's own switches (see "Debug output"):
+`build_portable_runtime.py --no-debug-msgs` (Wine; needs its own workspace — the mode is pinned
+per workspace and a mismatch is refused), `assemble_portable_runtime.py --no-debug-msgs` (the
+d3d12 layer), and `DEBUG_CFLAGS="-DWINE_NO_TRACE_MSGS -DWINE_NO_DEBUG_MSGS"
+tests/rosetta_nt/build_hook.sh OUT.dylib` then `add_nt_hook.py --hook OUT.dylib` (the hook).
+err messages always stay. `d3d12_layer/build.sh` refuses a layer that imports anything but
+kernel32/ntdll/api-ms-win-crt (a MinGW runtime DLL there makes d3d12.dll fail to load).
 
 Runtime versions and app output paths must be new each time; existing ones are never
 overwritten. An interrupted run leaves a partial artifact directory or `.app` shell that
@@ -216,6 +226,29 @@ Wine patches live in `WINE_PATCHES` in `scripts/build_portable_runtime.py`, orde
 **Append new ones at the end** so the existing source tree patches incrementally; changing
 or reordering an applied patch requires deleting `$W/sources/wine`. Applied patches are
 recorded in `.macfinals-patches.json` inside the Wine source.
+
+## Debug output — follow Wine's model
+
+All MacFinals code logs the way Wine does (2026-11-09): **debug channels with the classes
+err/fixme/warn/trace, selected at run time with `WINEDEBUG`, and compiled out for a release
+build with `-DWINE_NO_TRACE_MSGS` / `-DWINE_NO_DEBUG_MSGS`.** Default err+fixme; nothing is
+written to files unless trace is on. New code uses this too — no new `MACFINALS_*_LOG`
+variables, no switch files.
+
+| Channel | Code | trace adds |
+|---|---|---|
+| `macfinals_hook` | `tests/rosetta_nt/hooklib.c` (parses WINEDEBUG itself with Wine's rules: it runs before ntdll) | counter dumps every 2.4 s, `/tmp/rosetta-re/hook-<pid>.log`, payload ring capture |
+| `macfinals_dx12` | `d3d12_layer/layer.c` (through ntdll's `__wine_dbg_*`) | every rewritten shader and pipeline; **warn** = pipeline creation ≥ 50 ms, with thread name and epoch time |
+| `macfinals_scan` | hooklib's arena scan at process exit | trace class only; heavy, own channel like relay |
+
+Only our output: `WINEDEBUG=-all,+macfinals_hook,+macfinals_dx12` (a named channel always beats
+`all`, whatever the order); one process only: `Discovery.exe:+macfinals_dx12`. Channel names are
+≤ 14 characters or Wine ignores them. `launch_main.sh DEBUG=macfinals` is that, with Wine's
+pid/tid/timestamp prefixes and MoltenVK quieted (`MVK_CONFIG_LOG_LEVEL=1`; MoltenVK logs
+outside WINEDEBUG). Any `WINEDEBUG=...` given to `launch_main.sh` is passed verbatim.
+Retired: `MACFINALS_D3D12_LAYER_LOG`, `MACFINALS_HOOK_RING`, `MACFINALS_SYSC_DUMP`,
+`/tmp/rosetta-re/nt-ring`. Functional switches (`MACFINALS_SKIN_FIX`, `MACFINALS_NT_HOOK=0`,
+`MACFINALS_NT_OFF`, `MACFINALS_THUNK_PATCH`) are not debug output and stay.
 
 ## Testing a new app bundle — read this first
 

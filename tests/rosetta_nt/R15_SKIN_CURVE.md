@@ -109,6 +109,7 @@ substitution happens for every image mapping via `virtual_map_section → load_b
 ```sh
 # quit the app, Steam and the game first
 RUNTIME=macfinals-21 MACFINALS_D3D12_LAYER_LOG=1 tests/finals_bisect/launch_main.sh
+# (2026-11-09: MACFINALS_D3D12_LAYER_LOG is retired; use WINEDEBUG=-all,+macfinals_dx12)
 ```
 
 `MACFINALS_SKIN_FIX=0` turns the layer into a pure forwarder (A/B test). The layer logs one

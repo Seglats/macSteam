@@ -1355,3 +1355,72 @@ SIGSYS; absent from the time ranking), MSync event ops ~93k/s at ~3 µs.
 Open lever: DISABLE_AOT=1 (the hook requires it) forces JIT translation of
 every Mach-O image in the process (Wine's unix side, x86_64 system
 libraries, D3DMetal) — its cost has never been measured.
+
+## Freeze hunt (2026-11-09 08:46, macfinals-47, PERF=1 avx msync, warn+macfinals_dx12, +macfinals_hook)
+
+Rasmus: "a few major freezes". Game pid 72957; fast path still engaged (entered 9.43M,
+hits 9.43M). Freezes from perf (GameThread ≥ 90 % alone, process quiet): loading +13..+22 s;
+in play +94 s (0.4 s), **+109 s (1.7 s)**, **+129 s (2.2 s)**, +138 s (0.7 s).
+
+- **Not pipeline builds.** Only 14 builds ≥ 50 ms all session, all on UE5's
+  `PSOPrecompilePool #N` threads in one 7 s burst ending +34 s (~5,260 pipelines; ~35 ms of
+  the slow ones was our DXIL rewrite, the rest GPTK). Nothing ≥ 50 ms near any play freeze.
+  (Many builds < 50 ms on GameThread are not yet excluded — warn does not show them.)
+- **Not Wine syscalls.** During freezes syscalls are cheap (memory calls absent from the
+  time ranking), Wine's VM lock is held LESS than in normal play (40 vs 58 ms/s), and
+  GameThread is 95 % user / 6 % sys. What rises: NtAllocateVirtualMemory 569/s (normal 85),
+  NtFreeVirtualMemory 706 (277), mmap 1320 (522), NtDeviceIoControlFile 615 (207),
+  NtDelayExecution 108 (7), NtContinue 417 (270), NtUserCallHwnd 8.7 (0). So: GameThread
+  computing in user mode with its allocator churning — the shape of UE5's own hitches
+  (garbage collection / streaming), magnified by running translated.
+- **Two kinds.** +94 s and +138 s coincide with large translation bursts (2-6 M emitted
+  words per 2.4 s interval — new code running for the first time); the two biggest, +109 s
+  and +129 s, have translation near idle (2-40 k): pure compute in already-translated code.
+- Open: (a) a default-logging run (trace off = no payload ring capture) to see whether the
+  translation-burst freezes shrink; (b) what GameThread executes in the compute freezes —
+  needs a stack sample of a live translated process (sample/spindump), which touches the
+  2026-11-07 panic class and the anti-cheat's view of the process: Rasmus's decision.
+
+## Freeze hunt, continued and PAUSED (2026-11-09 09:20) — NOT DONE
+
+**Status: not finished, parked by Rasmus ("i don't think we need it atm").** The freezes are
+still there and their cause is still unknown. Pick it up from here if they become a problem.
+
+What was learned since the section above:
+
+- **Shaders are cached between runs.** D3DMetal keeps its cache in
+  `$(getconf DARWIN_USER_CACHE_DIR)d3dm/Discovery.exe/shaders.cache` (about 1.4 GB: the
+  DXIL→Metal `bytecode_cache.bin`/`stage_cache.bin` and Metal's compiled `functions.data`).
+  It is not wiped between runs. `bytecode_cache.bin` last grew 11-02, `stage_cache.bin`
+  08:03 and `functions.data` 08:46 on 11-09; three later runs added nothing, yet they still
+  froze. So, together with the pipeline timing above, **the play freezes are not shader
+  compilation.** (macOS may purge that cache folder under disk pressure; a purge would bring
+  first-run compiles back.) UE5's own `Saved/Discovery_PCD3D_SM6.upipelinecache` is 9 KB.
+- **Freeze counts in the two later runs** (perf files, GameThread ≥ 90 % with < 6000 calls per
+  0.1 s): 9 and 20 freezes, all 0.3-1.4 s, none of the 2 s kind. Most cluster in loading and
+  the first minutes.
+- **Apple `sample` is the wrong tool** (`tests/finals_bisect/freeze_sampler.py`). It works on
+  translated processes and caused no trouble, but on the game it gets only 6-13 stacks per
+  1.5 s (it suspends ~200 threads per stack) and starts 0.7-1.2 s after the freeze began, so
+  it mostly samples after a 0.3-0.9 s freeze has ended. Its 8 samples
+  (`logs/main-20261109-090403-avx-msync/freeze-samples/`) show GameThread in Wine server
+  calls (NtDeviceIoControlFile, NtReadFile/NtWriteFile, waits) and in game code, but they
+  are post-freeze and statistically thin — do not draw conclusions from them. One sample had
+  frames in the anti-cheat region (only noted, not analysed).
+  Also learned: THE FINALS starts a short-lived `Discovery.exe` (it names a GameThread too,
+  exits after ~30 s) before the real game; tools must follow the newest process.
+- **The better tool is built but has never captured a game freeze:**
+  `tests/finals_bisect/freeze_profile.py` (`record`, then `analyze`). It attaches Instruments'
+  Time Profiler (`xctrace record --attach`) — kernel sampling at 1 kHz, no thread suspension,
+  **no developer mode needed**, stacks of translated processes in x86 terms — and afterwards
+  cuts GameThread's samples to the perf-file freeze windows, broken down by module (Windows
+  addresses mapped via `+loaddll` bases; the anti-cheat region only counted). Verified on
+  probe programs: timing aligns to the millisecond, the hand-over between two processes
+  works. Its first game run failed: kperf serves one recording at a time and the first
+  process's recording still held it ("could not lock kperf"); fixed (one recording at a
+  time, newest process wins, restart on a lock error) and re-tested on probes, **not yet on
+  the game**.
+
+To resume: `python3 tests/finals_bisect/freeze_profile.py record`, then
+`RUNTIME=macfinals-47 PERF=1 tests/finals_bisect/launch_main.sh avx msync`, play through some
+freezes, quit, then `python3 tests/finals_bisect/freeze_profile.py analyze`.

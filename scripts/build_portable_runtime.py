@@ -170,7 +170,7 @@ def apply_once(source, patch):
         run(['/usr/bin/patch', '-N', '-F0', '-p1', '-i', patch], cwd=source)
 
 
-def build(work, tools, headers, jobs):
+def build(work, tools, headers, jobs, debug_msgs=True):
     fetch(work)
     wine = extract(work, 'wine', 'sources/wine/') / 'sources/wine'
     libraries = extract(work, 'libraries', 'Libraries/Wine/lib/') / 'Libraries/Wine/lib'
@@ -228,6 +228,21 @@ def build(work, tools, headers, jobs):
                           '/usr/bin', '/bin', '/usr/sbin', '/sbin'])
     env['MACOSX_DEPLOYMENT_TARGET'] = '26.0'
     flags = '-O2 -g0 -ffile-prefix-map=' + str(work) + '=/build/overwatch-2-mac'
+    # --no-debug-msgs: Wine's own release switches. WINE_NO_TRACE_MSGS compiles every TRACE
+    # out, WINE_NO_DEBUG_MSGS also WARN and FIXME; ERR stays (include/wine/debug.h). The
+    # mode changes every object file, so it is pinned per workspace instead of silently
+    # rebuilding one: a release Wine is built in its own workspace.
+    if not debug_msgs:
+        flags += ' -DWINE_NO_TRACE_MSGS -DWINE_NO_DEBUG_MSGS'
+    debug_mode = work / 'wine-build/.portable-debug-msgs'
+    want_mode = ('on' if debug_msgs else 'off') + '\n'
+    if debug_mode.exists():
+        if debug_mode.read_text() != want_mode:
+            raise RuntimeError('This workspace builds Wine with debug messages ' + debug_mode.read_text().strip()
+                               + '; use a separate workspace to build it ' + want_mode.strip())
+    elif (work / 'wine-build/Makefile').exists() and not debug_msgs:
+        raise RuntimeError('This workspace already holds a Wine built with debug messages; '
+                           'use a fresh workspace for --no-debug-msgs')
     logdir = work / 'build-logs'
     logdir.mkdir(exist_ok=True)
     with (logdir / 'freetype.log').open('w') as log:
@@ -309,6 +324,7 @@ def build(work, tools, headers, jobs):
              'i386_CFLAGS=' + flags, 'x86_64_CFLAGS=' + flags],
             cwd=builddir, env=env, stdout=log, stderr=subprocess.STDOUT)
         padding.write_text('0x1000\n')
+        debug_mode.write_text(want_mode)
         cross_paths.write_text(flags + '\n')
         nested_paths.write_text(flags + '\n')
         run(['make', 'install', 'DESTDIR=' + str(work / 'install')], cwd=builddir,
@@ -322,6 +338,7 @@ def build(work, tools, headers, jobs):
               'without_vulkan': False, 'without_gstreamer': True, 'with_sdl2': True,
               'native_linker_header_padding': '0x1000',
               'windows_compiler_paths_remapped': True,
+              'debug_messages': debug_msgs,
               'driver_matches_accepted_patch': True}
     (work / 'wine-build-proof.json').write_text(json.dumps(record, indent=2) + '\n')
     print('Full Wine build complete; no live installation modified', flush=True)
@@ -336,6 +353,9 @@ if __name__ == '__main__':
     parser.add_argument('--download-only', action='store_true',
                         help='Fetch verified inputs before building native dependencies')
     parser.add_argument('--jobs', type=int, choices=range(1,5), default=2)
+    parser.add_argument('--no-debug-msgs', action='store_true',
+                        help="Compile Wine's TRACE/WARN/FIXME messages out (WINE_NO_TRACE_MSGS, "
+                             "WINE_NO_DEBUG_MSGS), as for a release build; needs its own workspace")
     args = parser.parse_args()
     work = args.workspace.resolve()
     if work == ROOT or work in ROOT.parents or work.name != 'phase-2':
@@ -354,4 +374,4 @@ if __name__ == '__main__':
             parser.error('Build the pinned native dependencies first, or supply --gnutls-headers')
         if not (work / 'clean-deps/include/SDL2/SDL.h').is_file():
             parser.error('Build the pinned native dependencies first: SDL2 is missing')
-        build(work, args.toolchains.resolve(), headers, args.jobs)
+        build(work, args.toolchains.resolve(), headers, args.jobs, debug_msgs=not args.no_debug_msgs)

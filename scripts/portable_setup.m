@@ -535,7 +535,9 @@ static NSString *sessionChoice(NSString *value) {
     return [value isEqual:@"0"]?value:nil;
 }
 static NSMutableDictionary *clientEnvironment(NSMutableDictionary *env, BOOL hud, BOOL gameMode);
-static NSString *const MVGameDebugDefault=@"+pid,+tid,+timestamp,err+all,fixme+all,+seh,+loaddll,+process,warn+module,+syscall,+reg,+ntoskrnl,+service,+debugstr,+threadname";
+/* No +seh: it logs every exception and changed THE FINALS' behaviour (2026-11-01). Includes
+ * MacFinals' own channels (Rosetta hook, d3d12 layer), which follow Wine's channel model. */
+static NSString *const MVGameDebugDefault=@"+pid,+tid,+timestamp,err+all,fixme+all,+loaddll,+process,warn+module,+syscall,+reg,+ntoskrnl,+service,+debugstr,+threadname,+macfinals_hook,+macfinals_dx12";
 /* Starts GAME the way Steam does, but from here: its executable in its install folder, with
  * Steam's launch options and the variables Steam gives the games it starts, so the Steam API
  * attaches to the running client. Nothing in the game's folder changes. */

@@ -46,6 +46,7 @@
 #include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <stdint.h>
@@ -95,13 +96,118 @@ static uint32_t *g_ring;
 static uint32_t *g_payload;    /* MAP_TRANSLATED_ALLOW_EXECUTE page  */
 static int g_installed;        /* 1 = append hook, 2 = converters    */
 
-static void logf(const char *fmt, ...) {
-    va_list ap;
-    if (g_fd >= 0) {
-        va_start(ap, fmt); vdprintf(g_fd, fmt, ap); va_end(ap);
+/* ---- debug output: Wine's channel model, channel "macfinals_hook" ----------
+ * The hook runs before Wine's ntdll exists (dyld constructor of the loader), so it
+ * cannot ask Wine; it reads WINEDEBUG itself with Wine's exact rules
+ * (dlls/ntdll/unix/debug.c init_options/parse_options/add_option):
+ *   default err+fixme; "all" changes the default; a named channel starts from the
+ *   default as it stands at its first mention; "app:" entries apply only when app
+ *   is argv[1]'s basename; stderr on /dev/null turns everything off.
+ *   WINEDEBUG=-all,+macfinals_hook               this hook only, nothing from Wine
+ *   WINEDEBUG=-all,Discovery.exe:+macfinals_hook only in the game process
+ * err  = a fix is NOT active in this process (fail-closed, install failure)
+ * warn = degraded (converters or the fast-path target never appeared, ...)
+ * trace = everything else, plus the counter dumps, the per-pid file
+ *   /tmp/rosetta-re/hook-<pid>.log and the ring capture (payload + poll thread).
+ * Second channel "macfinals_scan" (trace class): the arena scan at process exit
+ * (syscdump) — heavy (every exec region, under a temporary SIGSEGV handler), so it is
+ * its own channel, as Wine keeps relay/snoop apart: WINEDEBUG=trace+macfinals_scan.
+ * Lines go to stderr like Wine's. -DWINE_NO_TRACE_MSGS / -DWINE_NO_DEBUG_MSGS compile
+ * trace / warn+fixme out, as for Wine. */
+enum { DBCL_FIXME, DBCL_ERR, DBCL_WARN, DBCL_TRACE };
+static const char *const g_dbg_names[] = {"macfinals_hook", "macfinals_scan"};
+static unsigned char g_dbg_flags[2] = {(1 << DBCL_ERR) | (1 << DBCL_FIXME), (1 << DBCL_ERR) | (1 << DBCL_FIXME)};
+#define g_dbg (g_dbg_flags[0])
+static __thread int g_dbg_midline;      /* header only at the start of a line */
+#define DBG_CHANNEL "macfinals_hook"
+
+__attribute__((unused)) static void dbg_init(const char *app_arg) {
+    static const char *const classes[] = {"fixme", "err", "warn", "trace"};
+    unsigned char def = (1 << DBCL_ERR) | (1 << DBCL_FIXME), mine[2] = {0, 0};
+    int named[2] = {0, 0};
+    const char *wd = getenv("WINEDEBUG"), *app = app_arg ? app_arg : "", *q;
+    struct stat st1, st2;
+    char *opts, *opt, *next;
+
+    if (!fstat(2, &st1) && S_ISCHR(st1.st_mode) && !stat("/dev/null", &st2) &&
+        S_ISCHR(st2.st_mode) && st1.st_rdev == st2.st_rdev) { g_dbg_flags[0] = g_dbg_flags[1] = 0; return; }
+    if (!wd || !(opts = strdup(wd))) { g_dbg_flags[0] = g_dbg_flags[1] = def; return; }
+    while ((q = strpbrk(app, "/\\"))) app = q + 1;
+    for (opt = opts; opt; opt = next) {
+        unsigned char set = 0, clear = 0;
+        char *p;
+        if ((next = strchr(opt, ','))) *next++ = 0;
+        if ((p = strchr(opt, ':'))) {
+            *p = 0;
+            if (strcasecmp(opt, app)) continue;
+            opt = p + 1;
+        }
+        p = opt + strcspn(opt, "+-");
+        if (!p[0]) p = opt;             /* assume it's a debug channel name */
+        if (p > opt) {
+            unsigned i;
+            for (i = 0; i < 4; i++)
+                if (strlen(classes[i]) == (size_t)(p - opt) && !memcmp(opt, classes[i], p - opt)) {
+                    if (*p == '+') set |= 1 << i; else clear |= 1 << i;
+                    break;
+                }
+            if (i == 4) continue;       /* bad class name, skip it */
+        }
+        else if (*p == '-') clear = 0xff;
+        else set = 0xff;
+        if (*p == '+' || *p == '-') p++;
+        if (!p[0]) continue;
+        if (!strcmp(p, "all")) def = (def & ~clear) | set;
+        else for (int c = 0; c < 2; c++)
+            if (!strcmp(p, g_dbg_names[c])) {
+                if (!named[c]) { mine[c] = def; named[c] = 1; }
+                mine[c] = (mine[c] & ~clear) | set;
+            }
     }
-    va_start(ap, fmt); vfprintf(stderr, fmt, ap); va_end(ap);
+    free(opts);
+    for (int c = 0; c < 2; c++) g_dbg_flags[c] = named[c] ? mine[c] : def;
 }
+
+__attribute__((format(printf, 3, 4)))
+static void dbg_out(int cls, const char *function, const char *fmt, ...) {
+    static const char *const classes[] = {"fixme", "err", "warn", "trace"};
+    char buf[1024], hdr[96] = "";
+    va_list ap;
+    int n;
+    va_start(ap, fmt); n = vsnprintf(buf, sizeof buf, fmt, ap); va_end(ap);
+    if (n < 0) return;
+    if (n >= (int)sizeof buf) n = (int)sizeof buf - 1;
+    if (!g_dbg_midline)                 /* macOS pid: the hook sits below Wine's pids */
+        snprintf(hdr, sizeof hdr, "pid%d:%s:" DBG_CHANNEL ":%s ", (int)getpid(), classes[cls], function);
+    g_dbg_midline = !(n > 0 && buf[n - 1] == '\n');
+    dprintf(2, "%s%s", hdr, buf);
+    if (g_fd >= 0) dprintf(g_fd, "%s%s", hdr, buf);
+}
+
+#define DBG_ON(cls) (g_dbg & (1u << (cls)))
+#ifdef WINE_NO_TRACE_MSGS
+# define SCAN_ON() 0
+#else
+# define SCAN_ON() (g_dbg_flags[1] & (1u << DBCL_TRACE))
+#endif
+#define DBG_(cls, ...) do { if (DBG_ON(cls)) dbg_out(cls, __func__, __VA_ARGS__); } while (0)
+/* compiled out: arguments stay type-checked, the call and its strings are dead code */
+#define DBG_OFF_(cls, ...) do { if (0) dbg_out(cls, __func__, __VA_ARGS__); } while (0)
+#define ERR(...) DBG_(DBCL_ERR, __VA_ARGS__)
+#ifdef WINE_NO_DEBUG_MSGS
+# define WARN_ON() 0
+# define WARN(...) DBG_OFF_(DBCL_WARN, __VA_ARGS__)
+#else
+# define WARN_ON() DBG_ON(DBCL_WARN)
+# define WARN(...) DBG_(DBCL_WARN, __VA_ARGS__)
+#endif
+#ifdef WINE_NO_TRACE_MSGS
+# define TRACE_ON() 0
+# define TRACE(...) DBG_OFF_(DBCL_TRACE, __VA_ARGS__)
+#else
+# define TRACE_ON() DBG_ON(DBCL_TRACE)
+# define TRACE(...) DBG_(DBCL_TRACE, __VA_ARGS__)
+#endif
 
 /* ---- mach helpers (same shape as ntstub.c; that file stays the lab copy) */
 
@@ -184,7 +290,7 @@ static mach_vm_address_t find_image(const uint8_t want[16], const char *label) {
                 uint32_t cpu = hdr[4] | hdr[5] << 8 | hdr[6] << 16 | (uint32_t)hdr[7] << 24;
                 if (magic == 0xFEEDFACF && cpu == 0x0100000C &&
                     uuid_matches(addr, want)) {
-                    if (label) logf("%s at %016llx\n", label, (unsigned long long)addr);
+                    if (label) TRACE("%s at %016llx\n", label, (unsigned long long)addr);
                     return addr;
                 }
             }
@@ -197,14 +303,14 @@ static mach_vm_address_t find_image(const uint8_t want[16], const char *label) {
 static int cow_write(mach_vm_address_t page, unsigned off, const void *data, unsigned len) {
     unsigned orig = prot_of(page);
     mach_vm_size_t win = clamp_to_region(page, 0x1000);
-    if (!win) { logf("cow_write %llx: clamp FAILED\n", (unsigned long long)page); return 1; }
+    if (!win) { ERR("cow_write %llx: clamp FAILED\n", (unsigned long long)page); return 1; }
     kern_return_t kr = mach_vm_protect(mach_task_self(), page, win, FALSE,
                                        VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
-    if (kr != KERN_SUCCESS) { logf("cow_write %llx: RW|COPY kr=%d FAILED\n", (unsigned long long)page, kr); return 1; }
+    if (kr != KERN_SUCCESS) { ERR("cow_write %llx: RW|COPY kr=%d FAILED\n", (unsigned long long)page, kr); return 1; }
     memcpy((void *)(uintptr_t)(page + off), data, len);
     sys_icache_invalidate((void *)page, win);
     kr = mach_vm_protect(mach_task_self(), page, win, FALSE, orig);
-    if (kr != KERN_SUCCESS) { logf("cow_write %llx: restore kr=%d FAILED\n", (unsigned long long)page, kr); return 1; }
+    if (kr != KERN_SUCCESS) { ERR("cow_write %llx: restore kr=%d FAILED\n", (unsigned long long)page, kr); return 1; }
     return 0;
 }
 
@@ -213,13 +319,13 @@ static int cow_write(mach_vm_address_t page, unsigned off, const void *data, uns
 static uint32_t *map_payload(void) {
     uint32_t *p = mmap(NULL, PAYLOAD_SPAN, PROT_READ | PROT_WRITE,
                        MAP_ANON | MAP_PRIVATE | MAP_TRANSLATED_ALLOW_EXECUTE, -1, 0);
-    if (p == MAP_FAILED) { logf("payload mmap FAILED errno=%d\n", errno); return NULL; }
+    if (p == MAP_FAILED) { ERR("payload mmap FAILED errno=%d\n", errno); return NULL; }
     memcpy(p, payload_text, PAYLOAD_TEXT_WORDS * 4);
     sys_dcache_flush(p, PAYLOAD_TEXT_WORDS * 4);
     sys_icache_invalidate(p, PAYLOAD_TEXT_WORDS * 4);
     if (mach_vm_protect(mach_task_self(), (mach_vm_address_t)p, 0x4000, FALSE,
                         VM_PROT_READ | VM_PROT_EXECUTE) != KERN_SUCCESS) {
-        logf("payload TEXT R|X FAILED\n");
+        ERR("payload TEXT R|X FAILED\n");
         return NULL;
     }
     if (p[P_NTFIX_APPEND_OFF / 4] != P_NTFIX_APPEND_W0 ||
@@ -227,7 +333,7 @@ static uint32_t *map_payload(void) {
         p[P_NTFIX_DECOMPOSE_OFF / 4] != P_NTFIX_DECOMPOSE_W0 ||
         p[P_NTFIX_MACFAST_OFF / 4] != P_NTFIX_MACFAST_W0 ||
         p[P_NTFIX_TRAPFAST_OFF / 4] != P_NTFIX_TRAPFAST_W0) {
-        logf("fail-closed: payload entries %08x/%08x/%08x macfast %08x "
+        ERR("fail-closed: payload entries %08x/%08x/%08x macfast %08x "
              "trapfast %08x (want %08x/%08x/%08x %08x %08x)\n",
              p[P_NTFIX_APPEND_OFF / 4], p[P_NTFIX_COMPOSE_OFF / 4],
              p[P_NTFIX_DECOMPOSE_OFF / 4], p[P_NTFIX_MACFAST_OFF / 4],
@@ -246,7 +352,7 @@ static int patch_abs_jump(mach_vm_address_t rb, uintptr_t entry_off, void *stub)
     uint32_t got[4];
     read_bytes(rb + entry_off, got, sizeof got);
     if (rc || memcmp(got, jump, sizeof got)) {
-        logf("install FAILED @%llx (rc=%d readback %08x)\n",
+        ERR("install FAILED @%llx (rc=%d readback %08x)\n",
              (unsigned long long)entry_off, rc, got[0]);
         return 1;
     }
@@ -334,11 +440,11 @@ static int hot_write(mach_vm_address_t at, const void *data, unsigned len) {
             sys_icache_invalidate((void *)(uintptr_t)page, win);
             kr = mach_vm_protect(mach_task_self(), page, win, FALSE, orig);
             if (kr == KERN_SUCCESS) return 0;
-            logf("hot_write %llx: X|COPY restore kr=%d\n",
+            WARN("hot_write %llx: X|COPY restore kr=%d\n",
                  (unsigned long long)at, kr);
             return 1;
         }
-        logf("hot_write %llx: X|COPY kr=%d — falling back to cold RW|COPY\n",
+        WARN("hot_write %llx: X|COPY kr=%d — falling back to cold RW|COPY\n",
              (unsigned long long)at, kr);
     }
     return cow_write(page, (unsigned)(at - page), data, len);
@@ -374,14 +480,14 @@ static void patch_one_thunk(mach_vm_address_t w) {
     /* trampoline first: nothing branches to it until the redirect lands */
     if (hot_write(w + TH_TRAMP_OFF, g_trampoline, sizeof g_trampoline)) {
         g_thunks_badwrite++;
-        logf("thunk %llx: trampoline write FAILED — left stock\n",
+        WARN("thunk %llx: trampoline write FAILED — left stock\n",
              (unsigned long long)w);
         return;
     }
     if (!read_bytes(w + TH_TRAMP_OFF, chk, sizeof g_trampoline) ||
         memcmp(chk, g_trampoline, sizeof g_trampoline)) {
         g_thunks_badwrite++;
-        logf("thunk %llx: trampoline readback MISMATCH — left stock\n",
+        WARN("thunk %llx: trampoline readback MISMATCH — left stock\n",
              (unsigned long long)w);
         return;
     }
@@ -389,13 +495,13 @@ static void patch_one_thunk(mach_vm_address_t w) {
     if (hot_write(w + TH_DEF_OFF, &redirect, 4) ||
         !read_bytes(w + TH_DEF_OFF, chk, 4) || chk[0] != TH_W_DEF_NEW) {
         g_thunks_badwrite++;
-        logf("thunk %llx: redirect FAILED — trampoline parked, stock flow "
+        WARN("thunk %llx: redirect FAILED — trampoline parked, stock flow "
              "intact\n", (unsigned long long)w);
         return;
     }
     g_thunk_done[g_thunk_n++] = w;
     g_thunks_patched++;
-    logf("thunk %llx patched: syscall fastpath live\n", (unsigned long long)w);
+    TRACE("thunk %llx patched: syscall fastpath live\n", (unsigned long long)w);
 }
 
 /* Walk every anonymous exec-capable region and patch every matching thunk. */
@@ -480,17 +586,17 @@ static int install_append(mach_vm_address_t rb) {
     read_bytes(rb + OFF_APPEND, v, sizeof v);
     if (!memcmp(v, PRO_APPEND, sizeof v)) ;          /* expected: install  */
     else if (v[0] == 0x58000049u) {                   /* our jump word      */
-        logf("append entry already hooked — skipping (second load?)\n");
+        WARN("append entry already hooked — skipping (second load?)\n");
         return 0;
     } else {
-        logf("fail-closed: append prologue %08x %08x %08x %08x unexpected\n",
+        ERR("fail-closed: append prologue %08x %08x %08x %08x unexpected\n",
              v[0], v[1], v[2], v[3]);
         return 1;
     }
 
     char *dp = mmap(NULL, 0x1000 + (size_t)RING_WORDS * 4 + (size_t)INSLOG_WORDS * 4, PROT_READ | PROT_WRITE,
                     MAP_ANON | MAP_PRIVATE, -1, 0);
-    if (dp == MAP_FAILED) { logf("data page FAILED errno=%d\n", errno); return 1; }
+    if (dp == MAP_FAILED) { ERR("data page FAILED errno=%d\n", errno); return 1; }
     g_ctl = (uint64_t *)dp;                       /* ctl block, 32 slots */
     /* MACFINALS_NT_OFF=gather,scatter,iret: bisect controls, read by the
      * payload when a chain arms (ctl[28]/[29]/[15]) */
@@ -528,7 +634,7 @@ static int install_append(mach_vm_address_t rb) {
             }
             g_ctl[30] = zero;
             g_ctl[31] = nop ? 1 : (tail ? 2 : (logonly ? 3 : (matchonly ? 4 : (burn ? 4 + burn : 0))));
-            logf("MACFINALS_NT_OFF=%s: gather %s scatter %s%s%s%s%s%s iret %s "
+            TRACE("MACFINALS_NT_OFF=%s: gather %s scatter %s%s%s%s%s%s%s%s iret %s "
                  "syscall-fastpath %s\n", off,
                  g_ctl[28] ? "off" : "on", g_ctl[29] ? "off" : "on",
                  zero ? " (zero-mode: NT delivered as 0)" : "",
@@ -542,14 +648,17 @@ static int install_append(mach_vm_address_t rb) {
                  g_ctl[33] ? "off" : "on");
         }
     }
-    g_ring = (uint32_t *)(dp + 0x1000);           /* ring, RING_WORDS    */
+    /* ring, RING_WORDS: trace only. With a NULL ring the payload skips the per-word
+     * capture (its every use is behind `if (g_ring)`), so a normal run spends nothing
+     * on it in Rosetta's emitter. */
+    g_ring = TRACE_ON() ? (uint32_t *)(dp + 0x1000) : NULL;
 
     g_payload = map_payload();
     if (!g_payload) return 1;
 
     uint32_t *sp = mmap(NULL, 0x4000, PROT_READ | PROT_WRITE,
                         MAP_ANON | MAP_PRIVATE | MAP_TRANSLATED_ALLOW_EXECUTE, -1, 0);
-    if (sp == MAP_FAILED) { logf("stub page FAILED errno=%d\n", errno); return 1; }
+    if (sp == MAP_FAILED) { ERR("stub page FAILED errno=%d\n", errno); return 1; }
     memcpy(sp, stub_blob, STUB_LEN * 4);
     {
         uint32_t *s = sp;
@@ -561,7 +670,7 @@ static int install_append(mach_vm_address_t rb) {
         unsigned offs[4] = {PCALL_OFF, PCTL_OFF, PRING_OFF, PBACK_OFF};
         for (int i = 0; i < 4; i++) {
             if (*(uint64_t *)&s[offs[i]] != want[i]) {
-                logf("fail-closed: append stub slot %d (%016llx) unexpected\n",
+                ERR("fail-closed: append stub slot %d (%016llx) unexpected\n",
                      i, (unsigned long long)*(uint64_t *)&s[offs[i]]);
                 return 1;
             }
@@ -572,11 +681,11 @@ static int install_append(mach_vm_address_t rb) {
     sys_icache_invalidate(sp, 0x4000);
     if (mach_vm_protect(mach_task_self(), (mach_vm_address_t)sp, 0x4000, FALSE,
                         VM_PROT_READ | VM_PROT_EXECUTE) != KERN_SUCCESS) {
-        logf("stub page R|X FAILED\n");
+        ERR("stub page R|X FAILED\n");
         return 1;
     }
     if (patch_abs_jump(rb, OFF_APPEND, sp)) return 1;
-    logf("append hook installed at libRosettaRuntime %016llx+0x18a0 "
+    TRACE("append hook installed at libRosettaRuntime %016llx+0x18a0 "
          "(payload %p ctl %p ring %p)\n",
          (unsigned long long)rb, (void *)g_payload, (void *)g_ctl, (void *)g_ring);
     return 0;
@@ -590,20 +699,20 @@ static int install_converters(void) {
     if (!rt) return 1;
     read_bytes(rt + OFF_COMPOSE, v, sizeof v);
     if (memcmp(v, PRO_COMPOSE, sizeof v)) {
-        logf("fail-closed: compose prologue %08x %08x %08x %08x unexpected\n",
+        ERR("fail-closed: compose prologue %08x %08x %08x %08x unexpected\n",
              v[0], v[1], v[2], v[3]);
         return 2;
     }
     read_bytes(rt + OFF_DECOMPOSE, v, sizeof v);
     if (memcmp(v, PRO_DECOMPOSE, sizeof v)) {
-        logf("fail-closed: decompose prologue %08x %08x %08x %08x unexpected\n",
+        ERR("fail-closed: decompose prologue %08x %08x %08x %08x unexpected\n",
              v[0], v[1], v[2], v[3]);
         return 2;
     }
     if (patch_abs_jump(rt, OFF_COMPOSE, g_payload + P_NTFIX_COMPOSE_OFF / 4) ||
         patch_abs_jump(rt, OFF_DECOMPOSE, g_payload + P_NTFIX_DECOMPOSE_OFF / 4))
         return 2;
-    logf("converters installed at rosetta/runtime %016llx "
+    TRACE("converters installed at rosetta/runtime %016llx "
          "(compose+decompose, readback verified)\n", (unsigned long long)rt);
     return 0;
 }
@@ -644,7 +753,7 @@ static void refresh_fastpath_target(void) {
         return;
     if (val) {
         g_ctl[35] = val;
-        logf("fastpath: prolog_end %llx published at 0x7ffe1008\n",
+        TRACE("fastpath: prolog_end %llx published at 0x7ffe1008\n",
              (unsigned long long)val);
     }
 }
@@ -660,10 +769,10 @@ static void *converter_poll(void *arg) {
     for (int i = 0; ; i++) {
         if (i >= 250) {   /* 100 fast ticks (10s) + 150 slow ones (5min) */
             if (!(g_installed & 2))
-                logf("converter poll: image never appeared — contexts will carry "
+                WARN("converter poll: image never appeared — contexts will carry "
                      "NT only after install\n");
             if (g_ctl && !g_ctl[35])
-                logf("converter poll: 0x7ffe1008 never appeared — syscall "
+                WARN("converter poll: 0x7ffe1008 never appeared — syscall "
                      "fastpath stays disarmed\n");
             return NULL;
         }
@@ -671,8 +780,8 @@ static void *converter_poll(void *arg) {
         nanosleep(&ts, NULL);
         if (!(g_installed & 2)) {
             int rc = install_converters();
-            if (rc == 0) { g_installed |= 2; logf("converter poll: installed on tick %d\n", i); }
-            else if (rc == 2) { logf("converter poll: fail-closed mismatch, giving up\n"); return NULL; }
+            if (rc == 0) { g_installed |= 2; TRACE("converter poll: installed on tick %d\n", i); }
+            else if (rc == 2) { ERR("converter poll: fail-closed mismatch, giving up\n"); return NULL; }
         }
         refresh_fastpath_target();
         if ((g_installed & 2) && (!g_ctl || g_ctl[35])) return NULL;
@@ -682,19 +791,19 @@ static void *converter_poll(void *arg) {
 
 static void dump_counters(const char *when) {
     if (!g_ctl) return;
-    logf("ctl %s: gather %llu scatter %llu skip %llu ring %llu | iret fixups %llu "
+    TRACE("ctl %s: gather %llu scatter %llu skip %llu ring %llu | iret fixups %llu "
          "misses %llu disarm %llu | events", when,
          (unsigned long long)g_ctl[0], (unsigned long long)g_ctl[1],
          (unsigned long long)g_ctl[2], (unsigned long long)g_ctl[3],
          (unsigned long long)g_ctl[13], (unsigned long long)g_ctl[14],
          (unsigned long long)g_ctl[15]);
     for (int i = 4; i < 12; i++)
-        if (g_ctl[i]) logf(" [%d]=%llx:%llx", i - 4,
+        if (g_ctl[i]) TRACE(" [%d]=%llx:%llx", i - 4,
                            (unsigned long long)(g_ctl[i] >> 32),
                            (unsigned long long)(g_ctl[i] & 0xffffffffu));
-    logf("\n");
+    TRACE("\n");
     /* r13 matcher diagnostics (payload_arm64.c ctl layout [16..27]) */
-    logf("diag %s: nosl %llu slots %llu | seen movz202 %llu msr %llu irecs %llu | "
+    TRACE("diag %s: nosl %llu slots %llu | seen movz202 %llu msr %llu irecs %llu | "
          "scat head %llu broken %llu msr-out %llu | gath lsr4 %llu bfi8 %llu "
          "push-miss %llu armed-out %llu\n", when,
          (unsigned long long)g_ctl[16], (unsigned long long)g_ctl[17],
@@ -707,7 +816,7 @@ static void dump_counters(const char *when) {
      * [34] misses (r19) [35] published target [36] engaged hits [37] stub
      * entries [39] clean bails; driver counts: thunks patched / bad writes /
      * signature near-misses) */
-    logf("sysc %s: thunks %u badwrite %u nearmiss %u ins %llu miss %llu hits %llu disarm %llu "
+    TRACE("sysc %s: thunks %u badwrite %u nearmiss %u ins %llu miss %llu hits %llu disarm %llu "
          "target %llx entered %llu bail5 %llu guards %016llx c38 %llx\n", when,
          g_thunks_patched, g_thunks_badwrite, g_thunks_skipcfg,
          (unsigned long long)g_ctl[32], (unsigned long long)g_ctl[34],
@@ -729,33 +838,33 @@ static void dump_counters(const char *when) {
      * (ais6+): full-word 5b fail count — the byte lane at 0x144 wrapped at
      * 255 in the hot-loop runs. */
     if (g_ctl[41] || g_ctl[42] || g_ctl[43] || g_ctl[44] || g_ctl[45])
-        logf("tpidrro %s: raw %llx bic %llx [base+30] %llx [base+378] %llx fails %llu\n",
+        TRACE("tpidrro %s: raw %llx bic %llx [base+30] %llx [base+378] %llx fails %llu\n",
              when,
              (unsigned long long)g_ctl[41], (unsigned long long)g_ctl[42],
              (unsigned long long)g_ctl[43], (unsigned long long)g_ctl[44],
              (unsigned long long)g_ctl[45]);
     /* r21b base census v2 (payload ctl [47..80]): appends+inserts per 2MB
      * bucket, and the last 8 raw bases that took an insert */
-    logf("bases %s:", when);
+    TRACE("bases %s:", when);
     for (int i = 0; i < 8; i++)
         if (g_ctl[48 + i * 3])
-            logf(" [%llx<<21 app %llu ins %llu]",
+            TRACE(" [%llx<<21 app %llu ins %llu]",
                  (unsigned long long)g_ctl[48 + i * 3],
                  (unsigned long long)g_ctl[49 + i * 3],
                  (unsigned long long)g_ctl[50 + i * 3]);
-    if (g_ctl[47]) logf(" (+%llu appends in further buckets)", (unsigned long long)g_ctl[47]);
-    logf(" | last X %llx | last insert bases:", (unsigned long long)g_ctl[46]);
+    if (g_ctl[47]) TRACE(" (+%llu appends in further buckets)", (unsigned long long)g_ctl[47]);
+    TRACE(" | last X %llx | last insert bases:", (unsigned long long)g_ctl[46]);
     for (int i = 0; i < 8; i++)
         if (g_ctl[73 + i])
-            logf(" %llx", (unsigned long long)g_ctl[73 + i]);
-    logf("\n");
+            TRACE(" %llx", (unsigned long long)g_ctl[73 + i]);
+    TRACE("\n");
 }
 
-/* Ring capture, for matcher debugging. At exit via MACFINALS_HOOK_RING=1 —
- * and, because a crashing process never reaches atexit, continuously while
- * /tmp/rosetta-re/nt-ring exists: a side thread rewrites ring-<pid>.bin every
- * 300 ms (oldest-first), so the last window before a crash survives. The
- * launcher drops unknown env vars, hence the file switch like nt-off. */
+/* Ring capture, for matcher debugging; on with trace+macfinals_hook. Because a
+ * crashing or killed process never reaches atexit, a side thread rewrites
+ * ring-<pid>.bin / ctl-<pid>.bin every 300 ms (oldest-first) and prints the
+ * counters every 2.4 s, so the last window before a crash survives. (Replaces
+ * the MACFINALS_HOOK_RING variable and the /tmp/rosetta-re/nt-ring switch file.) */
 static void write_ring_fd(int fd) {
     if (fd < 0 || !g_ring || !g_ctl) return;
     uint64_t total = g_ctl[3] & 0xffffffffull;
@@ -780,7 +889,7 @@ static void *ring_poll(void *arg) {
     char cpath[64];
     snprintf(cpath, sizeof cpath, "/tmp/rosetta-re/ctl-%d.bin", (int)getpid());
     int fc = open(cpath, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    logf("ring poll: capturing to /tmp/rosetta-re/{ring,inslog,ctl}-%d.bin (50ms early, 300ms later)\n",
+    TRACE("ring poll: capturing to /tmp/rosetta-re/{ring,inslog,ctl}-%d.bin (50ms early, 300ms later)\n",
          (int)getpid());
     for (int i = 1;; i++) {
         struct timespec ts = {0, (i <= 100 ? 50L : 300L) * 1000L * 1000L};
@@ -797,15 +906,10 @@ static void *ring_poll(void *arg) {
     return NULL;
 }
 
-static int ring_capture_on(void) {
-    if (getenv("MACFINALS_HOOK_RING")) return 1;
-    return access("/tmp/rosetta-re/nt-ring", F_OK) == 0;
-}
-
 static void atexit_dump(void);
 
 /* r21 diagnostic: one-shot arena scan at exit (translation quiescent) for the
- * v6 insert chain — MACFINALS_SYSC_DUMP=1. Metadata walk + page-guarded direct
+ * v6 insert chain — WINEDEBUG=trace+macfinals_scan. Metadata walk + page-guarded direct
  * loads only (the 2026-11-07 rule; also the r21 caution: never mid-churn).
  * Answers "did the chains reach the materialized TBs at all?" for a process
  * where entered==0 despite inserts (the Wine probe run). Wine owns SIGSEGV at
@@ -844,7 +948,7 @@ static void syscdump(void) {
     char path[64];
     snprintf(path, sizeof path, "/tmp/rosetta-re/syscdump-%d.log", (int)getpid());
     int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    logf("syscdump: scanning arenas for v6 chains -> %s\n", path);
+    TRACE("syscdump: scanning arenas for v6 chains -> %s\n", path);
     struct sigaction rec = {.sa_sigaction = (void *)sd_recover, .sa_flags = SA_SIGINFO};
     sigemptyset(&rec.sa_mask);
     sigaction(SIGSEGV, &rec, &sd_old_segv);
@@ -957,7 +1061,7 @@ static void syscdump(void) {
     }
     sigaction(SIGSEGV, &sd_old_segv, NULL);
     sigaction(SIGBUS, &sd_old_bus, NULL);
-    logf("syscdump: %u exec regions (%u scanned), %u v6 chains, %u stock sites\n",
+    TRACE("syscdump: %u exec regions (%u scanned), %u v6 chains, %u stock sites\n",
          exec_regions, regions, hits, stock);
     if (fd >= 0) { dprintf(fd, "regions %u scanned %u chains %u stock %u\n",
                            exec_regions, regions, hits, stock); close(fd); }
@@ -966,9 +1070,9 @@ static void syscdump(void) {
 
 static void atexit_dump(void) {
 #if defined(__x86_64__)
-    if (getenv("MACFINALS_SYSC_DUMP")) syscdump();
+    if (SCAN_ON()) syscdump();
 #endif
-    dump_counters("at exit");
+    if (TRACE_ON()) dump_counters("at exit");
 }
 
 /* ---- exports: ntstub's HOOKLIB mode and diagnostics read these ---------- */
@@ -990,10 +1094,15 @@ static void macfinals_hook_init(int argc, const char **argv) {
     /* a native arm64 child that inherited the variable: nothing to correct */
     if (!translated_process()) return;
 
-    mkdir("/tmp/rosetta-re", 0755);
-    char path[64];
-    snprintf(path, sizeof path, "/tmp/rosetta-re/hook-%d.log", (int)getpid());
-    g_fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0644);
+    dbg_init(argc > 1 && argv ? argv[1] : NULL);
+    if (TRACE_ON()) {
+        /* trace: also a per-process copy, since a session's stderr interleaves ~30
+         * Wine processes (the game's counters are the ones that matter) */
+        mkdir("/tmp/rosetta-re", 0755);
+        char path[64];
+        snprintf(path, sizeof path, "/tmp/rosetta-re/hook-%d.log", (int)getpid());
+        g_fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0644);
+    }
     /* proc_pidpath only ever names the Wine loader; argv carries the Windows
      * image, which is what tells one process of a session from another */
     char cmd[600] = {0};
@@ -1002,10 +1111,10 @@ static void macfinals_hook_init(int argc, const char **argv) {
         if (n + 2 >= sizeof cmd) break;
         snprintf(cmd + n, sizeof cmd - n, "%s%s", i ? " " : "", argv[i]);
     }
-    logf("=== hooklib pid %d ppid %d installed=%d cmd: %s\n",
+    TRACE("=== hooklib pid %d ppid %d installed=%d cmd: %s\n",
          (int)getpid(), (int)getppid(), g_installed, cmd);
     if (getenv("MACFINALS_NT_HOOK") && !strcmp(getenv("MACFINALS_NT_HOOK"), "0")) {
-        logf("MACFINALS_NT_HOOK=0: disabled by request\n");
+        TRACE("MACFINALS_NT_HOOK=0: disabled by request\n");
         return;
     }
     /* Steam's CEF UI (steamwebhelper.exe, steamwebhelper_real.exe and every
@@ -1015,30 +1124,30 @@ static void macfinals_hook_init(int argc, const char **argv) {
      * 2026-11-01: no hook / DISABLE_AOT + empty dylib both boot in ~10 s;
      * append-only and full hook never do). Leave it untranslated-by-us. */
     if (strcasestr(cmd, "steamwebhelper")) {
-        logf("skipped: Steam CEF process (append hook stalls it; it needs no NT fix)\n");
+        TRACE("skipped: Steam CEF process (append hook stalls it; it needs no NT fix)\n");
         return;
     }
     if (!getenv("DISABLE_AOT")) {
-        logf("REFUSING: DISABLE_AOT is not set — cached AOT translations bypass "
+        ERR("REFUSING: DISABLE_AOT is not set — cached AOT translations bypass "
              "the hook and would leave this process HALF-fixed. Set DISABLE_AOT=1 "
              "together with the injection (as ntstub requires).\n");
         return;
     }
 
     mach_vm_address_t rb = find_image(WANT_UUID, "libRosettaRuntime");
-    if (!rb) { logf("fail-closed: no UUID-matching libRosettaRuntime —Rosetta "
+    if (!rb) { ERR("fail-closed: no UUID-matching libRosettaRuntime —Rosetta "
                     "build changed? nothing patched\n"); return; }
     if (install_append(rb)) return;
     g_installed |= 1;
-    if (ring_capture_on()) {
+    if (TRACE_ON()) {
         pthread_t th;
         if (pthread_create(&th, NULL, ring_poll, NULL) == 0) pthread_detach(th);
-        else logf("ring poll thread FAILED errno=%d\n", errno);
+        else WARN("ring poll thread FAILED errno=%d\n", errno);
     }
 
 #ifdef MACFINALS_NO_CONVERTERS
     /* bisect build: append hook only, Rosetta's own context converters */
-    logf("converters skipped (MACFINALS_NO_CONVERTERS build)\n");
+    TRACE("converters skipped (MACFINALS_NO_CONVERTERS build)\n");
     atexit(atexit_dump);
     dump_counters("at install");
     return;
@@ -1056,11 +1165,11 @@ static void macfinals_hook_init(int argc, const char **argv) {
             if (pthread_create(&th, NULL, converter_poll, NULL) == 0)
                 pthread_detach(th);
             else
-                logf("converter poll thread FAILED errno=%d — syscall "
+                ERR("converter poll thread FAILED errno=%d — syscall "
                      "fastpath stays disarmed in this process\n", errno);
         }
     }
-    else if (rc == 2) { logf("converters unmatched — append hook stays live "
+    else if (rc == 2) { WARN("converters unmatched — append hook stays live "
                              "(pushf/popf/iret NT only, contexts not)\n"); }
     else {
         /* image not mapped yet: watch for it on the side */
@@ -1068,7 +1177,7 @@ static void macfinals_hook_init(int argc, const char **argv) {
         if (pthread_create(&th, NULL, converter_poll, NULL) == 0)
             pthread_detach(th);
         else
-            logf("converter poll thread FAILED errno=%d — contexts stay "
+            ERR("converter poll thread FAILED errno=%d — contexts stay "
                  "NT-blind in this process\n", errno);
     }
     /* r20 QUARANTINED 2026-11-07: the first in-process run of this scanner
@@ -1092,12 +1201,12 @@ static void macfinals_hook_init(int argc, const char **argv) {
             if (pthread_create(&th, NULL, thunk_poll, NULL) == 0)
                 pthread_detach(th);
             else
-                logf("thunk poll thread FAILED errno=%d — late thunks stay "
+                WARN("thunk poll thread FAILED errno=%d — late thunks stay "
                      "stock in this process\n", errno);
         }
     }
     else {
-        logf("thunk patch OFF (2026-11-07 kernel panic: mach_vm_read_overwrite "
+        TRACE("thunk patch OFF (2026-11-07 kernel panic: mach_vm_read_overwrite "
              "on translated exec regions — see NOTES.md); MACFINALS_THUNK_PATCH=1 "
              "to re-enable\n");
     }

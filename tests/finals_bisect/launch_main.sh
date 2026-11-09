@@ -12,12 +12,19 @@
 #   launch_main.sh mouselook             + WINEMAC_MOUSELOOK
 #   launch_main.sh msync avx             + WINEMSYNC=1, ROSETTA_ADVERTISE_AVX=1
 #   launch_main.sh app                   everything the app sets (should reproduce E111000D)
-#   RUNTIME=macfinals-17 HOOK=0 DEBUG=quiet|full|max launch_main.sh ...
+#   RUNTIME=macfinals-17 HOOK=0 DEBUG=quiet|full|max|macfinals launch_main.sh ...
+#   WINEDEBUG='-all,warn+macfinals_dx12' launch_main.sh ...   any WINEDEBUG, verbatim
 #   APP=774801 launch_main.sh ...       Crab Champions (the canary) instead of THE FINALS
 #   APP=steam launch_main.sh ...        Steam only, no game
 #
 # DEBUG=max logs as much as is safe and, after the session, collects Steam's logs and dumps,
 # macOS crash reports, the D3DMetal cache listing and the macOS log next to the Wine log.
+# MacFinals' own code logs through Wine's debug channels (WINEDEBUG), like Wine itself:
+#   macfinals_hook  the in-process Rosetta hook (NT flag, syscall fast path)
+#   macfinals_dx12  the d3d12 layer (skin-fix shader rewrite, pipeline-creation timing)
+#   macfinals_scan  the hook's heavy arena scan at process exit (trace class only)
+# Default err+fixme, like any channel. DEBUG=macfinals shows only those (-all first), with
+# Wine's pid/tid/timestamp prefixes; full and max include them; WINEDEBUG overrides DEBUG.
 # PERF=1 adds per-process performance counters (10 a second) in that folder's perf/.
 # For FPS measurements pass avx: the app advertises AVX by default, this script does not.
 #
@@ -49,8 +56,8 @@ env=(
   WEBHELPER_EXTRA_ARGS=--use-angle=vulkan
   ROSETTA_ADVERTISE_AVX=$(( ${+on[avx]} ))
 )
-# The environment is cleared below, so pass the d3d12 layer's switches through explicitly.
-for v in MACFINALS_SKIN_FIX MACFINALS_D3D12_LAYER_LOG; do
+# The environment is cleared below, so pass the d3d12 layer's switch through explicitly.
+for v in MACFINALS_SKIN_FIX; do
   [[ -z ${(P)v:-} ]] || env+=("$v=${(P)v}")
 done
 (( ! ${+on[msync]} ))     || env+=(WINEMSYNC=1)
@@ -60,9 +67,13 @@ done
 if [[ ${HOOK:-1} != 0 && -f $engine/lib/macfinals-nt-hook.dylib ]]; then
   env+=(DYLD_INSERT_LIBRARIES="$engine/lib/macfinals-nt-hook.dylib" DISABLE_AOT=1)
 fi
-case ${DEBUG:-light} in
-  quiet) env+=(WINEDEBUG=-all) ;;
-  full)  env+=(WINEDEBUG=+pid,+tid,+timestamp,err+all,fixme+all,+seh,+loaddll,+process,warn+module) ;;
+ours=+macfinals_hook,+macfinals_dx12
+if [[ -n ${WINEDEBUG:-} ]]; then env+=(WINEDEBUG="$WINEDEBUG")
+else case ${DEBUG:-light} in
+  # MoltenVK (Steam's Vulkan) logs on its own, outside WINEDEBUG: errors only in these two
+  quiet) env+=(WINEDEBUG=-all MVK_CONFIG_LOG_LEVEL=1) ;;
+  macfinals) env+=(WINEDEBUG=-all,+pid,+tid,+timestamp,$ours MVK_CONFIG_LOG_LEVEL=1) ;;
+  full)  env+=(WINEDEBUG=+pid,+tid,+timestamp,err+all,fixme+all,+seh,+loaddll,+process,warn+module,$ours) ;;
   # Everything short of per-call tracing: every err/warn/fixme, thread names (warn+threadname),
   # DLL loads and process events. +seh is left out on purpose: it logs every exception, and
   # in a 2026-11-01 run it changed the game's behaviour.
@@ -71,10 +82,9 @@ case ${DEBUG:-light} in
   # heap_set_debug_flags), which is what a process started under a debugger looks like.
   # The anti-cheat then stops the game with "disallowed tool" (2026-11-02). Never enable
   # warn+heap, trace+heap, relay or snoop for the game: they change what it can observe.
-  max)   env+=(WINEDEBUG=+pid,+tid,+timestamp,err+all,warn+all,warn-heap,fixme+all,+loaddll,+process)
-         [[ -n ${MACFINALS_D3D12_LAYER_LOG:-} ]] || env+=(MACFINALS_D3D12_LAYER_LOG=1) ;;
+  max)   env+=(WINEDEBUG=+pid,+tid,+timestamp,err+all,warn+all,warn-heap,fixme+all,+loaddll,+process,$ours) ;;
   *)     env+=(WINEDEBUG=+pid,+tid,+timestamp,err+all,+loaddll,+process) ;;
-esac
+esac; fi
 
 /bin/mkdir -p "$here/logs"
 tag=${(j:-:)${(ok)on}}; [[ -n $tag ]] || tag=baseline

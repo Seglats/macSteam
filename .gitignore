@@ -28,3 +28,5 @@
 /tests/rosetta_nt/ntstub
 /tests/rosetta_nt/host_payload_test
 /tests/rosetta_nt/payload.dylib
+# tests/finals_bisect run logs
+/tests/finals_bisect/logs/

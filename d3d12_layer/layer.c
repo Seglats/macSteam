@@ -7,7 +7,16 @@
  * through the rewriter first. Unchanged shaders are passed through as they are.
  *
  * MACFINALS_SKIN_FIX=0 disables the rewrite (the layer then only forwards).
- * MACFINALS_D3D12_LAYER_LOG=1 logs every rewritten shader (to Wine's debug output).
+ *
+ * Debug output follows Wine's model exactly: debug channel "macfinals_dx12", classes
+ * err/fixme/warn/trace, selected with WINEDEBUG and printed by Wine's own ntdll
+ * (__wine_dbg_header/__wine_dbg_output), so +pid/+tid/+timestamp apply. Default: err and
+ * fixme only, like any Wine channel. Examples:
+ *   WINEDEBUG=-all,+macfinals_dx12                 only this layer, nothing from Wine
+ *   WINEDEBUG=-all,warn+macfinals_dx12             only slow pipeline creations
+ *   WINEDEBUG=-all,Discovery.exe:+macfinals_dx12   only in the game process
+ * Build with -DWINE_NO_TRACE_MSGS (and -DWINE_NO_DEBUG_MSGS) to compile trace (and
+ * warn/fixme) out, as for Wine itself. err always stays.
  */
 #define COBJMACROS
 #define INITGUID
@@ -29,22 +38,41 @@ struct layer_device
 
 #define REAL(This) (((struct layer_device *)(This))->real)
 
+/* Pipeline-creation timing (pso_done below): QPC at the moment the call is handed to GPTK,
+ * per thread, so the time splits into our rewrite and GPTK/D3DMetal's own work. Kept in a
+ * Win32 TLS slot, NOT a __thread variable: MinGW GCC implements __thread with emulated TLS,
+ * which imports libwinpthread-1.dll — absent from the prefix, so the layer would not load
+ * at all (caught by d3d12-factory-probe, 2026-11-09). */
+static DWORD pso_tls = TLS_OUT_OF_INDEXES;
+static LONGLONG pso_now(void) { LARGE_INTEGER t; QueryPerformanceCounter(&t); return t.QuadPart; }
+static void pso_mark_gptk(void)
+{
+    if (pso_tls != TLS_OUT_OF_INDEXES) TlsSetValue(pso_tls, (void *)(ULONG_PTR)pso_now());
+}
+static LONGLONG pso_gptk_start(void)
+{
+    return pso_tls != TLS_OUT_OF_INDEXES ? (LONGLONG)(ULONG_PTR)TlsGetValue(pso_tls) : 0;
+}
+
 /* The four GPTK methods the overrides below hand off to. */
 static HRESULT fwd_CreateGraphicsPipelineState(ID3D12Device10 *This, const D3D12_GRAPHICS_PIPELINE_STATE_DESC *desc,
         REFIID riid, void **out)
 {
+    pso_mark_gptk();
     return REAL(This)->lpVtbl->CreateGraphicsPipelineState(REAL(This), desc, riid, out);
 }
 
 static HRESULT fwd_CreateComputePipelineState(ID3D12Device10 *This, const D3D12_COMPUTE_PIPELINE_STATE_DESC *desc,
         REFIID riid, void **out)
 {
+    pso_mark_gptk();
     return REAL(This)->lpVtbl->CreateComputePipelineState(REAL(This), desc, riid, out);
 }
 
 static HRESULT fwd_CreatePipelineState(ID3D12Device10 *This, const D3D12_PIPELINE_STATE_STREAM_DESC *desc,
         REFIID riid, void **out)
 {
+    pso_mark_gptk();
     return REAL(This)->lpVtbl->CreatePipelineState(REAL(This), desc, riid, out);
 }
 
@@ -80,37 +108,126 @@ extern const char device_thunks[];
 _Static_assert(DEVICE_SLOTS == 128, "device_thunks has 128 stubs");
 static HMODULE gptk;
 static HRESULT (WINAPI *real_create_device)(IUnknown *, D3D_FEATURE_LEVEL, REFIID, void **);
-static int enabled = 1, verbose;
+static int enabled = 1;
 static LONG rewritten_shaders, rewritten_reads, cbuffer_shaders, unknown_streams;
 
-/* Lines go to Wine's debug output (the stream WINEDEBUG traces use), prefixed with pid:tid
- * like Wine's own. A process started by Steam has no Windows stderr, so writing there would
- * lose them. Nothing reaches the game. */
-static void log_line(const char *fmt, ...)
-{
-    static int (CDECL *dbg_output)(const char *);
-    static LONG resolved;
-    char buf[600];
-    int n;
-    va_list ap;
+/* ---- debug output: Wine's channel model, Wine's own implementation ----
+ * The channel struct and class numbers are Wine's (include/wine/debug.h); the three
+ * functions are ntdll exports, resolved at first use. A process started by Steam has no
+ * Windows stderr, so going through Wine's debug output is also what makes lines visible. */
+struct dbg_channel { unsigned char flags; char name[15]; };
+enum { DBCL_FIXME, DBCL_ERR, DBCL_WARN, DBCL_TRACE, DBCL_INIT = 7 };
+static struct dbg_channel dbch = { 0xff, "macfinals_dx12" };   /* 0xff: not looked up yet */
+static unsigned char (CDECL *p_dbg_get_channel_flags)(struct dbg_channel *);
+static int (CDECL *p_dbg_header)(int, struct dbg_channel *, const char *);
+static int (CDECL *p_dbg_output)(const char *);
 
-    if (!InterlockedCompareExchange(&resolved, 1, 0))
-        dbg_output = (void *)GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "__wine_dbg_output");
-    n = snprintf(buf, sizeof(buf), "%04lx:%04lx:macfinals-d3d12: ", GetCurrentProcessId(), GetCurrentThreadId());
+static void dbg_resolve(void)
+{
+    static LONG done;
+    HMODULE ntdll;
+    if (done) return;
+    ntdll = GetModuleHandleW(L"ntdll.dll");
+    p_dbg_get_channel_flags = (void *)GetProcAddress(ntdll, "__wine_dbg_get_channel_flags");
+    p_dbg_header = (void *)GetProcAddress(ntdll, "__wine_dbg_header");
+    p_dbg_output = (void *)GetProcAddress(ntdll, "__wine_dbg_output");
+    InterlockedExchange(&done, 1);
+}
+
+static int dbg_on(int cls)
+{
+    dbg_resolve();
+    if (!p_dbg_get_channel_flags) return cls == DBCL_ERR;      /* not under Wine: errors only */
+    return !!(p_dbg_get_channel_flags(&dbch) & (1 << cls));
+}
+
+static void __attribute__((format(printf, 3, 4))) dbg_printf(int cls, const char *function, const char *fmt, ...)
+{
+    char buf[1024];
+    va_list ap;
     va_start(ap, fmt);
-    vsnprintf(buf + n, sizeof(buf) - n, fmt, ap);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
-    if (dbg_output) dbg_output(buf);
+    if (p_dbg_header && p_dbg_output)
+    {
+        if (p_dbg_header(cls, &dbch, function) == -1) return;
+        p_dbg_output(buf);
+    }
     else OutputDebugStringA(buf);
 }
 
-static void log_guid(const char *what, REFGUID g)
+#define DBG_(cls, ...) do { if (dbg_on(cls)) dbg_printf(cls, __func__, __VA_ARGS__); } while (0)
+/* compiled out: arguments stay type-checked, the call and its strings are dead code */
+#define DBG_OFF_(cls, ...) do { if (0) dbg_printf(cls, __func__, __VA_ARGS__); } while (0)
+#define ERR(...)   DBG_(DBCL_ERR, __VA_ARGS__)
+#ifdef WINE_NO_DEBUG_MSGS
+# define WARN_ON()  0
+# define WARN(...)  DBG_OFF_(DBCL_WARN, __VA_ARGS__)
+# define FIXME(...) DBG_OFF_(DBCL_FIXME, __VA_ARGS__)
+#else
+# define WARN_ON()  dbg_on(DBCL_WARN)
+# define WARN(...)  DBG_(DBCL_WARN, __VA_ARGS__)
+# define FIXME(...) DBG_(DBCL_FIXME, __VA_ARGS__)
+#endif
+#ifdef WINE_NO_TRACE_MSGS
+# define TRACE_ON() 0
+# define TRACE(...) DBG_OFF_(DBCL_TRACE, __VA_ARGS__)
+#else
+# define TRACE_ON() dbg_on(DBCL_TRACE)
+# define TRACE(...) DBG_(DBCL_TRACE, __VA_ARGS__)
+#endif
+
+#define GUID_FMT "{%08lx-%04x-%04x-%02x%02x-%02x%02x%02x%02x%02x%02x}"
+#define GUID_ARGS(g) (g)->Data1, (g)->Data2, (g)->Data3, (g)->Data4[0], (g)->Data4[1], (g)->Data4[2], \
+                     (g)->Data4[3], (g)->Data4[4], (g)->Data4[5], (g)->Data4[6], (g)->Data4[7]
+
+/* One pipeline creation finished. warn: slower than PSO_SLOW_MS (the hunt for in-game
+ * freezes, 2026-11-09: GameThread spins for seconds while nothing renders); trace: every
+ * one. Each line carries the wall-clock time (Unix epoch, the timebase of WINE_SYSCALL_LOG
+ * perf files) and the calling thread's name, so a slow creation can be matched to a freeze
+ * and to GameThread / RenderThread. */
+#define PSO_SLOW_MS 50.0
+static void pso_done(const char *kind, LONGLONG t0, HRESULT hr)
 {
-    log_line("%s {%08lx-%04x-%04x-%02x%02x-%02x%02x%02x%02x%02x%02x}\n", what, g->Data1, g->Data2, g->Data3,
-             g->Data4[0], g->Data4[1], g->Data4[2], g->Data4[3], g->Data4[4], g->Data4[5], g->Data4[6], g->Data4[7]);
+    static LARGE_INTEGER freq;
+    static LONG count, slow;
+    static HRESULT (WINAPI *p_GetThreadDescription)(HANDLE, PWSTR *);
+    static LONG resolved;
+    LONGLONG t2 = pso_now(), t1 = pso_gptk_start();
+    double ms, rewrite_ms, gptk_ms;
+    LONG n = InterlockedIncrement(&count);
+    int slow_one;
+
+    if (!WARN_ON() && !TRACE_ON()) return;
+    if (!freq.QuadPart) QueryPerformanceFrequency(&freq);
+    if (t1 < t0 || t1 > t2) t1 = t0;
+    ms = (double)(t2 - t0) * 1000.0 / (double)freq.QuadPart;
+    rewrite_ms = (double)(t1 - t0) * 1000.0 / (double)freq.QuadPart;
+    gptk_ms = (double)(t2 - t1) * 1000.0 / (double)freq.QuadPart;
+    slow_one = ms >= PSO_SLOW_MS;
+    if (slow_one) InterlockedIncrement(&slow);
+    if (slow_one ? WARN_ON() : TRACE_ON())
+    {
+        FILETIME ft;
+        ULARGE_INTEGER u;
+        PWSTR name = NULL;
+        if (!InterlockedExchange(&resolved, 1))
+            p_GetThreadDescription = (void *)GetProcAddress(GetModuleHandleW(L"kernelbase.dll"),
+                                                            "GetThreadDescription");
+        if (p_GetThreadDescription && FAILED(p_GetThreadDescription(GetCurrentThread(), &name))) name = NULL;
+        GetSystemTimePreciseAsFileTime(&ft);
+        u.LowPart = ft.dwLowDateTime; u.HighPart = ft.dwHighDateTime;
+        dbg_printf(slow_one ? DBCL_WARN : DBCL_TRACE, __func__,
+                   "%s%s pipeline %.1f ms (rewrite %.1f, GPTK %.1f), hr %#lx, thread %04lx \"%ls\", "
+                   "at %.3f, pipeline #%ld, %ld slow so far\n",
+                   slow_one ? "slow " : "", kind, ms, rewrite_ms, gptk_ms, (unsigned long)hr,
+                   GetCurrentThreadId(), name ? name : L"", (double)(u.QuadPart - 116444736000000000ull) / 1e7,
+                   n, slow);
+        if (name) LocalFree(name);
+    }
 }
 
-/* Logs a GUID the first time it is seen (bounded; later ones are not logged). */
+/* Traces a GUID the first time it is seen (bounded; later ones are not logged). */
 static void log_guid_once(const char *what, REFGUID g)
 {
     static GUID seen[64];
@@ -119,12 +236,13 @@ static void log_guid_once(const char *what, REFGUID g)
     LONG i;
     BOOL fresh = TRUE;
 
+    if (!TRACE_ON()) return;
     AcquireSRWLockExclusive(&lock);
     for (i = 0; i < count; i++) if (IsEqualGUID(&seen[i], g)) { fresh = FALSE; break; }
     if (fresh && count < 64) seen[count++] = *g;
     else fresh = FALSE;
     ReleaseSRWLockExclusive(&lock);
-    if (fresh) log_guid(what, g);
+    if (fresh) TRACE("%s " GUID_FMT "\n", what, GUID_ARGS(g));
 }
 
 /* ---- rewrite cache, keyed by the DXBC checksum; entries live for the process ---- */
@@ -168,10 +286,9 @@ static const void *rewrite_bytecode(const void *code, SIZE_T size, SIZE_T *out_s
         LONG n = InterlockedIncrement(&rewritten_shaders);
         LONG cb = cb_reads ? InterlockedIncrement(&cbuffer_shaders) : cbuffer_shaders;
         InterlockedExchangeAdd(&rewritten_reads, (LONG)reads);
-        if (verbose || n == 1 || !(n % 25) || (cb_reads && cb == 1))
-            log_line("shader %02x%02x%02x%02x: %u array read(s) made defined, %u of them now read the "
-                     "constant buffer directly (%ld shaders so far, %ld with buffer reads)\n",
-                     digest[0], digest[1], digest[2], digest[3], reads, cb_reads, n, cb);
+        TRACE("shader %02x%02x%02x%02x: %u array read(s) made defined, %u of them now read the "
+              "constant buffer directly (%ld shaders so far, %ld with buffer reads)\n",
+              digest[0], digest[1], digest[2], digest[3], reads, cb_reads, n, cb);
     }
 
     EnterCriticalSection(&cache_cs);
@@ -187,7 +304,7 @@ static const void *rewrite_bytecode(const void *code, SIZE_T size, SIZE_T *out_s
 /* First use of each pipeline-creation path, so a run shows which ones the game uses. */
 static void note_path(LONG *flag, const char *name)
 {
-    if (!InterlockedExchange(flag, 1)) log_line("first %s through the layer\n", name);
+    if (!InterlockedExchange(flag, 1)) TRACE("first %s through the layer\n", name);
 }
 
 static void fix_shader(D3D12_SHADER_BYTECODE *bc)
@@ -238,7 +355,7 @@ ours:
     return S_OK;
 }
 
-static HRESULT STDMETHODCALLTYPE layer_CreateGraphicsPipelineState(ID3D12Device10 *This,
+static HRESULT create_graphics_pipeline(ID3D12Device10 *This,
         const D3D12_GRAPHICS_PIPELINE_STATE_DESC *desc, REFIID riid, void **out)
 {
     static LONG seen;
@@ -251,7 +368,7 @@ static HRESULT STDMETHODCALLTYPE layer_CreateGraphicsPipelineState(ID3D12Device1
     return fwd_CreateGraphicsPipelineState(This, &copy, riid, out);
 }
 
-static HRESULT STDMETHODCALLTYPE layer_CreateComputePipelineState(ID3D12Device10 *This,
+static HRESULT create_compute_pipeline(ID3D12Device10 *This,
         const D3D12_COMPUTE_PIPELINE_STATE_DESC *desc, REFIID riid, void **out)
 {
     static LONG seen;
@@ -295,7 +412,7 @@ static int subobject_layout(UINT type, size_t *size, size_t *align)
 #undef L
 }
 
-static HRESULT STDMETHODCALLTYPE layer_CreatePipelineState(ID3D12Device10 *This,
+static HRESULT create_stream_pipeline(ID3D12Device10 *This,
         const D3D12_PIPELINE_STATE_STREAM_DESC *desc, REFIID riid, void **out)
 {
     D3D12_PIPELINE_STATE_STREAM_DESC copy;
@@ -318,7 +435,7 @@ static HRESULT STDMETHODCALLTYPE layer_CreatePipelineState(ID3D12Device10 *This,
         {
             /* unknown subobject: create the pipeline exactly as the game asked */
             if (InterlockedIncrement(&unknown_streams) == 1)
-                log_line("pipeline stream with subobject type %u left unchanged\n", type);
+                FIXME("pipeline stream with subobject type %u passed through without the shader rewrite\n", type);
             free(buf);
             return fwd_CreatePipelineState(This, desc, riid, out);
         }
@@ -335,12 +452,40 @@ static HRESULT STDMETHODCALLTYPE layer_CreatePipelineState(ID3D12Device10 *This,
     return hr;
 }
 
+/* The device methods: the creation above, timed (pso_done). */
+static HRESULT STDMETHODCALLTYPE layer_CreateGraphicsPipelineState(ID3D12Device10 *This,
+        const D3D12_GRAPHICS_PIPELINE_STATE_DESC *desc, REFIID riid, void **out)
+{
+    LONGLONG t0 = pso_now();
+    HRESULT hr = create_graphics_pipeline(This, desc, riid, out);
+    pso_done("graphics", t0, hr);
+    return hr;
+}
+
+static HRESULT STDMETHODCALLTYPE layer_CreateComputePipelineState(ID3D12Device10 *This,
+        const D3D12_COMPUTE_PIPELINE_STATE_DESC *desc, REFIID riid, void **out)
+{
+    LONGLONG t0 = pso_now();
+    HRESULT hr = create_compute_pipeline(This, desc, riid, out);
+    pso_done("compute", t0, hr);
+    return hr;
+}
+
+static HRESULT STDMETHODCALLTYPE layer_CreatePipelineState(ID3D12Device10 *This,
+        const D3D12_PIPELINE_STATE_STREAM_DESC *desc, REFIID riid, void **out)
+{
+    LONGLONG t0 = pso_now();
+    HRESULT hr = create_stream_pipeline(This, desc, riid, out);
+    pso_done("stream", t0, hr);
+    return hr;
+}
+
 static HRESULT STDMETHODCALLTYPE layer_CreatePipelineLibrary(ID3D12Device10 *This, const void *blob,
         SIZE_T size, REFIID riid, void **out)
 {
     static LONG once;
     if (!InterlockedExchange(&once, 1))
-        log_line("game uses a pipeline library; pipelines loaded from it are not rewritten\n");
+        FIXME("game uses a pipeline library; pipelines loaded from it are not rewritten\n");
     return fwd_CreatePipelineLibrary(This, blob, size, riid, out);
 }
 
@@ -367,8 +512,8 @@ static HRESULT wrap_device(ID3D12Device *base, REFIID riid, void **out, const ch
     ID3D12Device_Release(base);         /* dev->real holds its own reference */
     if (!dev->real) { free(dev); return E_NOINTERFACE; }
     dev->iface.lpVtbl = &layer_vtbl.v;
-    log_line("device created via %s, wrapped as ID3D12Device%d (shader rewrite %s)\n", via, dev->version,
-             enabled ? "on" : "off");
+    TRACE("device created via %s, wrapped as ID3D12Device%d (shader rewrite %s)\n", via, dev->version,
+          enabled ? "on" : "off");
     /* The wrapper is never freed: AddRef/Release forward to GPTK's device, and a game
      * creates few devices. */
     hr = layer_QueryInterface(&dev->iface, riid, out);
@@ -489,9 +634,9 @@ static BOOL CALLBACK init_once(INIT_ONCE *once, void *param, void **context)
     int i;
 
     if ((v = getenv("MACFINALS_SKIN_FIX")) && !strcmp(v, "0")) enabled = 0;
-    if ((v = getenv("MACFINALS_D3D12_LAYER_LOG")) && *v && strcmp(v, "0")) verbose = 1;
     InitializeCriticalSection(&cache_cs);
     cache = calloc(CACHE_SIZE, sizeof(*cache));
+    pso_tls = TlsAlloc();
     for (i = 0; i < DEVICE_SLOTS; i++) layer_vtbl.slot[i] = (void *)(device_thunks + 16 * i);
     layer_vtbl.v.QueryInterface = layer_QueryInterface;
     layer_vtbl.v.CreateGraphicsPipelineState = layer_CreateGraphicsPipelineState;
@@ -500,20 +645,20 @@ static BOOL CALLBACK init_once(INIT_ONCE *once, void *param, void **context)
     layer_vtbl.v.CreatePipelineLibrary = layer_CreatePipelineLibrary;
     if (!(gptk = LoadLibraryW(L"d3d12_gptk.dll")))
     {
-        log_line("d3d12_gptk.dll not found (error %lu)\n", GetLastError());
+        ERR("d3d12_gptk.dll not found (error %lu)\n", GetLastError());
         return TRUE;
     }
     GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                        (LPCWSTR)(void *)init_once, &self);
     if (gptk == self)
     {
-        log_line("d3d12_gptk.dll resolved to this layer; check the runtime layout\n");
+        ERR("d3d12_gptk.dll resolved to this layer; check the runtime layout\n");
         return TRUE;
     }
     real_create_device = (void *)GetProcAddress(gptk, "D3D12CreateDevice");
     real_get_interface = (void *)GetProcAddress(gptk, "D3D12GetInterface");
-    log_line("layer %p, gptk %p, shader rewrite %s, per-shader log %s\n", (void *)self, (void *)gptk,
-             enabled ? "on" : "off (MACFINALS_SKIN_FIX=0)", verbose ? "on" : "off");
+    TRACE("layer %p, gptk %p, shader rewrite %s\n", (void *)self, (void *)gptk,
+          enabled ? "on" : "off (MACFINALS_SKIN_FIX=0)");
     return TRUE;
 }
 
@@ -551,6 +696,6 @@ HRESULT WINAPI D3D12GetInterface(REFCLSID clsid, REFIID riid, void **out)
     f->real = *out;
     f->refs = 1;
     *out = &f->iface;
-    log_line("device factory wrapped\n");
+    TRACE("device factory wrapped\n");
     return hr;
 }

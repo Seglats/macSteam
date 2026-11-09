@@ -73,7 +73,7 @@ def apple_redist(gptk):
     return info['CFBundleShortVersionString']
 
 
-def assemble(work,version,identity,gptk):
+def assemble(work,version,identity,gptk,debug_msgs=True):
     if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,63}',version):raise ValueError('Invalid runtime version')
     for name in SOURCE_BUILDS:
         if not (work/name).is_file():raise ValueError('Complete the source builds first: '+name)
@@ -228,7 +228,9 @@ def assemble(work,version,identity,gptk):
     #   lib/wine/x86_64-windows/d3d12_gptk.dll  placeholder (Wine fake, no exports)
     #   lib/wine/d3d12_gptk.dll                 Apple's d3d12.dll, unchanged
     #   lib/wine/d3d12_gptk.so                  -> ../external/libd3dshared.dylib
-    run(ROOT/'d3d12_layer/build.sh',work/'d3d12-layer',work/'wine-build/tools/winebuild/winebuild')
+    # --no-debug-msgs compiles the layer's trace/warn/fixme out, as Wine's release switches do
+    layer_env=dict(os.environ,DEBUG_CFLAGS='' if debug_msgs else '-DWINE_NO_TRACE_MSGS -DWINE_NO_DEBUG_MSGS')
+    run(ROOT/'d3d12_layer/build.sh',work/'d3d12-layer',work/'wine-build/tools/winebuild/winebuild',env=layer_env)
     apple_d3d12=dest/'lib/wine/x86_64-windows/d3d12.dll'
     copy(apple_d3d12,dest/'lib/wine/d3d12_gptk.dll')
     if sha(dest/'lib/wine/d3d12_gptk.dll')!=sha(redist/'wine/x86_64-windows/d3d12.dll'):
@@ -263,7 +265,8 @@ def assemble(work,version,identity,gptk):
         for p in sorted(dest.rglob('*')):tar.add(p,arcname=str(p.relative_to(dest)),recursive=False)
     proof={'version':version,'archive_sha256':sha(archive),'archive_bytes':archive.stat().st_size,
            'unpacked_file_bytes':sum(v.get('bytes',0) for v in files.values()),'files':len(files),
-           'signed_native_components':len(native),'dependency_names':sorted(chosen)}
+           'signed_native_components':len(native),'dependency_names':sorted(chosen),
+           'layer_debug_messages':debug_msgs}
     archive.with_suffix('.json').write_text(json.dumps(proof,indent=2)+'\n')
     print(json.dumps(proof,indent=2))
 
@@ -272,4 +275,6 @@ if __name__=='__main__':
     p=argparse.ArgumentParser(description=__doc__);p.add_argument('--workspace',type=Path,required=True)
     p.add_argument('--version',required=True);p.add_argument('--identity',required=True,help="'-' signs ad hoc")
     p.add_argument('--gptk',type=Path,default=ROOT/'gptk/gptk',help='Folder holding Apple\'s redist/ and its documents')
-    a=p.parse_args();assemble(a.workspace.resolve(),a.version,a.identity,a.gptk.resolve())
+    p.add_argument('--no-debug-msgs',action='store_true',
+                   help='Compile the d3d12 layer\'s trace/warn/fixme out (WINE_NO_TRACE_MSGS, WINE_NO_DEBUG_MSGS)')
+    a=p.parse_args();assemble(a.workspace.resolve(),a.version,a.identity,a.gptk.resolve(),debug_msgs=not a.no_debug_msgs)

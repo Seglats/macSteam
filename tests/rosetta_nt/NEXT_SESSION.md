@@ -2,6 +2,25 @@
 
 Start here after a context reset. Details live in the linked files.
 
+## Newest: runtime `macfinals-47` — storm fixed in game, debug output follows Wine's model
+
+- **The syscall storm is fixed in THE FINALS** (r21f, runtime -43): 99.99 % fast-path hits,
+  stock SIGSYS 30k/s → 1-2/s, Rosetta exception thread 0 %. NOTES.md "r21f in the game".
+- **Freezes: investigation PAUSED, not done** (Rasmus, 2026-11-09: not needed right now).
+  0.3-2.2 s GameThread freezes, mostly while loading and in the first minutes of play. Ruled
+  out: shader compilation (D3DMetal's cache persists between runs and stopped growing; slow
+  pipeline builds only at startup) and Wine syscall cost. Cause unknown. Resume with
+  `tests/finals_bisect/freeze_profile.py` (Time Profiler, no developer mode; works on probes,
+  never yet captured a game freeze). NOTES.md "Freeze hunt, continued and PAUSED".
+- **`macfinals-47`** = 46 (assembled with the reworked layer) + the reworked hook. Hook
+  payload unchanged since r21f. 44/45 are BROKEN (layer imported libwinpthread-1.dll and did
+  not load — never use them; installed 45 was removed). 46/47 verified: d3d12 probe loads the
+  layer, channel output correct.
+- **Debug output now follows Wine's model** (CLAUDE.md "Debug output"): channels
+  `macfinals_hook`, `macfinals_dx12`, `macfinals_scan`; default err+fixme; release builds
+  with `--no-debug-msgs` / `DEBUG_CFLAGS`. The nt-ring file / MACFINALS_HOOK_RING /
+  MACFINALS_SYSC_DUMP / MACFINALS_D3D12_LAYER_LOG are retired.
+
 ## Current build: macfinals-42 (TF guard; the 2026-11-08 game crash fixed at probe level)
 
 - **Newest runtime `macfinals-42`** (= unhooked 38 + r21e-2 hook), installed in
@@ -184,7 +203,7 @@ output (`pid:tid:macfinals-d3d12:`). `MACFINALS_SKIN_FIX=0` turns the rewrite of
   made Wine set debugger-style heap flags and the anti-cheat quit with "disallowed tool". Use
   `warn+all,warn-heap` (that is what `DEBUG=max` does). `+seh` also changed behaviour once.
 - `launch_main.sh` clears the environment: only variables it lists are passed on
-  (`MACFINALS_SKIN_FIX`, `MACFINALS_D3D12_LAYER_LOG` are).
+  (`MACFINALS_SKIN_FIX` is; debug output is chosen with `DEBUG=` or a verbatim `WINEDEBUG=`).
 - `launch_main.sh` defaults are the old CrossOver-like bisect baseline: **no MSync, no AVX**
   unless you pass `msync` / `avx`. The app enables both. Measure performance with both.
 - The layer's log only shows in the game if it goes through Wine's debug output; a process

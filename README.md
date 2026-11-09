@@ -1,107 +1,136 @@
-# MacVolvo
+# SteamDriver
 
-**Counter-Strike 2 and Deadlock on Apple Silicon.**
+**Windows games from the macOS Steam app on Apple Silicon: a better mouse and display for every
+game, and a Wine of their own for games that need one.**
 
-A free, open-source Mac launcher built on [Recall](https://github.com/AsherJN/recall).
-Install Steam, choose your game, and play through Wine and DXMT.
+SteamDriver is a fork of [MacVolvo](https://github.com/haeli05/MacVolvo), which is built on
+[Recall](https://github.com/AsherJN/recall). It works together with
+[NotProton](https://github.com/NotProtonNot/NotProton), which turns on Steam Play in the macOS
+Steam app. The app is still called **MacVolvo** inside; the rename hasn't happened yet.
 
-## [⬇ MacVolvo v1.1 · DXMT](https://github.com/haeli05/MacVolvo/releases/download/v1.1/MacVolvo-1.1.dmg) · [⬇ MacVolvo GPTK4](https://github.com/haeli05/MacVolvo/releases/download/v1.0-gptk4-eval.1/MacVolvo-GPTK4-1.0.dmg)
-
-Both downloads are Developer ID signed, Apple notarized and stapled.
-
-**MacVolvo GPTK4** is a separate evaluation app using Apple's D3DMetal 4.0 beta 3
-for DirectX 11. It has its own Steam setup and does not automatically import
-existing games. No FPS improvement over the original app has been established.
-See the [GPTK4 release notes](docs/releases/v1.0-gptk4-eval.1.md).
-
-[Introduction](https://haeli05.github.io/MacVolvo/) ·
-[Downloads & releases](https://github.com/haeli05/MacVolvo/releases) ·
-[Report a bug](https://github.com/haeli05/MacVolvo/issues)
-
-> **v1.1.** Includes Steam window restoration, browser recovery and Wine session
-> cleanup. Known launch, audio, performance and Deadlock UI issues remain.
-> Read the [release notes](docs/releases/v1.1.md) before downloading.
+> **Status: in development.** This repository has no releases of its own; build it from source.
+> THE FINALS runs from the macOS Steam app on the developer's Mac. Expect rough edges.
 
 ## What it does
 
-Valve dropped macOS support when Counter-Strike 2 replaced CS:GO, and Deadlock has never
-had a Mac version. MacVolvo installs the Windows version of Steam into a private Wine
-environment, and you play from there, with no CrossOver, Windows or Boot Camp needed.
+### For every game: options in Steam's Compatibility settings
 
-MacVolvo builds on [Recall](https://github.com/AsherJN/recall), Joshua Asher Nelson's
-work on running Overwatch on the Mac. Its performance results are not CS2 or
-Deadlock benchmarks.
+With NotProton installed, the app adds options to each game's **Properties › Compatibility** page
+in macOS Steam, through NotProton's own extension points. It replaces nothing of NotProton's.
 
-- **Wine**, built from CodeWeavers' CrossOver 26.3 sources, runs Steam and the games.
-- **Rosetta** translates the games' Intel code to Apple Silicon.
-- **DXMT** translates the games' Direct3D 11 graphics to Metal, with Recall's faster waits,
-  frame pacing, third frame buffer and image compression kept on.
-- **Raw mouse input** reads the mouse directly, up to 2,000 times a second, instead of
-  waiting on macOS's pointer.
-- **Game Mode**: each game starts as a Mac game, so macOS gives it priority.
+- **MacVolvo driver**: Recall's Mac driver for Wine, adding:
+  - raw mouse input, read up to 2,000 times a second;
+  - the **High-precision** mouse, which reads the mouse directly;
+  - precise or classic timing;
+  - fullscreen and display fixes.
+- **MacVolvo renderer**: MacVolvo's DXMT (Direct3D 11 to Metal), or Apple's D3DMetal from your own
+  Game Porting Toolkit.
+- **Game profiles** that tune DXMT for particular games.
 
-See [how Recall runs faster](docs/HOW-IT-WORKS.md) for the engine details.
+Details: [docs/NOTPROTON.md](docs/NOTPROTON.md).
 
-## Get started
+### For games that need more: a Wine environment of their own
 
-1. **Download MacVolvo** from [GitHub Releases](https://github.com/haeli05/MacVolvo/releases).
-   Read the package’s signing status and installation instructions, then move MacVolvo to Applications.
-2. **Open MacVolvo** and follow the setup steps. It prepares everything and installs Steam.
-3. **Open Steam, sign in,** and install Counter-Strike 2 or Deadlock from your Library.
-4. **Pick a game in MacVolvo and press Play.**
+Some games need Wine changes that NotProton's CrossOver runner can't take. Those games get their
+own environment in [`environments/`](environments/): one main Wine, plus a folder for each game
+that needs its own. A game's environment ships as a **Steam Play compatibility tool**, which the
+app installs into macOS Steam and you select per game.
+
+| Environment | For | Graphics |
+|---|---|---|
+| [`main`](environments/main/) | Counter-Strike 2, Deadlock, everything else | DXMT (Direct3D 11) |
+| [`finals`](environments/finals/) | **THE FINALS** | Apple D3DMetal (Direct3D 12) |
+
+**THE FINALS** runs through the compatibility tool "SteamDriver: THE FINALS". The tool runs
+CrossOver 26.3 Wine built from source with these additions:
+- an in-process fix for Rosetta's slow handling of the game's direct system calls (~32,000 a
+  second);
+- a fix for missing character limbs in Apple's D3DMetal;
+- the same mouse driver as above.
+
+The game reaches the Steam client through NotProton's Steam bridge, which our Wine loads itself.
+Nothing is patched from outside the game, and macOS developer mode isn't needed. Details:
+[environments/finals/compat-tool](environments/finals/compat-tool/README.md).
+
+The plan is to build environments ahead of time and download them per game. For now the app
+build bundles them.
+
+## Using it
 
 | You need | |
 |---|---|
-| Mac | Apple Silicon (M1 or newer). Intel Macs aren't supported. |
+| Mac | Apple Silicon (M1 or newer) |
 | macOS | macOS Tahoe 26.5 or later |
-| Memory | 16 GB recommended |
-| Storage | About 70 GB free per game |
-| Also | A Steam account, an internet connection, and Rosetta (MacVolvo checks for it) |
+| Also | the macOS Steam app, [NotProton](https://github.com/NotProtonNot/NotProton) (install it and open it once), Rosetta |
+| For THE FINALS | Apple's [Game Porting Toolkit](https://developer.apple.com/games/game-porting-toolkit/) to build the environment (Apple doesn't allow it to be redistributed), about 90 GB for the game |
 
-## About VAC
+1. Build the app (below) and open it.
+2. **For every game:** choose **Add to Steam**. Then, in a game's Properties › Compatibility, keep
+   NotProton's CrossOver, choose the MacVolvo driver and renderer under Developer, and turn on
+   MacVolvo mouse.
+3. **For THE FINALS:** under **Game runtimes**, choose **Add to Steam** and let the app restart
+   Steam. In THE FINALS › Properties › Compatibility, turn on "Force the use of a specific Steam
+   Play compatibility tool" and choose **SteamDriver: THE FINALS**. Options go in the launch
+   options, for example `STEAMDRIVER_MOUSE=hid %command%` for the High-precision mouse.
 
-Counter-Strike 2 and Deadlock are protected by VAC, Valve's anti-cheat. MacVolvo runs the
-games unmodified through Wine, the way Linux players have used Proton for years, but Valve
-doesn't support playing them on macOS this way and we can't promise VAC won't object. Play on
-an account you're prepared to take that risk with.
+Advanced › MacVolvo's own Steam still offers the original setup, for troubleshooting: Windows
+Steam inside the app's own Wine.
+
+## Anti-cheat
+
+The games run unmodified through Wine, the way Linux players use Proton. Nothing hides Wine
+from a game or its anti-cheat.
+- **Counter-Strike 2 and Deadlock** use VAC.
+- **THE FINALS** uses its own anti-cheat. In a new Wine prefix its first launch can show "issue
+  with starting Denuvo Anti-Cheat"; the second launch goes in.
+
+None of these publishers support playing on macOS this way. Use an account you're prepared to take
+that risk with.
 
 ## Known issues
 
-- **Black screen with sound on launch:** quit the game completely and restart it.
-  This can happen from either MacVolvo or Steam. A captured fullscreen deadlock is
-  fixed, but the intermittent symptom is not considered fully resolved.
-- **Audio static or crackling:** open **Audio MIDI Setup → Window → Show Audio Devices**,
-  select your output device, and set **Format to 96,000 Hz (96 kHz)** if supported.
-  Quit and restart the game afterward. This workaround helped on the tested M2 Max;
-  MacVolvo does not change your system audio format.
-- **CS2 combat lag spikes / severe FPS drops:** still under investigation.
-  Shader compilation can cause initial stutters, but it does not explain every report.
-- **Deadlock camera stops responding after a match:** clicks may still work.
-  Quit and restart the game. Post-match recovery has not been fully verified.
-- **Deadlock UI or click positions shift after changing video settings:** this
-  has been reported in the original DXMT app and remains under investigation.
-  Close Deadlock, turn off its Fullscreen option in MacVolvo, and relaunch at a
-  resolution that fits your display before trying the in-game settings again.
-- **Steam store/profile flicker:** pages may flicker while loading.
-
-See [v1.1 release notes](docs/releases/v1.1.md) for the current validation limits.
+- **THE FINALS:** short freezes (0.3–2 s), mostly while loading and in the first minutes of play.
+  The cause isn't known yet; shader compilation is ruled out. See
+  [PROFILING.md](environments/finals/tests/finals_bisect/PROFILING.md).
+- **Counter-Strike 2 and Deadlock:** see the [v1.1 release notes](docs/releases/v1.1.md) from
+  MacVolvo. They still apply to the main environment.
 
 ## Building from source
 
-See [build instructions](docs/BUILDING.md) and the [architecture notes](app/ARCHITECTURE.md).
-MacVolvo uses Recall 1.3.0's runtime with a mouse timing fix; the MacVolvo-specific pieces are the Steam
-worker (`scripts/portable_steam.h`), the Steam window fix (`scripts/webhelper_wrapper.c`) and
-the app. [docs/HANDOFF.md](docs/HANDOFF.md) records how the Steam window fix was found.
+- **The app:**
+
+  ```sh
+  DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer python3 scripts/build_native_app.py \
+    --identity - --runtime-archive <main runtime .tar.gz> \
+    --game-tool finals=<macfinals-N.tar.gz> --output runtime/build/SteamDriver-N.app
+  ```
+
+  Leave out `--game-tool` for an app without THE FINALS.
+- **The main environment** (the main runtime, DXMT, the Mac driver): [docs/BUILDING.md](docs/BUILDING.md).
+- **The finals environment** (its Wine, the d3d12 layer, the Rosetta hook, the runtime archive):
+  [environments/finals/README.md](environments/finals/README.md). It needs MinGW-w64 GCC.
+- **What broke while this was put together:**
+  - [environments/LESSONS.md](environments/LESSONS.md)
+  - [environments/finals/compat-tool/LESSONS.md](environments/finals/compat-tool/LESSONS.md)
+- **Architecture:** [app/ARCHITECTURE.md](app/ARCHITECTURE.md).
 
 ## Credits and license
 
-MacVolvo is a fork of [Recall](https://github.com/AsherJN/recall), created by Joshua Asher
-Nelson. It uses Wine from CodeWeavers' published CrossOver sources, DXMT by Feifan He through
-NerRobDog's fork, and Soju's runtime build recipe.
+SteamDriver builds on:
+- [MacVolvo](https://github.com/haeli05/MacVolvo) by haeli05;
+- [Recall](https://github.com/AsherJN/recall) by Joshua Asher Nelson;
+- Wine from CodeWeavers' published CrossOver sources;
+- DXMT by Feifan He through NerRobDog's fork;
+- Soju's runtime build recipe.
 
-The original code is licensed under [Apache 2.0](LICENSE). Dependencies and patches keep
-their own licenses; see the [third-party notices](THIRD_PARTY_NOTICES.md) and [NOTICE](NOTICE).
+THE FINALS' route uses NotProton's Steam bridge (GPL-3.0; Valve's lsteamclient and steam-helper
+from Proton) unchanged, from your NotProton install. Apple's D3DMetal comes from your own Game
+Porting Toolkit and is never redistributed.
 
-MacVolvo is an independent community project, not affiliated with or endorsed by Valve
-Corporation, Volvo, Blizzard Entertainment, Apple or CodeWeavers. Counter-Strike, Deadlock,
-Steam, Mac, CrossOver and other product names are trademarks of their respective owners.
+The original code is licensed under [Apache 2.0](LICENSE). Dependencies and patches keep their own
+licenses: see the [third-party notices](THIRD_PARTY_NOTICES.md) and [NOTICE](NOTICE).
+
+SteamDriver is an independent community project, not affiliated with or endorsed by Valve
+Corporation, Embark Studios, Apple, CodeWeavers, NotProton's authors or Blizzard Entertainment.
+Counter-Strike, Deadlock, Steam, THE FINALS, Mac, CrossOver and other product names are trademarks
+of their respective owners.

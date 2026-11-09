@@ -1,0 +1,24 @@
+--- a/dlls/ntdll/unix/virtual.c
++++ b/dlls/ntdll/unix/virtual.c
+@@ -4847,7 +4847,21 @@
+     {
+         if (is_inside_signal_stack( stack ))
+         {
++            struct ntdll_thread_data *thread_data = ntdll_get_thread_data();
++            TEB *teb = NtCurrentTeb();
++
+             ERR( "nested exception on signal stack addr %p stack %p\n", rec->ExceptionAddress, stack );
++            /* What the thread is about to lose: enough to tell which fault, in which thread
++             * (start address; thread names come from warn+threadname), on which stack. */
++            ERR( "  code %08x flags %x, %u params: %p %p (access type, address for a fault)\n",
++                 (unsigned int)rec->ExceptionCode, (unsigned int)rec->ExceptionFlags,
++                 (unsigned int)rec->NumberParameters,
++                 rec->NumberParameters > 0 ? (void *)rec->ExceptionInformation[0] : NULL,
++                 rec->NumberParameters > 1 ? (void *)rec->ExceptionInformation[1] : NULL );
++            ERR( "  thread %04x start %p param %p, stack %p-%p, kernel stack %p, signal stack %p-%p\n",
++                 (unsigned int)HandleToULong( teb->ClientId.UniqueThread ), thread_data->start,
++                 thread_data->param, teb->Tib.StackLimit, teb->Tib.StackBase, thread_data->kernel_stack,
++                 get_signal_stack(), (char *)get_signal_stack() + signal_stack_size );
+             abort_thread(1);
+         }
+         WARN( "exception outside of stack limits addr %p stack %p (%p-%p-%p)\n",

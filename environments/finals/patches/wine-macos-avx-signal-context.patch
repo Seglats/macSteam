@@ -1,0 +1,85 @@
+--- a/dlls/ntdll/unix/signal_x86_64.c
++++ b/dlls/ntdll/unix/signal_x86_64.c
+@@ -357,6 +357,28 @@
+ 
+ #define XState_sig(context)  NULL
+ 
++/* macOS signal contexts carry the AVX state when uc_mcsize says so (Rosetta delivers the AVX
++ * mcontext and applies changes made to it on return), but not in XSAVE layout: the upper
++ * halves of YMM0-15 sit 580 bytes after the FPU control word, after 4 reserved bytes and a
++ * 64-byte reserved block instead of the XSAVE header at 512. So they are copied into an XSAVE
++ * buffer in struct xcontext (save_context) and back (restore_context), not referenced in place
++ * like on Linux. Without this, exception contexts and suspended-thread contexts have no AVX
++ * state and continuing from an exception does not restore the YMM upper halves. */
++static inline M128A *YMMH_sig( const ucontext_t *context )
++{
++    if (context->uc_mcsize == sizeof(_STRUCT_MCONTEXT_AVX64) ||
++        context->uc_mcsize == sizeof(_STRUCT_MCONTEXT_AVX64_FULL) ||
++#ifdef _STRUCT_MCONTEXT_AVX512_64
++        context->uc_mcsize == sizeof(_STRUCT_MCONTEXT_AVX512_64) ||
++#endif
++        context->uc_mcsize == SIZEOF_STRUCT_MCONTEXT_AVX512_64_FULL)
++    {
++        return (M128A *)((char *)FPU_sig( context ) + offsetof( _STRUCT_X86_AVX_STATE64, __fpu_ymmh0 )
++                         - offsetof( _STRUCT_X86_AVX_STATE64, __fpu_fcw ));
++    }
++    return NULL;
++}
++
+ #else
+ #error You must define the signal context functions for your platform
+ #endif
+@@ -556,6 +578,11 @@
+ {
+     CONTEXT c;
+     CONTEXT_EX c_ex;
++#ifdef __APPLE__
++    /* XSAVE header and the YMM upper halves copied from the signal context, see YMMH_sig().
++     * Sized for xstate_size; save_context leaves the context without xstate if it is larger. */
++    DECLSPEC_ALIGN(16) BYTE mac_xstate[1024];  /* usr1_handler places xcontexts 16-aligned */
++#endif
+ };
+ 
+ static inline XSAVE_AREA_HEADER *xstate_from_context( const CONTEXT *context )
+@@ -1062,6 +1089,21 @@
+             __asm__ volatile( "stmxcsr %0" : "=m" (context->FltSave.MxCsr) );
+ #endif
+         context->MxCsr = context->FltSave.MxCsr;
++#ifdef __APPLE__
++        {
++            M128A *ymmh;
++
++            if ((xstate_extended_features & XSTATE_MASK_GSSE) && (ymmh = YMMH_sig( sigcontext )) &&
++                xstate_size <= sizeof(xcontext->mac_xstate))
++            {
++                xs = (XSAVE_AREA_HEADER *)xcontext->mac_xstate;
++                memset( xs, 0, sizeof(*xs) );
++                xs->Mask = XSTATE_MASK_LEGACY | XSTATE_MASK_GSSE;
++                memcpy( &((XSTATE *)xs)->YmmContext, ymmh, sizeof(YMMCONTEXT) );
++                context_init_xstate( context, xs );
++            }
++        }
++#endif
+         if (xstate_extended_features && (xs = XState_sig(FPU_sig(sigcontext))))
+         {
+             /* xcontext and sigcontext are both on the signal stack, so we can
+@@ -1126,6 +1168,19 @@
+     amd64_thread_data()->dr7 = context->Dr7;
+     set_sigcontext( context, sigcontext );
+     if (FPU_sig(sigcontext)) memcpy( FPU_sig(sigcontext), &context->FltSave, sizeof(context->FltSave) );
++#ifdef __APPLE__
++    {
++        const XSTATE *xs = (const XSTATE *)xstate_from_context( context );
++        M128A *ymmh = YMMH_sig( sigcontext );
++
++        /* the server leaves the AVX bit clear when all upper halves are zero (init state) */
++        if (xs && ymmh && (!xs->CompactionMask || (xs->CompactionMask & XSTATE_MASK_GSSE)))
++        {
++            if (xs->Mask & XSTATE_MASK_GSSE) memcpy( ymmh, &xs->YmmContext, sizeof(YMMCONTEXT) );
++            else memset( ymmh, 0, sizeof(YMMCONTEXT) );
++        }
++    }
++#endif
+     leave_handler( sigcontext );
+ }
+ 

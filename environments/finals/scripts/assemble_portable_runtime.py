@@ -1,0 +1,283 @@
+#!/usr/bin/env python3
+"""Assemble/sign MacFinals' runtime: the source-built Wine with Apple's D3DMetal.
+
+Does not copy installed developer runtimes or Windows prefixes. Apple's files come
+from the Game Porting Toolkit 4 evaluation environment (--gptk, the folder holding
+redist/ and its Read Me, License and Acknowledgements), laid over Wine's own
+Direct3D modules after everything else is signed, and remain unmodified — except
+that the MacFinals d3d12 layer takes d3d12.dll's place, with Apple's original kept
+byte-identical under the d3d12_gptk name (see assemble()).
+"""
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import plistlib
+import re
+import shutil
+import subprocess
+import tarfile
+from concurrent.futures import ThreadPoolExecutor
+
+import sys as _sys
+_sys.path.append(str(Path(__file__).resolve().parents[3] / 'scripts'))  # shared helpers (game_mode_app)
+import game_mode_app
+
+ROOT=Path(__file__).resolve().parents[1]   # environments/finals
+REPO=ROOT.parents[1]                      # repository root: shared config, licenses, toolchains, gptk
+# Apple's modules MacFinals loads (portable_setup.m's wineEnv); a redist without them is refused.
+APPLE_REQUIRED=['external/D3DMetal.framework/Versions/A/D3DMetal','external/libd3dshared.dylib',
+                'wine/x86_64-windows/d3d11.dll','wine/x86_64-windows/dxgi.dll',
+                'wine/x86_64-windows/d3d12.dll','wine/x86_64-windows/d3d12core.dll',
+                'wine/x86_64-unix/d3d11.so','wine/x86_64-unix/dxgi.so',
+                'wine/x86_64-unix/d3d12.so','wine/x86_64-unix/d3d12core.so']
+SOURCE_BUILDS=['wine-build-proof.json','native-build-proof.json']
+MONO_SOURCE_SHA='128e335396689e466dff5e1aa0770a714dbe3d16397fc4ddbb8a80999c67323b'
+
+
+def run(*args,**kwargs):return subprocess.run([str(a) for a in args],check=True,**kwargs)
+def sha(p):
+    with p.open('rb') as f:return hashlib.file_digest(f,'sha256').hexdigest()
+def macho(p):
+    if p.is_symlink() or not p.is_file():return False
+    with p.open('rb') as f:return f.read(4) in (b'\xcf\xfa\xed\xfe',b'\xce\xfa\xed\xfe',b'\xca\xfe\xba\xbe',b'\xbe\xba\xfe\xca')
+def links(p):
+    text=subprocess.check_output(['otool','-L',str(p)],text=True)
+    return [line.strip().split(' (')[0] for line in text.splitlines()[1:]]
+def rpaths(p):
+    text=subprocess.check_output(['otool','-l',str(p)],text=True)
+    return re.findall(r'cmd LC_RPATH\n\s+cmdsize \d+\n\s+path (.*?) \(offset',text)
+def copy(source,target):
+    target.parent.mkdir(parents=True,exist_ok=True)
+    if source.is_symlink():
+        link=os.readlink(source)
+        resolved=(target.parent/link).resolve()
+        if os.path.isabs(link):raise ValueError('Absolute source link: '+str(source))
+        target.symlink_to(link)
+    else:shutil.copy2(source,target)
+
+
+def apple_redist(gptk):
+    """Checks the GPTK folder before anything is built from it; returns D3DMetal's version."""
+    redist=gptk/'redist/lib'
+    for name in APPLE_REQUIRED:
+        if not (redist/name).exists():raise ValueError('Apple redist lacks '+name)
+    for name in ['License.rtf','Read Me.rtf','Acknowledgements.rtf']:
+        if not (gptk/name).is_file():raise ValueError('Apple package documentation missing: '+name)
+    info=plistlib.loads((redist/'external/D3DMetal.framework/Resources/Info.plist').read_bytes())
+    if info.get('CFBundleIdentifier')!='com.apple.D3DMetal' or not info['CFBundleShortVersionString'].startswith('4.'):
+        raise ValueError('The GPTK folder does not hold D3DMetal 4')
+    for p in redist.rglob('*'):
+        if p.is_symlink():
+            if os.path.isabs(os.readlink(p)) or not p.resolve().is_relative_to(redist.resolve()):
+                raise ValueError('Apple redist link escapes it: '+str(p))
+        elif macho(p):run('codesign','--verify','--strict','-R=anchor apple',p,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+    return info['CFBundleShortVersionString']
+
+
+def assemble(work,version,identity,gptk,debug_msgs=True):
+    if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,63}',version):raise ValueError('Invalid runtime version')
+    for name in SOURCE_BUILDS:
+        if not (work/name).is_file():raise ValueError('Complete the source builds first: '+name)
+    gptk_version=apple_redist(gptk)
+    dest=work/'artifacts'/version
+    if dest.exists():raise ValueError('Use a new version; existing artifact is never overwritten')
+    dest.mkdir(parents=True)
+    wine=work/'install/usr/local'
+    for name in ['bin/wine','bin/wineserver']:
+        copy(wine/name,dest/name)
+    for p in (wine/'lib/wine').rglob('*'):
+        # Wine also needs .drv, .sys, .acm, .cpl, .ocx and legacy resources.
+        # Exclude only developer import archives, never select by executable suffix.
+        if p.is_file() and p.suffix!='.a':
+            copy(p,dest/p.relative_to(wine))
+    shutil.copytree(wine/'share/wine',dest/'share/wine',symlinks=True)
+    # The worker still expects the renderer profile file; D3DMetal ignores it.
+    copy(REPO/'config/dxmt-source60-1200.conf',dest/'config/dxmt.conf')
+    for name in ['License.rtf','Read Me.rtf','Acknowledgements.rtf']:
+        copy(gptk/name,dest/'licenses/apple'/name)
+    copy(work/'sources/wine/sources/wine/COPYING.LIB',dest/'licenses/Wine-LGPL-2.1')
+    for p in (REPO/'licenses').iterdir():  # PROJECT-APACHE-2.0 and PROJECT-NOTICE among them
+        if p.is_file():copy(p,dest/'licenses'/p.name)
+    compiler=REPO/'runtime/toolchains/llvm-mingw-20251216-ucrt-macos-universal'
+    copy(compiler/'LICENSE.TXT',dest/'licenses/compiler-runtime/LLVM-MinGW-LICENSE.txt')
+    for architecture in ('x86_64','i686'):
+        copy(compiler/(architecture+'-w64-mingw32/share/mingw32/COPYING'),
+             dest/('licenses/compiler-runtime/MinGW-'+architecture+'-COPYING'))
+    soju=work/'sources/soju/soju-3a350b32bf906dd2a509b18c642a5a2676de022a'
+    copy(soju/'LICENSE',dest/'licenses/Soju-GPL-3.0')
+    mono_source=work/'downloads/wine-mono-10.4.1-src.tar.xz'
+    if not mono_source.exists():
+        part=Path(str(mono_source)+'.part')
+        run('/usr/bin/curl','-fL','--proto','=https','--proto-redir','=https','--retry','2','-o',part,
+            'https://github.com/wine-mono/wine-mono/releases/download/wine-mono-10.4.1/wine-mono-10.4.1-src.tar.xz')
+        if sha(part)!=MONO_SOURCE_SHA:raise ValueError('Wine Mono source hash mismatch')
+        part.rename(mono_source)
+    if sha(mono_source)!=MONO_SOURCE_SHA:raise ValueError('Wine Mono source hash mismatch')
+    # Preserve upstream notices at their original paths, including transitive
+    # projects. Keep the corresponding source archive for release delivery.
+    with tarfile.open(mono_source) as tar:
+        for entry in tar:
+            path=Path(entry.name)
+            if path.is_absolute() or '..' in path.parts:raise ValueError('Unsafe Mono source path')
+            if entry.isfile() and (path.name.upper().startswith(('COPYING','LICENSE','NOTICE','AUTHORS','THIRDPARTYNOTICES'))
+                                  or 'ICSharpCode.SharpZipLib/README' in entry.name):
+                target=dest/'licenses/wine-mono'/path
+                target.parent.mkdir(parents=True,exist_ok=True)
+                target.write_bytes(tar.extractfile(entry).read())
+    shutil.copytree(work/'clean-deps/licenses',dest/'licenses/native')
+    for name in ['FTL.TXT','GPLv2.TXT']:
+        copy(work/'sources/freetype/freetype-2.13.3/docs'/name,dest/'licenses/freetype'/name)
+    # Resolve only native libraries referenced by this runtime, plus four
+    # explicitly dlopened dependencies (SDL2 for winebus's controllers, 1.2).
+    # No unused graphical backend is copied.
+    available={p.name:p for p in (work/'clean-deps/lib').glob('*.dylib')}
+    available['libfreetype.6.dylib']=work/'deps/lib/libfreetype.6.dylib'
+    native=[p for p in dest.rglob('*') if macho(p)]
+    needed={'libgnutls.30.dylib','libfreetype.6.dylib','libMoltenVK.dylib','libSDL2-2.0.0.dylib'};chosen={}
+    for p in native:
+        for dep in links(p):
+            if Path(dep).name in available:needed.add(Path(dep).name)
+    while needed:
+        name=needed.pop()
+        if name in chosen:continue
+        p=available[name];chosen[name]=sha(p);shutil.copy2(p.resolve(),dest/'lib'/name)
+        for dep in links(p):
+            base=Path(dep).name
+            if base in available and base!=name:needed.add(base)
+    native=[p for p in dest.rglob('*') if macho(p)]
+    # GNU strip from the MinGW-w64 GCC toolchain that builds these modules
+    # (build_portable_runtime.py); the known-good CrossOver-based ntdll.dll was stripped
+    # the same way. i686 modules are plain PE too, so the x86_64 strip handles both.
+    strip=Path('/opt/homebrew/opt/mingw-w64/bin/x86_64-w64-mingw32-strip')
+    def strip_debug(p):
+        run(strip,'--strip-debug',p,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+    # Managed Mono assemblies are PE too; only strip built Wine modules.
+    pe=[p for p in (dest/'lib/wine').rglob('*') if p.is_file() and not p.is_symlink()
+        and p.suffix in ('.exe','.dll','.drv','.sys','.acm','.cpl','.ocx','.ax')]
+    with ThreadPoolExecutor(max_workers=4) as pool:list(pool.map(strip_debug,pe))
+    for p in native:
+        # Include the dependency closure copied above, not just Wine.
+        # Preserve exported symbols needed by Wine and dlopen.
+        run('/usr/bin/strip','-S','-x',p,stderr=subprocess.DEVNULL)
+        for dep in links(p):
+            if dep.startswith(('/usr/lib/','/System/Library/','@loader_path/','@rpath/','@executable_path/')):continue
+            name=Path(dep).name
+            if name=='libpcap.dylib':
+                run('install_name_tool','-change',dep,'/usr/lib/libpcap.A.dylib',p,stderr=subprocess.DEVNULL)
+            elif name in chosen:run('install_name_tool','-change',dep,'@rpath/'+name,p,stderr=subprocess.DEVNULL)
+            elif name in ('ntdll.so','win32u.so'):
+                run('install_name_tool','-change',dep,'@rpath/'+name,p,stderr=subprocess.DEVNULL)
+            else:raise ValueError('Unresolved non-system dependency: '+dep)
+        if p.suffix=='.dylib':run('install_name_tool','-id','@rpath/'+p.name,p,stderr=subprocess.DEVNULL)
+        desired=['@loader_path']
+        if p.parent==dest/'bin':desired+=['@loader_path/../lib','@loader_path/../lib/wine/x86_64-unix']
+        elif (dest/'lib/wine') in p.parents:desired+=['@loader_path/../..']
+        old=rpaths(p)
+        for path in old:
+            if path not in desired:run('install_name_tool','-delete_rpath',path,p,stderr=subprocess.DEVNULL)
+        for path in desired:
+            if path not in old:run('install_name_tool','-add_rpath',path,p,stderr=subprocess.DEVNULL)
+    private_paths=[value.encode(encoding) for value in (str(REPO),str(work),'/opt/homebrew/')
+                   for encoding in ('utf-8','utf-16-le')]
+    for p in [* (dest/'bin').rglob('*'), * (dest/'lib').rglob('*')]:
+        if p.is_file() and not p.is_symlink():
+            data=p.read_bytes()
+            if any(value in data for value in private_paths):
+                raise ValueError('Development path remains in payload: '+str(p.relative_to(dest)))
+            for encoding in ('utf-8','utf-16-le'):
+                needle='/Users/'.encode(encoding)
+                upstream='/Users/runner/work/llvm-mingw/'.encode(encoding)
+                start=0
+                while (start:=data.find(needle,start))>=0:
+                    # Public CI path in the pinned LLVM-MinGW libc++ ABI
+                    # library, not this project's developer/account data.
+                    if not data.startswith(upstream,start):
+                        raise ValueError('Unrecognized home path in payload: '+str(p.relative_to(dest)))
+                    start+=len(needle)
+    entitlements=work/'wine-entitlements.plist'
+    entitlements.write_bytes(plistlib.dumps({name:True for name in [
+        'com.apple.security.cs.allow-jit','com.apple.security.cs.allow-unsigned-executable-memory',
+        'com.apple.security.cs.disable-executable-page-protection','com.apple.security.cs.disable-library-validation',
+        # 1.3: without it the hardened runtime gives the game silence for the microphone, with no prompt.
+        'com.apple.security.device.audio-input']}))
+    # Apple's timestamp server is for Developer ID releases; ad-hoc and self-signed
+    # identities (a local certificate, so firewalls like Little Snitch keep their rules) skip it.
+    timestamp=['--timestamp'] if identity.startswith('Developer ID') else []
+    for index,p in enumerate(sorted(native)):
+        args=['codesign','--force','--options','runtime',*timestamp,'--sign',identity]
+        if p.name in ('wine','wineserver'):args+=['--entitlements',entitlements]
+        run(*args,p,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+        run('codesign','--verify','--strict',p,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+        if index%10==0:print('Signed native components:',index+1,'of',len(native),flush=True)
+    # Apple's D3DMetal replaces Wine's own Direct3D modules (as CrossOver's apple_gptk
+    # folder does at run time); added last, so nothing above strips or re-signs it.
+    redist=gptk/'redist/lib'
+    shutil.copytree(redist,dest/'lib',symlinks=True,dirs_exist_ok=True)
+    for p in redist.rglob('*'):
+        target=dest/'lib'/p.relative_to(redist)
+        if p.is_symlink():
+            if os.readlink(target)!=os.readlink(p):raise ValueError('Apple link changed: '+str(target))
+        elif p.is_file() and sha(target)!=sha(p):raise ValueError('Apple component must remain unmodified: '+str(target))
+    # The MacFinals d3d12 layer in front of Apple's d3d12 (skin-curve fix,
+    # tests/rosetta_nt/R15_SKIN_CURVE.md). Wine resolves builtin modules by the PE's
+    # internal export name, and Apple's d3d12.dll says "d3d12.dll", so any copy of it
+    # that the prefix can open funnels to whichever builtin holds that name. The layer
+    # takes the name; Apple's module moves outside the arch dir (bare lib/wine), where
+    # only Wine's builtin search finds it and prefix bootstrap never copies it over
+    # the placeholder that reserves the d3d12_gptk name in system32:
+    #   lib/wine/x86_64-windows/d3d12.dll       the layer, rewrites unsafe DXIL
+    #   lib/wine/x86_64-windows/d3d12_gptk.dll  placeholder (Wine fake, no exports)
+    #   lib/wine/d3d12_gptk.dll                 Apple's d3d12.dll, unchanged
+    #   lib/wine/d3d12_gptk.so                  -> ../external/libd3dshared.dylib
+    # --no-debug-msgs compiles the layer's trace/warn/fixme out, as Wine's release switches do
+    layer_env=dict(os.environ,DEBUG_CFLAGS='' if debug_msgs else '-DWINE_NO_TRACE_MSGS -DWINE_NO_DEBUG_MSGS')
+    run(ROOT/'d3d12_layer/build.sh',work/'d3d12-layer',work/'wine-build/tools/winebuild/winebuild',env=layer_env)
+    apple_d3d12=dest/'lib/wine/x86_64-windows/d3d12.dll'
+    copy(apple_d3d12,dest/'lib/wine/d3d12_gptk.dll')
+    if sha(dest/'lib/wine/d3d12_gptk.dll')!=sha(redist/'wine/x86_64-windows/d3d12.dll'):
+        raise ValueError('Apple d3d12 copy changed')
+    copy(work/'d3d12-layer/d3d12.dll',apple_d3d12)
+    copy(work/'d3d12-layer/d3d12_gptk.dll',dest/'lib/wine/x86_64-windows/d3d12_gptk.dll')
+    (dest/'lib/wine/d3d12_gptk.so').symlink_to('../external/libd3dshared.dylib')
+    for p in (dest/'lib/wine/d3d12_gptk.dll',dest/'lib/wine/x86_64-windows/d3d12.dll',
+              dest/'lib/wine/x86_64-windows/d3d12_gptk.dll'):
+        data=p.read_bytes()
+        if any(value in data for value in private_paths):raise ValueError('Development path remains in payload: '+str(p.relative_to(dest)))
+    # 1.1: the game app for macOS Game Mode, a copy of the signed loader (scripts/game_mode_app.py).
+    game_mode_app.make(dest,'26.0',identity)
+    files={}
+    for p in sorted(dest.rglob('*')):
+        if p.is_symlink():
+            if not p.resolve().is_relative_to(dest.resolve()):raise ValueError('Runtime symlink escapes payload')
+            files[str(p.relative_to(dest))]={'symlink':os.readlink(p)}
+        elif p.is_file():files[str(p.relative_to(dest))]={'sha256':sha(p),'bytes':p.stat().st_size}
+    manifest={'schema':1,'version':version,'minimum_macos':'26.0','files':files,
+              'graphics_backend':'d3dmetal','gptk_version':gptk_version,
+              'd3d12_layer':{'apple_original':'lib/wine/d3d12_gptk.dll',
+                             'replaces':'lib/wine/x86_64-windows/d3d12.dll'},
+              'source_builds':{n:json.loads((work/n).read_text()) for n in SOURCE_BUILDS},
+              'native_dependency_inputs':chosen,'apple_component_unmodified':True,
+              'development_path_scan_passed':True,
+              'wine_mono_corresponding_source_sha256':MONO_SOURCE_SHA,
+              'status':'macfinals_development; release review and QA still required'}
+    (dest/'runtime.json').write_text(json.dumps(manifest,indent=2)+'\n')
+    archive=Path(str(dest)+'.tar.gz')
+    with tarfile.open(archive,'w:gz',compresslevel=3) as tar:
+        for p in sorted(dest.rglob('*')):tar.add(p,arcname=str(p.relative_to(dest)),recursive=False)
+    proof={'version':version,'archive_sha256':sha(archive),'archive_bytes':archive.stat().st_size,
+           'unpacked_file_bytes':sum(v.get('bytes',0) for v in files.values()),'files':len(files),
+           'signed_native_components':len(native),'dependency_names':sorted(chosen),
+           'layer_debug_messages':debug_msgs}
+    archive.with_suffix('.json').write_text(json.dumps(proof,indent=2)+'\n')
+    print(json.dumps(proof,indent=2))
+
+
+if __name__=='__main__':
+    p=argparse.ArgumentParser(description=__doc__);p.add_argument('--workspace',type=Path,required=True)
+    p.add_argument('--version',required=True);p.add_argument('--identity',required=True,help="'-' signs ad hoc")
+    p.add_argument('--gptk',type=Path,default=REPO/'gptk/gptk',help='Folder holding Apple\'s redist/ and its documents')
+    p.add_argument('--no-debug-msgs',action='store_true',
+                   help='Compile the d3d12 layer\'s trace/warn/fixme out (WINE_NO_TRACE_MSGS, WINE_NO_DEBUG_MSGS)')
+    a=p.parse_args();assemble(a.workspace.resolve(),a.version,a.identity,a.gptk.resolve(),debug_msgs=not a.no_debug_msgs)

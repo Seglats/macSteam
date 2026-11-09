@@ -1,0 +1,17 @@
+--- a/dlls/ntdll/unix/signal_x86_64.c
++++ b/dlls/ntdll/unix/signal_x86_64.c
+@@ -3116,6 +3116,14 @@
+     ptr = (char *)user_shared_data + page_size;
+     anon_mmap_fixed( ptr, page_size, PROT_READ | PROT_WRITE, 0 );
+     *(void **)ptr = __wine_syscall_dispatcher;
++    /* MacFinals: publish the prolog-end entry too (7ffe1008) — the resume point the
++     * SIGSYS redirect uses, so an in-process fast path under Rosetta can send a direct
++     * `syscall` straight into the dispatcher without the exception round trip. One
++     * extra pointer store on a page already mapped here; unused on Linux. */
++    {
++        extern const void *__wine_syscall_dispatcher_prolog_end_ptr;
++        *(void **)((char *)ptr + 8) = __wine_syscall_dispatcher_prolog_end_ptr;
++    }
+ 
+     xstate_extended_features = user_shared_data->XState.EnabledFeatures & ~(UINT64)3;
+ 

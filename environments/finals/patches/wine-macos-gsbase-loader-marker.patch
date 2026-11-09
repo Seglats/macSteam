@@ -1,0 +1,80 @@
+--- a/dlls/ntdll/unix/signal_x86_64.c
++++ b/dlls/ntdll/unix/signal_x86_64.c
+@@ -920,7 +920,6 @@
+  * behaviour of never switching.
+  */
+ int mac_gsbase_switching;
+-#define MAC_GSBASE_TEB_MAGIC ((void *)(ULONG_PTR)0x47425357)  /* "GSBW" */
+ 
+ static void mac_set_gsbase( void *base )
+ {
+@@ -3162,11 +3161,10 @@
+        thread's gsbase.  Have each thread record its gsbase pointer into its
+        TEB so alloc_tls_slot() can find it. */
+     teb->Instrumentation[0] = thread_data->pthread_teb;
+-    /* Mark the thread for loader.c: with the GS base switching above, Windows
+-     * code reaches the TEB itself through %gs and CW HACK 18756 (TlsExpansionSlots
+-     * preallocation plus the TlsBitmap burn) must not run. */
+-    if (mac_gsbase_switching)
+-        teb->Instrumentation[1] = MAC_GSBASE_TEB_MAGIC;
++    /* With the GS base switching above, Windows code reaches the TEB itself
++     * through %gs; loader.c learns so from LdrSystemDllInitBlock, filled by
++     * the Unix loader from mac_gsbase_switching.  Instrumentation[1] is not
++     * free: with D3D12 loaded something dereferences it (+0x18). */
+ #else
+ # error Please define setting %gs for your architecture
+ #endif
+--- a/dlls/ntdll/unix/loader.c
++++ b/dlls/ntdll/unix/loader.c
+@@ -2233,6 +2233,12 @@
+     if (size) *size = data->Size;
+     return get_rva( module, data->VirtualAddress );
+ }
++
++#if defined(__x86_64__) && defined(__APPLE__)
++/* unix/signal_x86_64.c: set when the GS base switches between the TEB and
++ * macOS thread data at every Windows/Unix transition. */
++extern int mac_gsbase_switching;
++#endif
+ 
+ /***********************************************************************
+  *           load_ntdll_functions
+@@ -2278,6 +2284,11 @@
+         *p__wine_unix_call_dispatcher_arm64ec = __wine_unix_call_dispatcher;
+     }
+     else *p__wine_unix_call_dispatcher = __wine_unix_call_dispatcher;
++#if defined(__x86_64__) && defined(__APPLE__)
++    /* signal_init_process() has already run, so this reflects the final
++     * state of mac_gsbase_switching; loader.c skips CW HACK 18756 for it. */
++    pLdrSystemDllInitBlock->mac_gsbase_teb = mac_gsbase_switching;
++#endif
+ #undef GET_FUNC
+ }
+ 
+--- a/dlls/ntdll/loader.c
++++ b/dlls/ntdll/loader.c
+@@ -5188,10 +5188,11 @@
+         /* When the real GS base sits on the TEB while Windows code runs
+          * (unix/signal_x86_64.c), gs-relative TLS accesses see the TEB itself,
+          * so neither the TlsExpansionSlots preallocation nor the TlsBitmap burn
+-         * is needed.  init_syscall_frame() marks such threads in
+-         * Instrumentation[1]; unmarked threads keep the old behaviour. */
++         * is needed.  The Unix loader reports it in
++         * LdrSystemDllInitBlock.mac_gsbase_teb; unmarked builds keep the old
++         * behaviour. */
+         if (is_macos() && !NtCurrentTeb()->WowTebOffset
+-            && NtCurrentTeb()->Instrumentation[1] != (void *)(ULONG_PTR)0x47425357)
++            && !LdrSystemDllInitBlock.mac_gsbase_teb)
+         {
+             /* CW HACK 18756 */
+             /* Preallocate TlsExpansionSlots.  Otherwise, kernelbase will
+--- a/include/winternl.h
++++ b/include/winternl.h
+@@ -4434,6 +4434,7 @@
+     ULONG64 ntdll_handle;
+     ULONG64 pLdrSystemDllInitBlock;
+     ULONG64 pRtlpFreezeTimeBias;
++    ULONG64 mac_gsbase_teb;   /* Wine-specific: Windows code runs with the GS base on the TEB */
+ } SYSTEM_DLL_INIT_BLOCK;
+ #endif
+ 

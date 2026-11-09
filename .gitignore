@@ -17,3 +17,13 @@
 **/*.p8
 **/*.p12
 **/*.mobileprovision
+# Game Porting Toolkit images and the extracted toolkit (local only; environments/finals)
+/gptk/
+# environments/finals: Rosetta NT build outputs (sources are tracked; hooklib.dylib is a
+# build input for add_nt_hook.py and stays tracked) and game run logs
+/environments/finals/tests/rosetta_nt/*.o
+/environments/finals/tests/rosetta_nt/exectest
+/environments/finals/tests/rosetta_nt/ntstub
+/environments/finals/tests/rosetta_nt/host_payload_test
+/environments/finals/tests/rosetta_nt/payload.dylib
+/environments/finals/tests/finals_bisect/logs/

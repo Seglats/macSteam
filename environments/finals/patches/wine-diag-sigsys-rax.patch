@@ -1,0 +1,99 @@
+--- a/dlls/ntdll/unix/loader.c
++++ b/dlls/ntdll/unix/loader.c
+@@ -860,6 +860,7 @@
+     "sigsys", "tryfixed-fail"
+ };
+ LONG64 wine_diag_sigsys[2][4096];
++struct wine_diag_rax wine_diag_sigsys_rax[64];
+ 
+ static UINT64 syscall_log_now_ns(void)
+ {
+@@ -981,6 +982,7 @@
+     static LONG64 last_count[SYSCALL_LOG_TABLES][4096], last_time[SYSCALL_LOG_TABLES][4096];
+     static LONG64 last_diag[DIAG_COUNTERS];
+     static LONG64 last_sigsys[2][4096];
++    static LONG64 last_rax_count[64];
+     UINT64 last_bsd = 0, last_mach = 0, last_faults = 0, last_csw = 0, last_pageins = 0;
+     char name[32], line[4096];
+ 
+@@ -1088,12 +1090,39 @@
+                     if (c != last_sigsys[idx][num]) syscall_log_top( direct, 4, idx, num, c - last_sigsys[idx][num] );
+                     last_sigsys[idx][num] = c;
+                 }
++            {
++                struct { ULONG64 rax; LONG64 value; } raw[4] = {{0}};
++                int j, k;
++
++                for (j = 0; j < 64; j++)
++                {
++                    ULONG64 rax = __atomic_load_n( &wine_diag_sigsys_rax[j].rax, __ATOMIC_RELAXED );
++                    LONG64 c = __atomic_load_n( &wine_diag_sigsys_rax[j].count, __ATOMIC_RELAXED );
++                    LONG64 dc = c - last_rax_count[j];
++
++                    last_rax_count[j] = c;
++                    if (!rax || dc <= 0) continue;
++                    for (k = 0; k < 4 && raw[k].value >= dc; k++);
++                    if (k == 4) continue;
++                    memmove( &raw[k + 1], &raw[k], (3 - k) * sizeof(raw[0]) );
++                    raw[k].rax = rax - 1; raw[k].value = dc;
++                }
++                if (raw[0].value)
++                {
++                    syscall_log_append( line, sizeof(line), &pos, " | sigsys-rax:" );
++                    for (k = 0; k < 4 && raw[k].value; k++)
++                        syscall_log_append( line, sizeof(line), &pos, " %#llx=%lld",
++                                            (unsigned long long)raw[k].rax, (long long)raw[k].value );
++                }
++            }
+             if (direct[0].value)
+             {
+                 syscall_log_append( line, sizeof(line), &pos, " | sigsys:" );
+                 for (i = 0; i < 4 && direct[i].value; i++)
+                     syscall_log_append( line, sizeof(line), &pos, " %s=%lld",
+-                                        syscall_log_name( direct[i].idx, direct[i].num, name, sizeof(name) ),
++                                        direct[i].num < KeServiceDescriptorTable[direct[i].idx].ServiceLimit ?
++                                        syscall_log_name( direct[i].idx, direct[i].num, name, sizeof(name) ) :
++                                        (snprintf( name, sizeof(name), "invalid-%u:%03x", direct[i].idx, direct[i].num ), name),
+                                         (long long)direct[i].value );
+             }
+         }
+--- a/dlls/ntdll/unix/signal_x86_64.c
++++ b/dlls/ntdll/unix/signal_x86_64.c
+@@ -2945,6 +2945,7 @@
+     if (wine_diag_enabled)
+         __atomic_fetch_add( &wine_diag_sigsys[(RAX_sig(ucontext) >> 12) & 1][RAX_sig(ucontext) & 0xfff], 1,
+                             __ATOMIC_RELAXED );
++    wine_diag_count_rax( RAX_sig(ucontext) );
+ 
+     frame->rip = RIP_sig(ucontext) + 0xb;
+     frame->rcx = RIP_sig(ucontext);
+--- a/dlls/ntdll/unix/unix_private.h
++++ b/dlls/ntdll/unix/unix_private.h
+@@ -349,6 +349,27 @@
+ extern LONG64 wine_diag_counts[DIAG_COUNTERS];
+ /* direct `syscall` instructions from Windows code (SIGSYS), by service table and number */
+ extern LONG64 wine_diag_sigsys[2][4096];
++/* the same by full rax, for numbers outside the service tables (open addressing, 64 slots) */
++struct wine_diag_rax { ULONG64 rax; LONG64 count; };
++extern struct wine_diag_rax wine_diag_sigsys_rax[64];
++static inline void wine_diag_count_rax( ULONG64 rax )
++{
++    unsigned int i, slot = (unsigned int)((rax * 0x9e3779b97f4a7c15ull) >> 58);
++
++    if (!wine_diag_enabled) return;
++    for (i = 0; i < 64; i++, slot = (slot + 1) % 64)
++    {
++        ULONG64 seen = __atomic_load_n( &wine_diag_sigsys_rax[slot].rax, __ATOMIC_RELAXED );
++        if (seen == rax + 1 ||
++            (!seen && __atomic_compare_exchange_n( &wine_diag_sigsys_rax[slot].rax, &seen, rax + 1, 0,
++                                                   __ATOMIC_RELAXED, __ATOMIC_RELAXED )) ||
++            seen == rax + 1)
++        {
++            __atomic_fetch_add( &wine_diag_sigsys_rax[slot].count, 1, __ATOMIC_RELAXED );
++            return;
++        }
++    }
++}
+ extern struct wine_diag_lock_stats wine_diag_vm_lock;
+ extern UINT64 wine_diag_now_ns(void);
+ 

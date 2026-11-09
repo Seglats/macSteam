@@ -1,0 +1,222 @@
+--- a/dlls/ntdll/unix/signal_x86_64.c
++++ b/dlls/ntdll/unix/signal_x86_64.c
+@@ -903,6 +903,38 @@
+                    "ret" )
+ 
+ 
++#ifdef __APPLE__
++/**********************************************************************
++ *		mac_gsbase_switching / mac_set_gsbase / mac_current_teb
++ *
++ * Keep the real GS base on the Windows TEB while Windows code runs, and on
++ * macOS's own thread data while Unix code runs, like Wine does on Linux with
++ * arch_prctl(2).  mac_set_gsbase() uses the machdep trap pthread itself uses
++ * (thread_fast_set_cthread_self64); like any syscall it only clobbers
++ * %rax/%rcx/%r11.  mac_current_teb() reads the TEB self-pointer through %gs,
++ * which yields the TEB whichever base is live, because the field is mirrored
++ * into the macOS thread data at thread start (init_syscall_frame).
++ * NtCurrentTeb() must not be used for that: it is pthread_getspecific() and
++ * needs the macOS base.  Cleared unless running under Rosetta (set
++ * MACFINALS_NO_GS_TEB to disable), so unsupported setups keep the old
++ * behaviour of never switching.
++ */
++int mac_gsbase_switching;
++#define MAC_GSBASE_TEB_MAGIC ((void *)(ULONG_PTR)0x47425357)  /* "GSBW" */
++
++static void mac_set_gsbase( void *base )
++{
++    __asm__ volatile ( "syscall" : : "a" (0x3000003L), "D" (base) : "rcx", "r11", "memory" );
++}
++
++static inline TEB *mac_current_teb(void)
++{
++    TEB *teb;
++    __asm__ volatile ( "movq %%gs:0x30,%0" : "=r" (teb) );
++    return teb;
++}
++#endif
++
+ /***********************************************************************
+  *           init_handler
+  */
+@@ -916,6 +948,14 @@
+         arch_prctl( ARCH_SET_FS, ((struct amd64_thread_data *)thread_data->cpu_data)->pthread_teb );
+     }
+ #elif defined __APPLE__
++    /* The signal may have hit Windows code, where the GS base is the TEB.  The
++     * handler itself is Unix code and needs macOS thread data (pthread self,
++     * errno, TSD), so put the base back before anything else runs. */
++    if (mac_gsbase_switching)
++    {
++        TEB *teb = mac_current_teb();
++        mac_set_gsbase( ((struct amd64_thread_data *)&teb->GdiTebBatch)->pthread_teb );
++    }
+     /* When in a syscall, CS will be the kernel's selector (0x07, SYSCALL_CS in xnu source)
+      * instead of the user selector (cs64_sel: 0x2b, USER64_CS).
+      * Fix up sigcontext so later code can compare it to cs64_sel.
+@@ -940,6 +980,21 @@
+         !is_inside_syscall( RSP_sig(sigcontext) ))
+         __asm__ volatile( "movw %0,%%fs" :: "r" (fs32_sel) );
+ #endif
++#ifdef __APPLE__
++    /* Give the resumed code the base it runs with: Windows code has the GS
++     * base on the TEB, Unix code (on the kernel or the signal stack) on macOS
++     * thread data.  The test is computed before switching: it goes through
++     * NtCurrentTeb(), which needs the macOS base still in place. */
++    if (mac_gsbase_switching)
++    {
++        TEB *teb = mac_current_teb();
++        if (is_inside_signal_stack( (void *)RSP_sig(sigcontext) ) ||
++            is_inside_syscall( RSP_sig(sigcontext) ))
++            mac_set_gsbase( ((struct amd64_thread_data *)&teb->GdiTebBatch)->pthread_teb );
++        else
++            mac_set_gsbase( teb );
++    }
++#endif
+     if (is_16bit( sigcontext )) return;
+ #ifdef DS_sig
+     DS_sig(sigcontext) = ds64_sel;
+@@ -1817,6 +1872,18 @@
+                    "testw %ax,%ax\n\t"
+                    "jz 1f\n\t"
+                    "movw %ax,%fs\n"
++                   "1:\n\t"
++#endif
++#ifdef __APPLE__
++                   /* Into Windows code: GS base on the TEB (%r13 still holds it).
++                    * %rcx holds the callback, which the trap clobbers, so save it. */
++                   "cmpb $0, " __ASM_NAME("mac_gsbase_switching") "(%rip)\n\t"
++                   "je 1f\n\t"
++                   "pushq %rcx\n\t"
++                   "movq %r13,%rdi\n\t"
++                   "movl $0x3000003,%eax\n\t"  /* thread_fast_set_cthread_self64 */
++                   "syscall\n\t"
++                   "popq %rcx\n"
+                    "1:\n\t"
+ #endif
+                    "movq 0x330(%r13),%r10\n\t" /* amd64_thread_data()->instrumentation_callback */
+@@ -3020,6 +3087,14 @@
+     /* CW Hack 23427: __builtin_available presumably isn't signal-safe. */
+     if (__builtin_available( macOS 15.0, * ))
+         sequoia_or_later = TRUE;
++
++    /* Real GS-base switching between the TEB (Windows code) and macOS thread
++     * data (Unix code).  Rosetta-only: the machdep trap's behaviour is only
++     * known good under Rosetta, so fail closed on real Intel hardware.
++     * Set MACFINALS_NO_GS_TEB to disable. */
++    mac_gsbase_switching = is_rosetta2 && !getenv( "MACFINALS_NO_GS_TEB" );
++    if (mac_gsbase_switching)
++        TRACE( "mac GS-base switching between TEB and pthread data enabled\n" );
+ #endif
+ 
+     sig_act.sa_mask = server_block_set;
+@@ -3087,6 +3162,11 @@
+        thread's gsbase.  Have each thread record its gsbase pointer into its
+        TEB so alloc_tls_slot() can find it. */
+     teb->Instrumentation[0] = thread_data->pthread_teb;
++    /* Mark the thread for loader.c: with the GS base switching above, Windows
++     * code reaches the TEB itself through %gs and CW HACK 18756 (TlsExpansionSlots
++     * preallocation plus the TlsBitmap burn) must not run. */
++    if (mac_gsbase_switching)
++        teb->Instrumentation[1] = MAC_GSBASE_TEB_MAGIC;
+ #else
+ # error Please define setting %gs for your architecture
+ #endif
+@@ -3302,6 +3382,18 @@
+                    "leaq -0x98(%rbp),%rcx\n"
+                    "2:\n\t"
+ #endif
++#ifdef __APPLE__
++                   /* The Windows code above ran with the GS base on the TEB; the
++                    * Unix code below needs it on macOS thread data.  Like the Linux
++                    * path, %rcx is rebuilt from %rbp afterwards. */
++                   "cmpb $0, " __ASM_NAME("mac_gsbase_switching") "(%rip)\n\t"
++                   "je 1f\n\t"
++                   "movq 0x320(%r13),%rdi\n\t"     /* amd64_thread_data()->pthread_teb */
++                   "movl $0x3000003,%eax\n\t"      /* thread_fast_set_cthread_self64 */
++                   "syscall\n\t"
++                   "leaq -0x98(%rbp),%rcx\n"
++                   "1:\n\t"
++#endif
+                    "ldmxcsr 0x33c(%r13)\n\t"       /* amd64_thread_data()->mxcsr */
+                    "movl 0xb0(%rcx),%eax\n\t"      /* frame->syscall_id */
+                    "movq 0x18(%rcx),%r11\n\t"      /* 2nd argument */
+@@ -3337,6 +3429,22 @@
+                    "callq *%r12\n\t"
+                    "leaq -0x98(%rbp),%rcx\n\t"
+                    __ASM_LOCAL_LABEL("__wine_syscall_dispatcher_return") ":\n\t"
++#ifdef __APPLE__
++                   /* Back to Windows code: GS base on the TEB.  %gs:0x30 yields
++                    * the TEB whichever base is live (mirrored at thread start).
++                    * %rax holds the syscall's return value and %rcx the frame;
++                    * both are clobbered by the trap, so save them. */
++                   "cmpb $0, " __ASM_NAME("mac_gsbase_switching") "(%rip)\n\t"
++                   "je 1f\n\t"
++                   "pushq %rax\n\t"
++                   "pushq %rcx\n\t"
++                   "movq %gs:0x30,%rdi\n\t"
++                   "movl $0x3000003,%eax\n\t"      /* thread_fast_set_cthread_self64 */
++                   "syscall\n\t"
++                   "popq %rcx\n\t"
++                   "popq %rax\n"
++                   "1:\n\t"
++#endif
+                    /* push rbp-based kernel stack cfi */
+                    __ASM_CFI(".cfi_remember_state\n\t")
+                    __ASM_CFI_CFA_IS_AT2(rcx, 0xa8, 0x01) /* frame->syscall_cfa */
+@@ -3589,6 +3697,16 @@
+                    "mov $158,%eax\n\t"             /* SYS_arch_prctl */
+                    "syscall\n\t"
+                    "2:\n\t"
++#endif
++#ifdef __APPLE__
++                   /* Into Unix code: GS base back on macOS thread data.  %rcx is
++                    * dead here, it is rebuilt from %rsp after the call. */
++                   "cmpb $0, " __ASM_NAME("mac_gsbase_switching") "(%rip)\n\t"
++                   "je 1f\n\t"
++                   "movq 0x320(%r13),%rdi\n\t"     /* amd64_thread_data()->pthread_teb */
++                   "movl $0x3000003,%eax\n\t"      /* thread_fast_set_cthread_self64 */
++                   "syscall\n\t"
++                   "1:\n\t"
+ #endif
+                    "ldmxcsr 0x33c(%r13)\n\t"       /* amd64_thread_data()->mxcsr */
+                    "movq %r8,%rdi\n\t"             /* args */
+@@ -3607,6 +3725,21 @@
+                    "movdqa 0x250(%rcx),%xmm15\n\t"
+                    "testl $0xffff,0xb4(%rcx)\n\t"  /* frame->restore_flags */
+                    "jnz " __ASM_LOCAL_LABEL("__wine_syscall_dispatcher_return") "\n\t"
++#ifdef __APPLE__
++                   /* Back to Windows code: GS base on the TEB.  %r13 still holds
++                    * the TEB here; %rax is the call's return value, %rcx the
++                    * frame, both clobbered by the trap. */
++                   "cmpb $0, " __ASM_NAME("mac_gsbase_switching") "(%rip)\n\t"
++                   "je 1f\n\t"
++                   "pushq %rax\n\t"
++                   "pushq %rcx\n\t"
++                   "movq %r13,%rdi\n\t"
++                   "movl $0x3000003,%eax\n\t"      /* thread_fast_set_cthread_self64 */
++                   "syscall\n\t"
++                   "popq %rcx\n\t"
++                   "popq %rax\n"
++                   "1:\n\t"
++#endif
+                    /* switch to user stack */
+                    "movq 0x88(%rcx),%rsp\n\t"
+                    __ASM_CFI(".cfi_restore_state\n\t")
+--- a/dlls/ntdll/loader.c
++++ b/dlls/ntdll/loader.c
+@@ -5185,7 +5185,13 @@
+     }
+ 
+ #if defined(__x86_64__) && !defined(__arm64ec__)
+-        if (is_macos() && !NtCurrentTeb()->WowTebOffset)
++        /* When the real GS base sits on the TEB while Windows code runs
++         * (unix/signal_x86_64.c), gs-relative TLS accesses see the TEB itself,
++         * so neither the TlsExpansionSlots preallocation nor the TlsBitmap burn
++         * is needed.  init_syscall_frame() marks such threads in
++         * Instrumentation[1]; unmarked threads keep the old behaviour. */
++        if (is_macos() && !NtCurrentTeb()->WowTebOffset
++            && NtCurrentTeb()->Instrumentation[1] != (void *)(ULONG_PTR)0x47425357)
+         {
+             /* CW HACK 18756 */
+             /* Preallocate TlsExpansionSlots.  Otherwise, kernelbase will

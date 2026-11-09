@@ -1,0 +1,70 @@
+--- a/dlls/ntdll/unix/virtual.c
++++ b/dlls/ntdll/unix/virtual.c
+@@ -690,7 +690,8 @@
+     }
+     else
+     {
+-        errno = (ret == KERN_NO_SPACE ? EEXIST : ENOMEM);
++        /* above the top of the host address space is taken too, not out of memory */
++        errno = (ret == KERN_NO_SPACE || ret == KERN_INVALID_ADDRESS ? EEXIST : ENOMEM);
+         ptr = MAP_FAILED;
+     }
+ #else
+@@ -1623,7 +1624,40 @@
+     *base_ptr = base;
+     *end_ptr = end;
+     return first;
++}
++
++
++#ifdef __APPLE__
++/***********************************************************************
++ *           mac_skip_host_mapping
++ *
++ * A free area collided with a host mapping that Wine has no view for.  Return the next
++ * candidate past that mapping, the same one stepping would reach one kernel call at a time,
++ * or NULL if there is no mapping to skip.  The caller still maps without overwriting.
++ */
++static void *mac_skip_host_mapping( void *start, size_t size, ptrdiff_t step )
++{
++    mach_vm_address_t addr = (mach_vm_address_t)start, next;
++    mach_vm_size_t region_size = 0;
++    vm_region_basic_info_data_64_t info;
++    mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
++    mach_port_t object = MACH_PORT_NULL;
++
++    if (!step) return NULL;
++    if (mach_vm_region( mach_task_self(), &addr, &region_size, VM_REGION_BASIC_INFO_64,
++                        (vm_region_info_t)&info, &count, &object ))
++        return NULL;
++    if (addr >= (mach_vm_address_t)start + size) return NULL;
++    if (step > 0)
++    {
++        next = (addr + region_size + step - 1) & ~(mach_vm_address_t)(step - 1);
++        return next > (mach_vm_address_t)start ? (void *)next : NULL;
++    }
++    if (addr < size) return NULL;
++    next = (addr - size) & ~(mach_vm_address_t)(-step - 1);
++    return next < (mach_vm_address_t)start ? (void *)next : NULL;
+ }
++#endif
+ 
+ 
+ /***********************************************************************
+@@ -1645,6 +1679,16 @@
+                  strerror(errno), start, (char *)start + size, unix_prot );
+             return NULL;
+         }
++#ifdef __APPLE__
++        {
++            void *next = mac_skip_host_mapping( start, size, step );
++            if (next)
++            {
++                start = next;
++                continue;
++            }
++        }
++#endif
+         if ((step > 0 && (char *)end - (char *)start < step) ||
+             (step < 0 && (char *)start - (char *)base < -step) ||
+             step == 0)

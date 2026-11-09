@@ -5,7 +5,7 @@ Private preview embeds the exact qualified Phase 2 archive. No account, game,
 cache, or installed prefix is copied. Uses the tracked owner artwork by default; --icon accepts an ICNS override.
 The bundle is named Recall; its identifier and data folder keep their original values.
 """
-import argparse
+import argparse,tarfile
 import hashlib
 import json
 from pathlib import Path
@@ -67,7 +67,28 @@ def notproton_profiles(profile):
         out[name]=f'# MacVolvo renderer profile for {exe} (MacVolvo DXMT), from MacVolvo\'s runtime.\n[{exe}]'+'\n'.join(game).rstrip()+'\n'
     return out
 
-def build(output,workspace,runtime_archive,icon=None,identity=None,variant='dxmt'):
+# Games with a Wine of their own (environments/<name>): each ships as a Steam Play compatibility
+# tool the app installs into Steam's compatibilitytools.d (app/Sources/GameTools.swift). The
+# runtime archive comes from that environment's own build (--game-tool NAME=ARCHIVE).
+GAME_TOOLS={'finals':{'id':'notproton-steamdriver-finals','game':'THE FINALS','display':'SteamDriver: THE FINALS',
+                      'source':ROOT/'environments/finals/compat-tool','required':('bin/wine','lib/macfinals-nt-hook.dylib')}}
+def bundle_game_tool(resources,name,archive):
+    tool=GAME_TOOLS[name]
+    with tarfile.open(archive) as t:
+        names=set(t.getnames())
+        manifest=json.load(t.extractfile('runtime.json'))
+    missing=[r for r in tool['required'] if r not in names]
+    if missing:raise ValueError(f'{archive} lacks {missing} for the {name} tool')
+    vdf=(tool['source']/'compatibilitytool.vdf').read_text()
+    if f'"{tool["id"]}"' not in vdf or f'"display_name" "{tool["display"]}"' not in vdf:raise ValueError(f'{name}: compatibilitytool.vdf does not match GAME_TOOLS')
+    dest=resources/'GameTools'/tool['id'];dest.mkdir(parents=True)
+    for f in ('run','compatibilitytool.vdf','toolmanifest.vdf'):shutil.copy2(tool['source']/f,dest/f)
+    run('/bin/cp','-c',archive,dest/'runtime.tar.gz')
+    record={'id':tool['id'],'game':tool['game'],'display':tool['display'],'runtime':manifest['version'],'runtime_sha256':sha(archive)}
+    (dest/'tool.json').write_text(json.dumps(record,indent=2)+'\n')
+    return record
+
+def build(output,workspace,runtime_archive,icon=None,identity=None,variant='dxmt',game_tools=()):
     if variant not in ('dxmt','gptk4'):raise ValueError('Unknown app variant')
     evaluation=variant=='gptk4'
     app_name='MacVolvo GPTK4' if evaluation else APP_NAME
@@ -120,6 +141,7 @@ def build(output,workspace,runtime_archive,icon=None,identity=None,variant='dxmt
             (notproton/'profiles').mkdir()
             for name,text in notproton_profiles((Path(folder)/NOTPROTON_PROFILE).read_text()).items():
                 (notproton/'profiles'/name).write_text(text)
+    tools=[bundle_game_tool(resources,name,archive) for name,archive in game_tools]
     # Notices from the actual reviewed runtime; kept readable without extraction.
     with tempfile.TemporaryDirectory() as folder:
         run('/usr/bin/tar','-xzf',runtime_archive,'-C',folder,'licenses')
@@ -146,9 +168,16 @@ def build(output,workspace,runtime_archive,icon=None,identity=None,variant='dxmt
             entitlements=Path(folder)/'app.entitlements';entitlements.write_bytes(plistlib.dumps(ENTITLEMENTS))
             run('/usr/bin/codesign','--force','--options','runtime',*timestamp,'--entitlements',entitlements,'--sign',identity,output)
         run('/usr/bin/codesign','--verify','--deep','--strict',output)
-    proof={'app_version':release['appVersion'],'app_build':APP_BUILD,'variant':variant,'bundle_identifier':bundle_id,'candidate_contract_sha256':sha(resources/'candidate-parity-contract.json'),'runtime_sha256':sha(resources/release['runtimeArchive']),'source_files':{str(p.relative_to(ROOT)):sha(p) for p in sorted((ROOT/'app').rglob('*')) if p.is_file()},'signed':bool(identity and identity!='-'),'signature_type':'ad-hoc' if identity=='-' else ('Developer ID' if identity else 'none'),'files':{str(p.relative_to(output)):sha(p) for p in output.rglob('*') if p.is_file()}}
+    proof={'app_version':release['appVersion'],'app_build':APP_BUILD,'variant':variant,'bundle_identifier':bundle_id,'candidate_contract_sha256':sha(resources/'candidate-parity-contract.json'),'runtime_sha256':sha(resources/release['runtimeArchive']),'source_files':{str(p.relative_to(ROOT)):sha(p) for p in sorted((ROOT/'app').rglob('*')) if p.is_file()},'signed':bool(identity and identity!='-'),'signature_type':'ad-hoc' if identity=='-' else ('Developer ID' if identity else 'none'),'game_tools':tools,'files':{str(p.relative_to(output)):sha(p) for p in output.rglob('*') if p.is_file()}}
     output.with_suffix('.build.json').write_text(json.dumps(proof,indent=2)+'\n')
 if __name__=='__main__':
     p=argparse.ArgumentParser(description=__doc__);p.add_argument('--output',type=Path,required=True);p.add_argument('--workspace',type=Path,default=ROOT/'runtime');p.add_argument('--runtime-archive',type=Path,default=ROOT/'runtime/downloads/runtime.tar.gz');p.add_argument('--icon',type=Path);p.add_argument('--identity')
     p.add_argument('--variant',choices=('dxmt','gptk4'),default='dxmt')
-    a=p.parse_args();build(a.output.resolve(),a.workspace.resolve(),a.runtime_archive.resolve(),a.icon,a.identity,a.variant)
+    p.add_argument('--game-tool',action='append',default=[],metavar='NAME=ARCHIVE',help='bundle a game environment\'s compatibility tool with that runtime archive (names: '+', '.join(GAME_TOOLS)+')')
+    a=p.parse_args()
+    tools=[]
+    for item in a.game_tool:
+        name,_,archive=item.partition('=')
+        if name not in GAME_TOOLS or not archive:p.error(f'--game-tool {item}: expected NAME=ARCHIVE with NAME in {sorted(GAME_TOOLS)}')
+        tools.append((name,Path(archive).expanduser().resolve()))
+    build(a.output.resolve(),a.workspace.resolve(),a.runtime_archive.resolve(),a.icon,a.identity,a.variant,tools)

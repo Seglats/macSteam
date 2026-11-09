@@ -1,0 +1,13 @@
+"compatibilitytools"
+{
+  "compat_tools"
+  {
+    "notproton-steamdriver-finals"
+    {
+      "install_path" "."
+      "display_name" "SteamDriver: THE FINALS"
+      "from_oslist" "windows"
+      "to_oslist" "macos"
+    }
+  }
+}

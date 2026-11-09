@@ -1,0 +1,112 @@
+--- a/dlls/ntdll/loader.c
++++ b/dlls/ntdll/loader.c
+@@ -2271,6 +2271,97 @@
+ #endif
+ #ifdef __x86_64__
+ static void apply_fuzzy_binary_patches( WINE_MODREF* wm );
++#endif
++
++#ifdef __x86_64__
++/***********************************************************************
++ *           steamclient_redirect
++ *
++ * MacFinals: when macOS Steam starts a game through a compatibility tool, no Windows Steam
++ * client runs, so a game's steamclient64.dll has nothing to talk to. lsteamclient.dll (Valve's
++ * Proton Steam bridge, ported to macOS by NotProton) does: every export of steamclient64.dll
++ * that lsteamclient.dll also exports jumps to lsteamclient's, steamclient64's entry point
++ * reports success without running, and its imports are left unresolved. Nothing changes when
++ * lsteamclient.dll can't be loaded (a prefix without the bridge, such as one with its own
++ * Windows Steam), so steamclient64.dll then loads as usual.
++ */
++static void steamclient_write_code( BYTE *addr, const BYTE *code, SIZE_T len )
++{
++    void *base = addr;
++    SIZE_T size = len;
++    ULONG old;
++
++    if (NtProtectVirtualMemory( NtCurrentProcess(), &base, &size, PAGE_EXECUTE_READWRITE, &old )) return;
++    memcpy( addr, code, len );
++    NtProtectVirtualMemory( NtCurrentProcess(), &base, &size, old, &old );
++    NtFlushInstructionCache( NtCurrentProcess(), addr, len );
++}
++
++static BOOL steamclient_redirect( WINE_MODREF *wm, LPCWSTR load_path )
++{
++    static const UNICODE_STRING steamclient64 = RTL_CONSTANT_STRING( L"steamclient64.dll" );
++    UNICODE_STRING lsteamclient = RTL_CONSTANT_STRING( L"lsteamclient.dll" );
++    static const BYTE report_success[] = { 0xb8, 0x01, 0x00, 0x00, 0x00, 0xc3 };  /* mov eax,1; ret */
++    BYTE *module = wm->ldr.DllBase, jump[12] = { 0x48, 0xb8 };                     /* movabs rax,target */
++    const IMAGE_EXPORT_DIRECTORY *exports;
++    const IMAGE_NT_HEADERS *nt;
++    const DWORD *names, *functions;
++    const WORD *ordinals;
++    HMODULE bridge;
++    ULONG size, i, count = 0;
++    BOOL found = FALSE;
++
++    if (!RtlEqualUnicodeString( &wm->ldr.BaseDllName, &steamclient64, TRUE )) return FALSE;
++    /* lsteamclient.dll sits next to steamclient64.dll (the tool stages both); a builtin is only
++     * found where the search path sees its file, so look in that folder first. */
++    if (!LdrGetDllHandle( NULL, 0, &lsteamclient, &bridge )) found = TRUE;
++    else
++    {
++        const UNICODE_STRING *full = &wm->ldr.FullDllName;
++        SIZE_T n = full->Length / sizeof(WCHAR);
++        WCHAR *dir;
++
++        while (n && full->Buffer[n - 1] != '\\') n--;
++        if (n > 1 && (dir = RtlAllocateHeap( GetProcessHeap(), 0, n * sizeof(WCHAR) )))
++        {
++            memcpy( dir, full->Buffer, (n - 1) * sizeof(WCHAR) );
++            dir[n - 1] = 0;
++            found = !LdrLoadDll( dir, 0, &lsteamclient, &bridge );
++            RtlFreeHeap( GetProcessHeap(), 0, dir );
++        }
++        if (!found) found = !LdrLoadDll( load_path, 0, &lsteamclient, &bridge );
++    }
++    if (!found)
++    {
++        TRACE_(loaddll)( "no lsteamclient.dll, %s loads unchanged\n", debugstr_us(&wm->ldr.BaseDllName) );
++        return FALSE;
++    }
++    if (!(exports = RtlImageDirectoryEntryToData( (HMODULE)module, TRUE, IMAGE_DIRECTORY_ENTRY_EXPORT, &size )))
++        return FALSE;
++
++    jump[10] = 0xff; jump[11] = 0xe0;                                             /* jmp rax */
++    names = (const DWORD *)(module + exports->AddressOfNames);
++    functions = (const DWORD *)(module + exports->AddressOfFunctions);
++    ordinals = (const WORD *)(module + exports->AddressOfNameOrdinals);
++    for (i = 0; i < exports->NumberOfNames; i++)
++    {
++        DWORD rva = functions[ordinals[i]];
++        void *target;
++
++        if (rva >= (BYTE *)exports - module && rva < (BYTE *)exports - module + size) continue;  /* forwarder */
++        if (!(target = RtlFindExportedRoutineByName( bridge, (const char *)module + names[i] ))) continue;
++        memcpy( jump + 2, &target, sizeof(target) );
++        steamclient_write_code( module + rva, jump, sizeof(jump) );
++        count++;
++    }
++    nt = RtlImageNtHeader( (HMODULE)module );
++    if (nt->OptionalHeader.AddressOfEntryPoint)
++        steamclient_write_code( module + nt->OptionalHeader.AddressOfEntryPoint, report_success,
++                                sizeof(report_success) );
++    TRACE_(loaddll)( "%s redirected to lsteamclient.dll at %p (%lu exports)\n",
++                     debugstr_us(&wm->ldr.BaseDllName), bridge, count );
++    return TRUE;
++}
+ #endif
+ 
+ /*************************************************************************
+@@ -2310,6 +2401,11 @@
+ 
+     update_load_config( *module );
+ 
++#ifdef __x86_64__
++    /* MacFinals: steamclient64.dll answered by lsteamclient.dll; its imports stay unresolved */
++    if (!is_builtin && steamclient_redirect( wm, load_path )) flags |= DONT_RESOLVE_DLL_REFERENCES;
++#endif
++
+     /* fixup imports */
+ 
+     if (!(flags & DONT_RESOLVE_DLL_REFERENCES) &&

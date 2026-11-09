@@ -89,6 +89,7 @@ final class AppModel {
         d3dmetalVersion=NotProton.d3dmetalVersion
         runnerD3DMetal=NotProton.supported(resources).first.flatMap(NotProton.runnerD3DMetalVersion)
         profiles=Set(NotProton.installedProfiles)
+        checkGameTools()
         // A newer MacVolvo, or files changed underneath: update in place, never remove and add again.
         if case .added=notProton,!notProtonCurrent,NotProton.refresh(resources:resources) {
             notProtonCurrent=NotProton.isCurrent(resources:resources)
@@ -163,6 +164,30 @@ final class AppModel {
                 "Added. MacVolvo is now in your games’ Compatibility settings in Steam.")
         } catch { notice=error.localizedDescription }
         checkNotProton()
+    }
+    /// Compatibility tools for games with a Wine of their own (GameTools.swift), as last checked.
+    var gameTools:[GameTools.Tool]=[]
+    var gameToolStates:[String:GameTools.State]=[:]
+    var installingGameTool:String?
+    func checkGameTools() {
+        gameTools=GameTools.bundled(resources)
+        gameToolStates=Dictionary(uniqueKeysWithValues:gameTools.map { ($0.id,GameTools.state($0)) })
+    }
+    func installGameTool(_ tool:GameTools.Tool) {
+        installingGameTool=tool.id;notice="Installing \(tool.display)…"
+        Task {
+            let result=await Task.detached { Result { try GameTools.install(tool) } }.value
+            installingGameTool=nil
+            switch result {
+            case .success: changedSteam("\(tool.display) is in Steam. In \(tool.game)’s Properties › Compatibility, force a compatibility tool and choose it.")
+            case .failure(let error): notice=error.localizedDescription
+            }
+            checkGameTools()
+        }
+    }
+    func removeGameTool(_ tool:GameTools.Tool) {
+        do { try GameTools.remove(tool);changedSteam("\(tool.display) removed from Steam.") } catch { notice=error.localizedDescription }
+        checkGameTools()
     }
     func removeFromNotProton() {
         do {

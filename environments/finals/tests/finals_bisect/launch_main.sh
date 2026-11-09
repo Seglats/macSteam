@@ -9,7 +9,9 @@
 #   launch_main.sh                       CrossOver-like baseline
 #   launch_main.sh writecopy             + WINE_SIMULATE_WRITECOPY=1 (CW Hack 22996)
 #   launch_main.sh gamemode              + WINE_GAME_MODE (Discovery.exe via game-mode/Discovery.app)
-#   launch_main.sh mouselook             + WINEMAC_MOUSELOOK
+#   launch_main.sh mouselook             + WINEMAC_MOUSELOOK (precise timing, SteamDriver's driver)
+#   launch_main.sh hid                   + High-precision mouse (implies mouselook)
+#   launch_main.sh classic               + the older mouse timing (implies mouselook)
 #   launch_main.sh msync avx             + WINEMSYNC=1, ROSETTA_ADVERTISE_AVX=1
 #   launch_main.sh app                   everything the app sets (should reproduce E111000D)
 #   RUNTIME=macfinals-17 HOOK=0 DEBUG=quiet|full|max|macfinals launch_main.sh ...
@@ -63,7 +65,17 @@ done
 (( ! ${+on[msync]} ))     || env+=(WINEMSYNC=1)
 (( ! ${+on[writecopy]} )) || env+=(WINE_SIMULATE_WRITECOPY=1)
 (( ! ${+on[gamemode]} ))  || env+=(WINE_GAME_MODE=Discovery.exe)
-(( ! ${+on[mouselook]} )) || env+=(WINEMAC_MOUSELOOK=Discovery.exe)
+# The Mac driver's mouse, as SteamDriver's NotProton rows set it (docs/NOTPROTON.md at the
+# repository root): mouselook = "MacVolvo mouse" (precise timing), hid = High-precision
+# (reads the mouse directly; macOS asks for Input Monitoring for the app that starts this
+# script), classic = the older timing. hid-status.json in the session log folder says
+# whether the High-precision mouse worked.
+(( ! ${+on[hid]} && ! ${+on[classic]} )) || on[mouselook]=1
+if (( ${+on[mouselook]} )); then
+  env+=(WINEMAC_MOUSELOOK=Discovery.exe WINEMAC_INPUT_VARIANT=precise)
+  (( ! ${+on[classic]} )) || env+=(WINEMAC_INPUT_VARIANT=classic)
+  (( ! ${+on[hid]} ))     || env+=(WINEMAC_RAW_SOURCE=hid WINEMAC_RAW_REQUEST=1)
+fi
 if [[ ${HOOK:-1} != 0 && -f $engine/lib/macfinals-nt-hook.dylib ]]; then
   env+=(DYLD_INSERT_LIBRARIES="$engine/lib/macfinals-nt-hook.dylib" DISABLE_AOT=1)
 fi
@@ -123,6 +135,7 @@ EOF
 started=$(/bin/date '+%Y-%m-%d %H:%M:%S')
 marker="$here/logs/.start-$$"; : > "$marker"
 out=${log%.log}; /bin/mkdir -p "$out"
+(( ! ${+on[mouselook]} )) || env+=(WINEMAC_RAW_STATUS="$out/hid-status.json")
 # PERF=1: every Wine process writes 10 lines a second to $out/perf/wine.<pid> (our ntdll's
 # WINE_SYSCALL_LOG): syscall counts and time, Mach/BSD syscalls, page faults, context
 # switches, exception and fault counters, the busiest threads' CPU. Output only.

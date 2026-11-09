@@ -1,0 +1,136 @@
+#!/bin/zsh -f
+# SteamDriver: THE FINALS — a Steam Play compatibility tool for macOS Steam (2026-11-09).
+#
+# macOS Steam (with NotProton switching Steam Play on) runs this as `run <verb> <game> <args>`
+# when THE FINALS' Properties › Compatibility names "SteamDriver: THE FINALS". It starts the
+# game in the finals environment's Wine (runtime/ next to this script): D3DMetal, the d3d12
+# skin-fix layer, the in-process Rosetta syscall hook and SteamDriver's Mac driver mouse.
+# Everything runs inside the game's own process, from our own build; nothing outside is
+# patched and no developer mode is involved.
+#
+# The game reaches macOS Steam through NotProton's Steam bridge (lsteamclient, steam.exe and
+# Steam's Windows client DLLs from ~/Library/Application Support/notproton/bridge, used
+# unchanged): they are copied into the prefix's Steam folder, and our Wine's
+# wine-steamclient-lsteamclient.patch points steamclient64.dll at lsteamclient.dll.
+#
+# Options, as Steam launch options in front of %command% (e.g. `STEAMDRIVER_MOUSE=hid %command%`):
+#   STEAMDRIVER_MOUSE=precise|hid|classic|off   Mac driver mouse (default precise; hid = High-precision,
+#                                                macOS then asks for Input Monitoring for Steam)
+#   STEAMDRIVER_NT_HOOK=0                       without the Rosetta syscall hook
+#   STEAMDRIVER_MSYNC=0, STEAMDRIVER_AVX=0      MSync / ROSETTA_ADVERTISE_AVX off
+#   WINEDEBUG=...                               Wine's channels (default: errors and DLL loads)
+# Log: <compatdata>/steamdriver-run.log; Wine's output: <compatdata>/steamdriver-wine.log.
+#
+# The folder is named notproton-steamdriver-finals: NotProton's launch hook in macOS Steam hands a
+# game's launch command to /bin/sh only for tools under compatibilitytools.d/notproton*
+# (dylib/feats/compat.c np_compat_runs_tool); without it Steam fails with "OS Error 260". NotProton
+# only removes notproton* folders it wrote itself (a flavor file or its own run header), so this
+# one stays.
+
+verb=$1; shift
+tool=${0:A:h}
+engine=$tool/runtime
+compat=${STEAM_COMPAT_DATA_PATH:-}
+bridge="$HOME/Library/Application Support/notproton/bridge"
+
+case $verb in
+  getcompatpath) print -r -- "$compat"; exit 0 ;;
+  getnativepath) print -r -- "$1"; exit 0 ;;
+esac
+
+alert() {
+  /usr/bin/osascript -e 'on run argv' -e 'display alert (item 1 of argv) message (item 2 of argv) as critical' \
+    -e 'end run' "$1" "$2" >/dev/null 2>&1 &
+}
+[[ -n $compat ]] || { print -u2 "steamdriver-finals: STEAM_COMPAT_DATA_PATH is not set"; exit 1; }
+/bin/mkdir -p "$compat"
+log=$compat/steamdriver-run.log
+say() { print -r -- "$(/bin/date '+%Y-%m-%d %H:%M:%S') $*" >> "$log"; }
+say "=== $verb $* (tool ${tool:t}, runtime $(/usr/bin/sed -n 's/.*"version": *"\([^"]*\)".*/\1/p' "$engine/runtime.json" 2>/dev/null | head -1))"
+
+if [[ ! -x $engine/bin/wine ]]; then
+  say "no runtime at $engine"
+  alert "SteamDriver: THE FINALS is incomplete" "Its Wine runtime is missing. Install it again from SteamDriver."
+  exit 1
+fi
+if [[ ! -f $bridge/lsteamclient.dll || ! -f $bridge/x86_64-unix/lsteamclient.so || ! -f $bridge/steam.exe ]]; then
+  say "NotProton's Steam bridge is missing at $bridge"
+  alert "NotProton is needed" "SteamDriver: THE FINALS uses NotProton's Steam bridge. Install NotProton and open it once."
+  exit 1
+fi
+
+export WINEPREFIX=$compat/pfx WINEARCH=win64
+export WINELOADER=$engine/bin/wine WINESERVER=$engine/bin/wineserver
+export PATH=$engine/bin:/usr/bin:/bin:/usr/sbin:/sbin
+prefix_steam="$WINEPREFIX/drive_c/Program Files (x86)/Steam"
+
+# First run: make the prefix (no Gecko or Mono prompts; the game needs neither).
+if [[ ! -f $WINEPREFIX/system.reg ]]; then
+  say "creating the prefix"
+  WINEDLLOVERRIDES='mscoree,mshtml=' WINEDEBUG=-all "$WINELOADER" wineboot -i >> "$log" 2>&1
+  "$WINESERVER" -w
+fi
+
+# NotProton's Steam bridge into the prefix's Steam folder (copies; refreshed when NotProton updates).
+/bin/mkdir -p "$prefix_steam"
+for f in steamclient64.dll steamclient.dll tier0_s64.dll vstdlib_s64.dll lsteamclient.dll steam.exe x86_64-unix/lsteamclient.so; do
+  dst="$prefix_steam/${f:t}"
+  /usr/bin/cmp -s "$bridge/$f" "$dst" || /bin/cp -c -f "$bridge/$f" "$dst" 2>/dev/null || /bin/cp -f "$bridge/$f" "$dst" || {
+    say "could not copy $f"; alert "SteamDriver: THE FINALS" "A Steam file could not be copied into the game's prefix."; exit 1; }
+done
+
+# The finals environment (as environments/finals/tests/finals_bisect/launch_main.sh sets it).
+export WINEDLLPATH=$prefix_steam
+export WINEDLLOVERRIDES='d3d11,dxgi,d3d10,d3d12,d3d12core=b;d3d10core,winemetal,nvapi64,nvngx=;steamclient=n;steamclient64=n;lsteamclient=b'
+export CX_APPLEGPTK_LIBD3DSHARED_PATH=$engine/lib/external/libd3dshared.dylib
+export D3DMETAL_FRAMEWORK_PATH=$engine/lib/external/D3DMetal.framework/D3DMetal
+export CX_ACTIVE_GRAPHICS_BACKEND=d3dmetal CX_GRAPHICS_BACKEND=d3dmetal D3DM_ENABLE_METALFX=0
+export WINEESYNC=0
+[[ ${STEAMDRIVER_MSYNC:-1} == 0 ]] && unset WINEMSYNC || export WINEMSYNC=1
+export ROSETTA_ADVERTISE_AVX=$([[ ${STEAMDRIVER_AVX:-1} == 0 ]] && print 0 || print 1)
+export WINEDEBUG=${WINEDEBUG:-err+all,fixme-all,+loaddll}
+
+# SteamDriver's Mac driver mouse (its NotProton rows, docs/NOTPROTON.md).
+case ${STEAMDRIVER_MOUSE:-precise} in
+  off) ;;
+  *)
+    export WINEMAC_MOUSELOOK='Discovery.exe' WINEMAC_INPUT_VARIANT=precise WINEMAC_RAW_STATUS=$compat/hid-status.json
+    [[ ${STEAMDRIVER_MOUSE:-} == classic ]] && export WINEMAC_INPUT_VARIANT=classic
+    [[ ${STEAMDRIVER_MOUSE:-} == hid ]] && export WINEMAC_RAW_SOURCE=hid WINEMAC_RAW_REQUEST=1
+    ;;
+esac
+
+# The in-process Rosetta syscall hook (environments/finals/tests/rosetta_nt). It replaces
+# anything Steam asked to insert: the hook has to be the process's own, and DISABLE_AOT has
+# to ride along (cached AOT translations would bypass it).
+unset DYLD_INSERT_LIBRARIES
+if [[ ${STEAMDRIVER_NT_HOOK:-1} != 0 && -f $engine/lib/macfinals-nt-hook.dylib ]]; then
+  export DYLD_INSERT_LIBRARIES=$engine/lib/macfinals-nt-hook.dylib DISABLE_AOT=1
+fi
+
+say "WINEDLLOVERRIDES=$WINEDLLOVERRIDES"
+say "hook=${DYLD_INSERT_LIBRARIES:-off} mouse=${STEAMDRIVER_MOUSE:-precise} msync=${WINEMSYNC:-0} avx=$ROSETTA_ADVERTISE_AVX"
+shim='C:\Program Files (x86)\Steam\steam.exe'
+
+case $verb in
+  waitforexitandrun)
+    # The game. Helpers (verb run: Steam's iscriptevaluator.exe with a script path relative to
+    # Steam's folder) keep the working directory Steam gave them; see the last case.
+    [[ -n ${STEAM_COMPAT_INSTALL_PATH:-} && -d $STEAM_COMPAT_INSTALL_PATH ]] && cd "$STEAM_COMPAT_INSTALL_PATH"
+    say "launching: $shim $*"
+    "$WINELOADER" "$shim" "$@" >> "$compat/steamdriver-wine.log" 2>&1
+    rc=$?
+    say "game exited ($rc); ending the prefix's Wine session"
+    "$WINESERVER" -k 2>/dev/null
+    exit $rc ;;
+  runinprefix)
+    "$WINELOADER" "$@" >> "$log" 2>&1; exit $? ;;
+  destroyprefix)
+    "$WINESERVER" -k 2>/dev/null; /bin/rm -rf "$WINEPREFIX"; say "prefix removed"; exit 0 ;;
+  *)
+    # Steam's helpers (run: install scripts through iscriptevaluator.exe) go through the shim,
+    # as on Linux, in the working directory Steam gave them.
+    say "helper ($verb) in $PWD: $shim $*"
+    "$WINELOADER" "$shim" "$@" >> "$compat/steamdriver-wine.log" 2>&1
+    rc=$?; say "helper exited ($rc)"; exit $rc ;;
+esac

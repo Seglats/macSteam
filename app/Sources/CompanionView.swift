@@ -22,6 +22,7 @@ struct CompanionView:View {
                         statusPanel
                         VStack(spacing:12) { actions }
                         if !model.notice.isEmpty { LauncherNotice(text:model.notice) }
+                        if !model.gameTools.isEmpty { gameToolsPanel }
                         renderersPanel
                         profilesPanel
                         mousePanel
@@ -118,6 +119,57 @@ struct CompanionView:View {
                 Button("Remove from Steam…",role:.destructive) { confirmRemove=true }
                     .buttonStyle(.borderless).foregroundStyle(.red).font(LauncherStyle.font(13,.medium))
             }
+        }
+    }
+
+    // MARK: Game runtimes (GameTools.swift)
+    private var gameToolsPanel:some View {
+        LauncherPanel(inset:16) {
+            VStack(alignment:.leading,spacing:10) {
+                VStack(alignment:.leading,spacing:2) {
+                    Text("Game runtimes").font(LauncherStyle.font(14,.semibold))
+                    Text("Games that need a Wine of their own get it as a compatibility tool in Steam. In the game’s Properties › Compatibility, turn on \u{201C}Force the use of a specific Steam Play compatibility tool\u{201D} and choose it. Uses NotProton’s Steam Play and Steam bridge.")
+                        .font(LauncherStyle.font(12)).foregroundStyle(.secondary).fixedSize(horizontal:false,vertical:true)
+                }
+                if case .notInstalled=model.notProton {
+                    StatusLine(.problem,"Needs NotProton: install it and open it once first.")
+                }
+                ForEach(model.gameTools) { tool in
+                    HStack(alignment:.center,spacing:12) {
+                        VStack(alignment:.leading,spacing:2) {
+                            Text(tool.game).font(LauncherStyle.font(13,.semibold))
+                            Text(gameToolDetail(tool)).font(LauncherStyle.font(12)).foregroundStyle(.secondary).fixedSize(horizontal:false,vertical:true)
+                        }
+                        Spacer(minLength:12)
+                        gameToolButtons(tool)
+                    }
+                }
+            }
+        }
+    }
+    private func gameToolDetail(_ tool:GameTools.Tool)->String {
+        if model.installingGameTool==tool.id { return "Installing \u{201C}\(tool.display)\u{201D}…" }
+        switch model.gameToolStates[tool.id] ?? .notInstalled {
+        case .notInstalled: return "Not in Steam yet. Adds \u{201C}\(tool.display)\u{201D} (runtime \(tool.runtime))."
+        case .installed: return "\u{201C}\(tool.display)\u{201D} is in Steam (runtime \(tool.runtime))."
+        case .outdated(let old): return "In Steam with runtime \(old); this version of \(Brand.name) has \(tool.runtime)."
+        case .foreign: return "Steam has a \u{201C}\(tool.id)\u{201D} tool \(Brand.name) didn’t install; it is left as it is."
+        }
+    }
+    @ViewBuilder private func gameToolButtons(_ tool:GameTools.Tool)->some View {
+        let busy=model.installingGameTool != nil
+        switch model.gameToolStates[tool.id] ?? .notInstalled {
+        case .notInstalled:
+            Button("Add to Steam") { model.installGameTool(tool) }.buttonStyle(.bordered).buttonBorderShape(.capsule).disabled(busy)
+        case .outdated:
+            HStack(spacing:10) {
+                Button("Update") { model.installGameTool(tool) }.buttonStyle(.bordered).buttonBorderShape(.capsule).disabled(busy)
+                Button("Remove") { model.removeGameTool(tool) }.buttonStyle(.borderless).foregroundStyle(.red).disabled(busy)
+            }
+        case .installed:
+            Button("Remove") { model.removeGameTool(tool) }.buttonStyle(.borderless).foregroundStyle(.red).font(LauncherStyle.font(12,.medium)).disabled(busy)
+        case .foreign:
+            EmptyView()
         }
     }
 

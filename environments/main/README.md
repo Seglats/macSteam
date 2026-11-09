@@ -1,8 +1,8 @@
-# Base environment
+# Main environment
 
-SteamDriver's own Wine environment: CrossOver 26.3 Wine with Recall's and MacVolvo's
-patches, DXMT for Direct3D 11, and the Mac driver with the mouse work. It is the default for
-every game that has no environment of its own, and the source of the Mac driver that the
+The main Wine, SteamDriver's own: CrossOver 26.3 Wine with Recall's and MacVolvo's
+patches, DXMT for Direct3D 11, and the Mac driver with the mouse work. It is the Wine for
+every game that has no folder of its own, and the source of the Mac driver that the
 NotProton companion lays over NotProton's runner.
 
 **Its files have not moved here yet.** They stay where SteamDriver has always kept them,

@@ -91,6 +91,9 @@ WINE_PATCHES = [
     # virtual-memory lock, the window driver's activation, canvas and pointer fixes.
     # Their diagnostics (WINESERVER_REGISTRY_LOG, WINE_SYSCALL_LOG, WINE_IO_ERROR_LOG,
     # WINE_DISPLAY_LOG, WINEMAC_INPUT_STATS) stay off unless set.
+    # wine-mouselook and wine-winemac-activation are the Mac driver patches shared with
+    # SteamDriver's main environment (patches/ at the repository root, Recall 1.6.2's
+    # precise/classic input and High-precision HID mouse); keep them identical to those.
     'wine-server-registry-save.patch',
     'wine-ntdll-syscall-log.patch',
     'wine-win32u-display-log.patch',
@@ -152,6 +155,11 @@ WINE_PATCHES = [
     # (tests/rosetta_nt, R19) can redirect a direct `syscall` straight into Wine's
     # dispatcher with sigsys_handler semantics. Harmless without the hook.
     'wine-syscall-fastpath-publish.patch',
+    # macOS Steam through the steamdriver-finals compatibility tool (compat-tool/): a game's
+    # steamclient64.dll is answered by NotProton's lsteamclient.dll (the Steam bridge, staged
+    # into the prefix by the tool), the way Proton's Wine does it. Inert when lsteamclient.dll
+    # can't be loaded, so the own-Steam prefix (Windows Steam inside) is unaffected.
+    'wine-steamclient-lsteamclient.patch',
 ]
 
 

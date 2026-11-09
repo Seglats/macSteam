@@ -2,7 +2,23 @@
 
 Start here after a context reset. Details live in the linked files.
 
-## Newest: runtime `macfinals-47` — storm fixed in game, debug output follows Wine's model
+## Newest (2026-11-09, later): inside SteamDriver, and launched from the macOS Steam app
+
+- **This is now the `finals` environment of SteamDriver** (repository
+  `/Users/rasmus/Documents/Kod/Annat/MacVolvo`, branch `environments`; paths here are relative to
+  `environments/finals/`). Its Wine has SteamDriver's newer Mac driver patches (Recall 1.6.2:
+  precise/classic input, High-precision HID mouse). Workspace `~/SteamDriver-build/finals/phase-2`.
+- **THE FINALS starts from the macOS Steam app** through our compatibility tool "SteamDriver: THE
+  FINALS" (`compat-tool/`, folder `notproton-steamdriver-finals`), runtime `macfinals-53`. It
+  uses NotProton's Steam bridge, which our Wine loads from source
+  (`wine-steamclient-lsteamclient.patch`). It has no outside patching and needs no developer mode.
+  Installed by `SteamDriver-2.app` (Game runtimes). Rasmus: "everything seems to work".
+- **What broke on the way, and why:** `compat-tool/LESSONS.md` (Steam tool),
+  `../LESSONS.md` (merge and builds), `tests/finals_bisect/PROFILING.md` (freeze tooling).
+- The game files moved into macOS Steam's library (main profile); a symlink at the old place
+  keeps `launch_main.sh` and older runtimes working.
+
+## Runtime `macfinals-47` — storm fixed in game, debug output follows Wine's model
 
 - **The syscall storm is fixed in THE FINALS** (r21f, runtime -43): 99.99 % fast-path hits,
   stock SIGSYS 30k/s → 1-2/s, Rosetta exception thread 0 %. NOTES.md "r21f in the game".

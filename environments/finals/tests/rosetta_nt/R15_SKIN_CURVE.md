@@ -1,8 +1,7 @@
 # THE FINALS skins missing arms and body parts: root cause (2026-11-02)
 
 Symptom on MacFinals (`macfinals-19`): nearly all skins render without arms and parts of the body.
-The ARC package ships an in-memory patch of D3DMetal's Metal output for this ("S12 skin
-correction"). Rasmus wants a Wine-side fix instead, so that the shader is translated correctly
+Rasmus wants a Wine-side fix, so that the shader is translated correctly
 before GPTK, without touching Rosetta, injecting anything or modifying GPTK.
 
 ## Data

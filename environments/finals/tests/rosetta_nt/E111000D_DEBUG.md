@@ -109,7 +109,10 @@ r11/r12 went straight from ntstub to Steam and the game.
 5. **Fix the general-case IRETQ address (E).** Then the probe has to pass 4/4 on MacFinals
    and match Proton exactly, including check 4 through `NtContinue` (D).
 6. Then Crab Champions (the regression check), then THE FINALS.
-
+7. **If the probe matches Proton and the game still fails:** the "runs with a translator
+   hook" result came from a full stack that also included Wine patches we don't
+   have, first among them the GS/TLS one. That is the next suspect. Implement it ourselves,
+   from what it's for.
 
 ## Do not
 

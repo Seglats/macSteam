@@ -1,0 +1,91 @@
+--- a/dlls/winemac.drv/cocoa_app.m
++++ b/dlls/winemac.drv/cocoa_app.m
+@@ -25,6 +25,7 @@
+ #import "cocoa_v1.h"
+ #import "cocoa_icon_utils.h"
+ #import <GameController/GameController.h>
++#import <Metal/Metal.h>
+ #import <IOKit/hid/IOHIDManager.h>
+ #import <IOKit/hid/IOHIDUsageTables.h>
+ #import <IOKit/hidsystem/IOHIDLib.h>
+@@ -1056,6 +1057,70 @@
+ static NSString* WineLocalizedString(unsigned int stringID)
+ {
+     return ((NSDictionary*)localized_strings)[@(stringID)];
++}
++
++
++/* WINEMAC_METAL_CAPTURE=<folder> (diagnostics; Metal only inserts its capture layer when
++ * MTL_CAPTURE_ENABLED=1 is set when the process starts): Control-Option-G saves all the
++ * Metal work of this process for WINEMAC_METAL_CAPTURE_MS (default 150 ms) as
++ * <folder>/capture-<date>.gputrace, to open in Xcode.  No debugger is involved.  Beeps
++ * when the file is written or the capture failed. */
++static BOOL handle_metal_capture_key(NSEvent* event)
++{
++    static const NSEventModifierFlags mask = NSEventModifierFlagControl | NSEventModifierFlagOption |
++                                             NSEventModifierFlagShift | NSEventModifierFlagCommand;
++    static BOOL checked;
++    static NSString* folder;
++    static long duration_ms = 150;
++    MTLCaptureManager* manager;
++    MTLCaptureDescriptor* descriptor;
++    NSDateFormatter* formatter;
++    NSString* path;
++    NSError* error = nil;
++
++    if (!checked)
++    {
++        const char* value = getenv("WINEMAC_METAL_CAPTURE");
++        const char* ms = getenv("WINEMAC_METAL_CAPTURE_MS");
++        checked = TRUE;
++        if (value && *value) folder = [[NSString alloc] initWithUTF8String:value];
++        if (ms && atol(ms) > 0) duration_ms = atol(ms);
++    }
++    if (!folder || event.keyCode != kVK_ANSI_G ||
++        (event.modifierFlags & mask) != (NSEventModifierFlagControl | NSEventModifierFlagOption))
++        return FALSE;
++    if (event.isARepeat) return TRUE;
++
++    manager = [MTLCaptureManager sharedCaptureManager];
++    if (manager.isCapturing) return TRUE;
++    if (![manager supportsDestination:MTLCaptureDestinationGPUTraceDocument])
++    {
++        ERR(@"Metal capture unavailable: MTL_CAPTURE_ENABLED=1 was not set at process start\n");
++        NSBeep();
++        return TRUE;
++    }
++
++    formatter = [[[NSDateFormatter alloc] init] autorelease];
++    formatter.dateFormat = @"yyyyMMdd-HHmmss";
++    path = [folder stringByAppendingPathComponent:[NSString stringWithFormat:@"capture-%@.gputrace",
++                                                   [formatter stringFromDate:[NSDate date]]]];
++    descriptor = [[[MTLCaptureDescriptor alloc] init] autorelease];
++    descriptor.captureObject = [[MTLCopyAllDevices() autorelease] firstObject];
++    descriptor.destination = MTLCaptureDestinationGPUTraceDocument;
++    descriptor.outputURL = [NSURL fileURLWithPath:path];
++    if (![manager startCaptureWithDescriptor:descriptor error:&error])
++    {
++        ERR(@"Metal capture failed to start: %@\n", error);
++        NSBeep();
++        return TRUE;
++    }
++    ERR(@"Metal capture started for %ld ms: %@\n", duration_ms, path);
++    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, duration_ms * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
++        [[MTLCaptureManager sharedCaptureManager] stopCapture];
++        ERR(@"Metal capture written\n");
++        NSBeep();
++    });
++    return TRUE;
+ }
+ 
+ 
+@@ -3856,6 +3921,9 @@
+         BOOL ret = FALSE;
+         NSEventType type = [anEvent type];
+ 
++        if (type == NSEventTypeKeyDown && handle_metal_capture_key(anEvent))
++            return TRUE;
++
+         if (type == NSEventTypeFlagsChanged)
+             self.lastFlagsChanged = anEvent;
+         else if (type == NSEventTypeMouseMoved || type == NSEventTypeLeftMouseDragged ||

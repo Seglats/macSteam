@@ -46,9 +46,6 @@ risk of tuning for the canary is accepted as slim.
    manually mapped at `0x700000000000` (sections `packer0`, `packer1`, `packer30`, …),
    loaded by `preloader.dll`. Working out which of its checks fails is out of scope even
    when the goal is compatibility. Dialog addresses like `02022AF3` are offsets into it.
-4. **Do not copy the closed-source CrossOver "notproton"-style package.** Its reasoning is
-   fair to learn from; its code is not to be reproduced. Anything shipped here is derived
-   independently.
 5. **Do not modify GPTK / D3DMetal.** Copying `D3DMetal.framework` and
    `libd3dshared.dylib` unchanged, calling interfaces they expose
    (`register_non_native_code_region`) and setting `D3DMETAL_FRAMEWORK_PATH` are *use*,
@@ -130,7 +127,7 @@ mandatory-safe revival plan.
 - **Current work and latest results: `tests/rosetta_nt/(removed)`.** Newest build is
   MacFinals-13 / `macfinals-17`, which fixes the hook losing NT after a literal `0` or `0x202` in
   guest code (`nt_patterns_probe`). Steam and Crab Champions work on it; THE FINALS still stops with
-  E111000D. Open questions: `tests/rosetta_nt/(removed)`. Measured differences from
+  E111000D. Findings and decisions: `tests/rosetta_nt/R14_FINDINGS.md`. Measured differences from
   Proton beyond CPUID identity and CS/SS are tabled there, and fixing any outside
   `POPF`/`PUSHF`/`IRET` is Rasmus's decision.
 - **Rebuild the hook with `tests/rosetta_nt/build_hook.sh`** (it stops on failure). A failed
@@ -255,7 +252,9 @@ pid/tid/timestamp prefixes and MoltenVK quieted (`MVK_CONFIG_LOG_LEVEL=1`; Molte
 outside WINEDEBUG). Any `WINEDEBUG=...` given to `launch_main.sh` is passed verbatim.
 Retired: `MACFINALS_D3D12_LAYER_LOG`, `MACFINALS_HOOK_RING`, `MACFINALS_SYSC_DUMP`,
 `/tmp/rosetta-re/nt-ring`. Functional switches (`MACFINALS_SKIN_FIX`, `MACFINALS_NT_HOOK=0`,
-`MACFINALS_NT_OFF`, `MACFINALS_THUNK_PATCH`) are not debug output and stay.
+`MACFINALS_NT_OFF`, `MACFINALS_THUNK_PATCH`, `MACFINALS_PRECISE_DISCARD=0`) are not debug output and
+stay. So do the search switches `MACFINALS_NO_DISCARD` and `MACFINALS_NO_FAST`
+(`tests/rosetta_nt/R22_MISSING_ROPE.md`).
 
 ## Testing a new app bundle — read this first
 

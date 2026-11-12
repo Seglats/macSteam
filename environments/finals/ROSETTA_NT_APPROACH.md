@@ -3,9 +3,7 @@
 Theory only — no code, no offsets, no byte patterns. This document says **how the
 correction should be designed and staged** within the boundaries set in
 [CLAUDE.md](CLAUDE.md). It does not override CLAUDE.md; where they disagree,
-CLAUDE.md wins. Principles marked *learned* are semantics distilled from studying some grey area source script (reading its reasoning is
-allowed; nothing from it is reproduced here — no identifiers, offsets, constants,
-or instruction encodings).
+CLAUDE.md wins.
 
 Audience: MacFinals maintainers and future sessions picking this work up.
 
@@ -85,10 +83,10 @@ From CLAUDE.md and the recorded incident:
    PE at `0x700000000000`, no spoofing, GPTK/D3DMetal not modified, no SIP
    changes.
 
-## 4. Principles (learned, restated independently)
+## 4. Principles
 
-The mechanics below are mach/ARM64 semantics, not secrets; the reference package
-demonstrates they are sufficient, and they align with the crash rule:
+The mechanics below are mach/ARM64 semantics, not secrets, and they align with the crash
+rule:
 
 - **COW before write.** If a file-backed code page must ever be modified, the
   kernel must privatise it first (`VM_PROT_COPY` on the protect call), so the
@@ -151,8 +149,8 @@ order of decreasing coupling to Rosetta internals:
 - **A spare bit in the runtime's own packed-flags word.** Zero new state, and it
   automatically rides every path the runtime already round-trips — but it
   requires our own structural analysis to find a bit that is genuinely unused
-  and stable across the builds we gate on. (The reference package demonstrates
-  such spare bits exist; which bit is *our* finding to make, not theirs to copy.)
+  and stable across the builds we gate on. (Such spare bits do exist;
+  which one is *our* finding to make.)
 - **A slot in memory whose address emitted code can derive** — e.g. off the
   guest TEB pointer the translator keeps in a reserved register. More
   self-contained, more analysis of the register convention.
@@ -294,8 +292,6 @@ file-backed pages (TEXT, `__DATA_CONST`, the `.aot` mappings,
 - No anti-cheat analysis, no spoofing of CPU vendor or environment, no hiding
   Wine. The correction makes the CPU model *more* truthful, never less.
 - No modification of GPTK/D3DMetal, Rosetta on disk, or SIP.
-- Nothing derived from the closed CrossOver package beyond the semantic
-  principles recorded in §4.
 
 ## 9. Open questions, and what answers each
 

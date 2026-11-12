@@ -164,9 +164,7 @@ conflict. Only **dynamically created executable memory** is unregistered. That i
 manually mapped code (the anti-cheat at `0x700000000000` via `preloader.dll`), JITs and
 packers run from.
 
-The closed-source CrossOver THE FINALS package (`~/Downloads/THE FINALS — CrossOver 26.3 —
-only. Do not open its patch bodies or `wine-modified-source.tar.xz`, and do not reproduce
-its code.** Only file names, file lists and comment lines were read. Also, its own bottle
+
 
 ## 2. The plan
 
@@ -318,7 +316,6 @@ positives: the local clang lacks Wine's include paths. Ignore them.
 - Never touch, patch or scan THE FINALS' files. Never analyse the anti-cheat image at
   `0x700000000000`. Registering memory regions generically (every executable range, every
   process) is a compatibility fix. Do not special-case the anti-cheat's addresses.
-- The closed-source package is reasoning only (see §1).
 - Fixes must make the environment more truthful, never hide Wine.
 - Ask before editing `tests/windows_probe/macfinals_probe.c`. New probes go in new files.
 

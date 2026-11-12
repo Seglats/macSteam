@@ -2,6 +2,15 @@
 
 Start here after a context reset. Details live in the linked files.
 
+## Newest (2026-11-10): the missing rope, and new debug tools
+
+- **Runtime `macfinals-65`** is installed in the Steam tool by hand. It adds Metal capture
+  (`STEAMDRIVER_CAPTURE=1`), and the d3d12 layer now computes what each discard depends on with
+  exact math. That restored the missing rope on Suspended Structures in a narrower test; the
+  default-on rule still needs a run in the game. `SteamDriver-2.app` still bundles `-53`.
+- Full account, ruled-out causes, tools and open items: `R22_MISSING_ROPE.md`.
+- New: `STEAMDRIVER_PERF=1` from Steam and `tests/finals_bisect/perf_report.py`.
+
 ## Newest (2026-11-09, later): inside SteamDriver, and launched from the macOS Steam app
 
 - **This is now the `finals` environment of SteamDriver** (repository
@@ -291,4 +300,4 @@ stubs), `recvtos_probe.c` (TOS control message; Proton gives `IP_TOS 0x88`),
 
 Game files never touched (crash reports and logs the game writes are read only); the
 anti-cheat's protected code is not analysed: count its effects, do not ask why; GPTK ships
-unchanged; Rosetta is not modified on disk; the closed-source package is not copied.
+unchanged; Rosetta is not modified on disk.

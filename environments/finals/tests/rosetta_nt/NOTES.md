@@ -193,8 +193,7 @@ exists, it is just undocumented in this SDK.
 
 ## Milestone-1 survey (2026-10-31, exectest) — payload page & the real GPTK bridge
 
-Recon before experimenting (all from our own dependencies, nothing from the
-closed package): GPTK's **x86_64** `libd3dshared.dylib`
+Recon before experimenting, from our own dependencies: GPTK's **x86_64** `libd3dshared.dylib`
 (`gptk/gptk/redist/lib/external`) exports
 `register_non_native_code_region(start, len)` implemented as literally
 `syscall(0x7000009, start, len)`, gated by `supports_non_native_code_regions()`

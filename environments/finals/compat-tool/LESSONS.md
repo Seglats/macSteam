@@ -20,9 +20,6 @@ the facts about NotProton it rests on. Sources: NotProton's GPL source
 - **Our finals Wine needs its own `ntdll`.** 15 of its 21 patches touch it. The one the storm fix
   can't do without is `wine-syscall-fastpath-publish`, a 9-line pointer publication for the hook.
   CrossOver's `ntdll.so` is stripped, so the hook can't find the dispatcher there by name.
-- **The earlier `notproton-finals-cx263-compat` tool (October) is the off-limits closed package.**
-  It patched memory from outside and needed developer mode. Rasmus wants none of that. Ours
-  builds the bridge into Wine from source, and everything runs inside the game's process.
 
 ## How the tool works
 

@@ -18,7 +18,15 @@
 #                                                macOS then asks for Input Monitoring for Steam)
 #   STEAMDRIVER_NT_HOOK=0                       without the Rosetta syscall hook
 #   STEAMDRIVER_MSYNC=0, STEAMDRIVER_AVX=0      MSync / ROSETTA_ADVERTISE_AVX off
+#   STEAMDRIVER_GAME_MODE=1                     start Discovery.exe from its game app, so macOS can
+#                                                turn Game Mode on (needs native fullscreen)
 #   WINEDEBUG=...                               Wine's channels (default: errors and DLL loads)
+#   STEAMDRIVER_PERF=1                          per-process performance counters, 10 a second, in
+#                                                <compatdata>/perf/<date>/; read them with
+#                                                tests/finals_bisect/perf_report.py
+#   STEAMDRIVER_CAPTURE=1                       Metal capture: Control-Option-G saves 150 ms of GPU work
+#                                                to <compatdata>/captures/ (debug runs only; loads
+#                                                Apple's capture layer into the game)
 # Log: <compatdata>/steamdriver-run.log; Wine's output: <compatdata>/steamdriver-wine.log.
 #
 # The folder is named notproton-steamdriver-finals: NotProton's launch hook in macOS Steam hands a
@@ -117,6 +125,21 @@ case $verb in
     # The game. Helpers (verb run: Steam's iscriptevaluator.exe with a script path relative to
     # Steam's folder) keep the working directory Steam gave them; see the last case.
     [[ -n ${STEAM_COMPAT_INSTALL_PATH:-} && -d $STEAM_COMPAT_INSTALL_PATH ]] && cd "$STEAM_COMPAT_INSTALL_PATH"
+    if [[ ${STEAMDRIVER_GAME_MODE:-0} != 0 ]]; then
+      export WINE_GAME_MODE=Discovery.exe
+      say "Game Mode app on"
+    fi
+    if [[ ${STEAMDRIVER_PERF:-0} != 0 ]]; then
+      perf=$compat/perf/$(/bin/date +%Y%m%d-%H%M%S)
+      /bin/mkdir -p "$perf"
+      export WINE_SYSCALL_LOG=$perf/wine WINEDEBUG=$WINEDEBUG,warn+macfinals_dx12
+      say "performance counters: $perf"
+    fi
+    if [[ ${STEAMDRIVER_CAPTURE:-0} != 0 ]]; then
+      /bin/mkdir -p "$compat/captures"
+      export MTL_CAPTURE_ENABLED=1 WINEMAC_METAL_CAPTURE=$compat/captures
+      say "Metal capture on: Control-Option-G saves to $compat/captures"
+    fi
     say "launching: $shim $*"
     "$WINELOADER" "$shim" "$@" >> "$compat/steamdriver-wine.log" 2>&1
     rc=$?

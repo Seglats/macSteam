@@ -148,8 +148,7 @@ def assemble(work,version,identity,gptk,debug_msgs=True):
             if base in available and base!=name:needed.add(base)
     native=[p for p in dest.rglob('*') if macho(p)]
     # GNU strip from the MinGW-w64 GCC toolchain that builds these modules
-    # (build_portable_runtime.py); the known-good CrossOver-based ntdll.dll was stripped
-    # the same way. i686 modules are plain PE too, so the x86_64 strip handles both.
+    # (build_portable_runtime.py). i686 modules are plain PE too, so the x86_64 strip handles both.
     strip=Path('/opt/homebrew/opt/mingw-w64/bin/x86_64-w64-mingw32-strip')
     def strip_debug(p):
         run(strip,'--strip-debug',p,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)

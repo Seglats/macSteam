@@ -634,12 +634,13 @@ static int decode_function(struct module *m, const struct item *fblk, struct fun
  * gets on Proton. The array read stays (clamped) but its result is no longer used.
  */
 
-enum { SITE_CLAMP, SITE_CBREAD };
+enum { SITE_CLAMP, SITE_CBREAD, SITE_NODISCARD };
 #define CLAMP_INSTS 4
 #define CBREAD_INSTS 17
 #define MAX_SITES 64
 #define MAX_NEWCONST 64
 #define DXOP_CBUFFER_LOAD_LEGACY 59
+#define DXOP_DISCARD 82
 #define DXOP_ANNOTATE_HANDLE 216
 #define RESOURCE_KIND_CBUFFER 13
 #define CBUFFER_MAX_FLOATS 16384             /* 64 KiB, the D3D12 limit */
@@ -829,14 +830,14 @@ static int cmp_site(const void *x, const void *y)
 }
 
 static unsigned find_sites(const struct module *m, const struct func *f, struct consts *cs,
-                           struct site *sites, unsigned max, unsigned *ncb)
+                           struct site *sites, unsigned max, unsigned *ncb, int no_discard, unsigned *ndiscard)
 {
     unsigned i, n = 0;
     int i32 = int_type(m, 32);
     int *v2i = NULL;
     struct uses u = { 0 };
 
-    *ncb = 0;
+    *ncb = 0; *ndiscard = 0;
     if (i32 < 0) return 0;
     if (!(v2i = malloc((m->nvalues + 1) * sizeof(*v2i))) || !build_uses(m, f, &u)) goto fail;
     for (i = 0; i <= m->nvalues; i++) v2i[i] = -1;
@@ -892,18 +893,37 @@ static unsigned find_sites(const struct module *m, const struct func *f, struct 
             (*ncb)++;
         }
     }
+    /* Debug (MACFINALS_NO_DISCARD): every dx.op.discard gets a constant false condition, so
+     * this shader never discards. Masked materials draw solid. */
+    if (no_discard)
+    {
+        int i1 = int_type(m, 1);
+        for (i = 0; i1 >= 0 && i < f->ninsts; i++)
+        {
+            const struct inst *c = &f->insts[i];
+            int64_t op;
+            if (c->rec->code != CALL || c->nrefs != 3 || !const_int(m, call_arg(c, 0), &op) || op != DXOP_DISCARD) continue;
+            if (n == max) goto fail;
+            sites[n].inst = i; sites[n].kind = SITE_NODISCARD; sites[n].idx = ~0u; sites[n].slot = c->refs[2];
+            sites[n].c0 = get_const(cs, (uint64_t)i1, 0);
+            n++; (*ndiscard)++;
+        }
+    }
     if (cs->bad) goto fail;
     qsort(sites, n, sizeof(*sites), cmp_site);
     for (i = 1; i < n; i++) if (sites[i].inst == sites[i - 1].inst) goto fail;
     free(v2i); free_uses(&u);
     return n;
 fail:
-    *ncb = 0;
+    *ncb = 0; *ndiscard = 0;
     free(v2i); free_uses(&u);
     return 0;
 }
 
-static unsigned site_insts(const struct site *s) { return s->kind == SITE_CLAMP ? CLAMP_INSTS : CBREAD_INSTS; }
+static unsigned site_insts(const struct site *s)
+{
+    return s->kind == SITE_CLAMP ? CLAMP_INSTS : s->kind == SITE_CBREAD ? CBREAD_INSTS : 0;
+}
 
 /* The function's constant block plus the new constants (or a new block holding them). */
 static void emit_constants(struct writer *w, const struct item *blk, const struct consts *cs,
@@ -992,9 +1012,16 @@ static int emit_cbread(struct writer *w, unsigned width, const struct func *f, c
 #undef ICMP
 #undef SEL
 
+/* Trailing flags on a binary operator or comparison: [lhs, rhs, opcode/predicate, flags]. */
+static int has_fast_flags(const struct inst *in)
+{
+    return (in->rec->code == BINOP || in->rec->code == CMP2) && in->nrefs == 2
+            && in->rec->nops == in->refs[1] + 3 && in->rec->ops[in->rec->nops - 1];
+}
+
 static int emit_function(struct module *m, const struct item *fblk, const struct func *f,
                          const struct site *sites, unsigned nsites, const struct consts *cs,
-                         struct writer *w, const uint8_t *data, unsigned parent_width)
+                         struct writer *w, const uint8_t *data, unsigned parent_width, const uint8_t *strip)
 {
     unsigned width = fblk->width, i, k, s;
     size_t len_pos, body_start;
@@ -1055,7 +1082,7 @@ static int emit_function(struct module *m, const struct item *fblk, const struct
             {
                 uint32_t idx = sites[s].idx < m->nvalues ? remap[sites[s].idx] : sites[s].idx;
                 if (sites[s].kind == SITE_CLAMP) { emit_clamp(w, width, &sites[s], idx, &cur); s2 = cur - 1; clamp = 1; }
-                else if (!emit_cbread(w, width, f, &sites[s], remap, m->nvalues, idx, &cur)) goto out;
+                else if (sites[s].kind == SITE_CBREAD && !emit_cbread(w, width, f, &sites[s], remap, m->nvalues, idx, &cur)) goto out;
                 new_index += site_insts(&sites[s]);
             }
             if (n > 256) goto out;
@@ -1069,8 +1096,11 @@ static int emit_function(struct module *m, const struct item *fblk, const struct
                     ops[in->refs[r]] = rel_of(in->signed_refs, na, cur);
                 }
                 if (clamp) ops[sites[s].slot] = (uint32_t)(cur - s2);
+                if (s < nsites && sites[s].inst == i && sites[s].kind == SITE_NODISCARD)
+                    ops[sites[s].slot] = rel_of(0, sites[s].c0, cur);
             }
             if (s < nsites && sites[s].inst == i) s++;
+            if (strip && strip[i] && has_fast_flags(in)) n--;
             wrecord(w, width, in->rec->code, ops, n);
             if (in->rec->code == DEBUG_LOC || in->rec->code == DEBUG_LOC_AGAIN) continue;
             inst_map[old_index++] = new_index++;
@@ -1111,11 +1141,46 @@ out:
     return ok;
 }
 
+/* Marks in strip[] every instruction a dx.op.discard's condition depends on. THE FINALS' fade
+ * conditions cancel large-world offsets (tile * 2097152); under DXIL's fast flags Apple's
+ * compiler reorders that arithmetic and the condition loses all precision, so an object is
+ * discarded entirely. Keeping exact math for the condition alone leaves the rest fast. */
+static int mark_discard_slices(const struct module *m, const struct func *f, uint8_t *strip)
+{
+    int *v2i = malloc((m->nvalues + 1) * sizeof(*v2i));
+    unsigned *stack = malloc((f->ninsts + 1) * sizeof(*stack)), sp = 0, i, r;
+    if (!v2i || !stack) { free(v2i); free(stack); return 0; }
+    for (i = 0; i <= m->nvalues; i++) v2i[i] = -1;
+    for (i = 0; i < f->ninsts; i++) if (f->insts[i].value >= 0) v2i[f->insts[i].value] = (int)i;
+    for (i = 0; i < f->ninsts; i++)
+    {
+        const struct inst *c = &f->insts[i];
+        int64_t op;
+        uint32_t cond;
+        if (c->rec->code != CALL || c->nrefs != 3 || !const_int(m, call_arg(c, 0), &op) || op != DXOP_DISCARD) continue;
+        cond = call_arg(c, 1);
+        if (cond < m->nvalues && v2i[cond] >= 0 && !strip[v2i[cond]]) { strip[v2i[cond]] = 1; stack[sp++] = (unsigned)v2i[cond]; }
+        while (sp)
+        {
+            const struct inst *in = &f->insts[stack[--sp]];
+            for (r = 0; r < in->nrefs; r++)
+            {
+                uint32_t a = abs_of(in, in->refs[r]);
+                if (a < m->nvalues && v2i[a] >= 0 && !strip[v2i[a]]) { strip[v2i[a]] = 1; stack[sp++] = (unsigned)v2i[a]; }
+            }
+        }
+    }
+    free(v2i); free(stack);
+    return 1;
+}
+
 /* Rewrites a raw DXIL bitcode buffer. Returns the number of sites rewritten (0: unchanged);
  * *ncb is how many of them read the constant buffer directly. */
-static unsigned rewrite_bitcode(const uint8_t *bc, size_t size, uint8_t **out, size_t *out_size, unsigned *ncb)
+static unsigned rewrite_bitcode(const uint8_t *bc, size_t size, uint8_t **out, size_t *out_size, unsigned *ncb,
+                                int no_discard, unsigned *ndiscard, int no_fast, unsigned *nfast, int precise_discard)
 {
     struct parser p;
+    uint8_t *strip = NULL;
     struct item top, *mod = NULL, *fblk = NULL;
     struct module m;
     struct func f;
@@ -1125,7 +1190,7 @@ static unsigned rewrite_bitcode(const uint8_t *bc, size_t size, uint8_t **out, s
     struct writer w = { 0 };
     size_t mod_len_pos;
 
-    *out = NULL; *ncb = 0;
+    *out = NULL; *ncb = 0; *ndiscard = 0; *nfast = 0;
     if (size < 8 || memcmp(bc, "BC\xc0\xde", 4)) return 0;
     memset(&p, 0, sizeof(p)); memset(&top, 0, sizeof(top)); memset(&m, 0, sizeof(m)); memset(&f, 0, sizeof(f));
     p.r.data = bc; p.r.end = size * 8; p.r.pos = 32;
@@ -1137,26 +1202,34 @@ static unsigned rewrite_bitcode(const uint8_t *bc, size_t size, uint8_t **out, s
     if (nfb != 1 || !decode_function(&m, fblk, &f)) goto done;
     if (!(cs = calloc(1, sizeof(*cs)))) goto done;
     cs->m = &m; cs->first = f.first;
-    if (!(nsites = find_sites(&m, &f, cs, sites, MAX_SITES, ncb))) goto done;
+    nsites = find_sites(&m, &f, cs, sites, MAX_SITES, ncb, no_discard, ndiscard);
+    if ((no_fast || precise_discard) && (strip = calloc(f.ninsts + 1, 1)))
+    {
+        if (no_fast) memset(strip, 1, f.ninsts);
+        else if (!mark_discard_slices(&m, &f, strip)) memset(strip, 0, f.ninsts);
+        for (i = 0; i < f.ninsts; i++) *nfast += strip[i] && has_fast_flags(&f.insts[i]);
+    }
+    if (!nsites && !*nfast) goto done;
 
     wcopy(&w, bc, 0, mod->len_pos);
     mod_len_pos = w.pos; wr(&w, 0, 32);
     wcopy(&w, bc, mod->content_start, fblk->start);
-    if (!emit_function(&m, fblk, &f, sites, nsites, cs, &w, bc, mod->width)) { nsites = 0; goto done; }
+    if (!emit_function(&m, fblk, &f, sites, nsites, cs, &w, bc, mod->width, strip)) { nsites = 0; *nfast = 0; goto done; }
     wcopy(&w, bc, fblk->end, mod->end);
     wpatch32(&w, mod_len_pos, (uint32_t)((w.pos - mod->content_start) / 32));
     wcopy(&w, bc, mod->end, size * 8);
-    if (w.bad || (w.pos & 31)) { nsites = 0; goto done; }
+    if (w.bad || (w.pos & 31)) { nsites = 0; *nfast = 0; goto done; }
     *out = w.buf; *out_size = w.pos / 8; w.buf = NULL;
 done:
-    if (!*out) *ncb = 0;
+    if (!*out) { *ncb = 0; *ndiscard = 0; *nfast = 0; }
     free(cs);
+    free(strip);
     free(w.buf);
     free(f.insts);
     free(m.types); free(m.values);
     for (i = 0; i < p.nbi; i++) free(p.bi[i].ab);
     free_items(&top);
-    return *out ? nsites : 0;
+    return *out ? (nsites ? nsites : 1) : 0;
 }
 
 /* ---- DXBC container ----------------------------------------------------------------- */
@@ -1223,7 +1296,8 @@ static void dxbc_checksum(const uint8_t *data, size_t size, uint8_t out[16])
 static uint32_t rd32(const uint8_t *p) { uint32_t v; memcpy(&v, p, 4); return v; }
 static void put32(uint8_t *p, uint32_t v) { memcpy(p, &v, 4); }
 
-unsigned dxil_rewrite_container(const void *blob, size_t size, void **out, size_t *out_size, unsigned *cb_reads)
+unsigned dxil_rewrite_container(const void *blob, size_t size, void **out, size_t *out_size, unsigned *cb_reads,
+                                int no_discard, unsigned *discards, int no_fast, unsigned *fast_ops, int precise_discard)
 {
     const uint8_t *in = blob;
     uint32_t count, i, dxil = ~0u, total;
@@ -1231,10 +1305,12 @@ unsigned dxil_rewrite_container(const void *blob, size_t size, void **out, size_
     uint32_t prog_size, bc_off, bc_size;
     uint8_t *bc_new = NULL, *res;
     size_t bc_new_size = 0, pos;
-    unsigned n, ncb = 0;
+    unsigned n, ncb = 0, nd = 0, nf = 0;
 
     *out = NULL; *out_size = 0;
     if (cb_reads) *cb_reads = 0;
+    if (discards) *discards = 0;
+    if (fast_ops) *fast_ops = 0;
     if (size < 32 || memcmp(in, "DXBC", 4) || rd32(in + 24) != size) return 0;
     count = rd32(in + 28);
     if (count > 64 || 32 + 4 * (size_t)count > size) return 0;
@@ -1250,7 +1326,7 @@ unsigned dxil_rewrite_container(const void *blob, size_t size, void **out, size_
     if (prog_size < 24 || rd32(prog + 8) != 0x4C495844) return 0;
     bc_off = rd32(prog + 16); bc_size = rd32(prog + 20);
     if (bc_off != 16 || 8 + (size_t)bc_off + bc_size > prog_size) return 0;
-    if (!(n = rewrite_bitcode(prog + 24, bc_size, &bc_new, &bc_new_size, &ncb))) return 0;
+    if (!(n = rewrite_bitcode(prog + 24, bc_size, &bc_new, &bc_new_size, &ncb, no_discard, &nd, no_fast, &nf, precise_discard))) return 0;
 
     {
         size_t new_prog = 24 + ((bc_new_size + 3) & ~(size_t)3);
@@ -1290,5 +1366,7 @@ unsigned dxil_rewrite_container(const void *blob, size_t size, void **out, size_
     dxbc_checksum(res + 20, total - 20, res + 4);
     *out = res; *out_size = total;
     if (cb_reads) *cb_reads = ncb;
+    if (discards) *discards = nd;
+    if (fast_ops) *fast_ops = nf;
     return n;
 }

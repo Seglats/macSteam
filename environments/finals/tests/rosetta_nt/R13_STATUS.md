@@ -298,6 +298,7 @@ Smaller items still open:
 - Analyse the anti-cheat image or scan THE FINALS' files (CLAUDE.md boundaries 1 and 3).
   The ctl snapshots show our hook's behaviour, not the anti-cheat's, which is why step 1 is
   allowed.
+- Upstream rosettax87_jit is for study only.
 - Write the disable-AOT byte or anything else outside POPF/PUSHF/IRET flag handling without
   asking Rasmus.
 - Ship or test through the app with macfinals-7 while its hook may still clobber SIMD.

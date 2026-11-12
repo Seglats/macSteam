@@ -1,0 +1,86 @@
+--- a/dlls/winemac.drv/cocoa_app.m
++++ b/dlls/winemac.drv/cocoa_app.m
+@@ -1072,11 +1072,7 @@
+     static BOOL checked;
+     static NSString* folder;
+     static long duration_ms = 150;
+-    MTLCaptureManager* manager;
+-    MTLCaptureDescriptor* descriptor;
+-    NSDateFormatter* formatter;
+-    NSString* path;
+-    NSError* error = nil;
++    static dispatch_queue_t capture_queue;
+ 
+     if (!checked)
+     {
+@@ -1091,34 +1087,43 @@
+         return FALSE;
+     if (event.isARepeat) return TRUE;
+ 
+-    manager = [MTLCaptureManager sharedCaptureManager];
+-    if (manager.isCapturing) return TRUE;
+-    if (![manager supportsDestination:MTLCaptureDestinationGPUTraceDocument])
+-    {
+-        ERR(@"Metal capture unavailable: MTL_CAPTURE_ENABLED=1 was not set at process start\n");
+-        NSBeep();
+-        return TRUE;
+-    }
+-
+-    formatter = [[[NSDateFormatter alloc] init] autorelease];
+-    formatter.dateFormat = @"yyyyMMdd-HHmmss";
+-    path = [folder stringByAppendingPathComponent:[NSString stringWithFormat:@"capture-%@.gputrace",
+-                                                   [formatter stringFromDate:[NSDate date]]]];
+-    descriptor = [[[MTLCaptureDescriptor alloc] init] autorelease];
+-    descriptor.captureObject = [[MTLCopyAllDevices() autorelease] firstObject];
+-    descriptor.destination = MTLCaptureDestinationGPUTraceDocument;
+-    descriptor.outputURL = [NSURL fileURLWithPath:path];
+-    if (![manager startCaptureWithDescriptor:descriptor error:&error])
+-    {
+-        ERR(@"Metal capture failed to start: %@\n", error);
+-        NSBeep();
+-        return TRUE;
+-    }
+-    ERR(@"Metal capture started for %ld ms: %@\n", duration_ms, path);
+-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, duration_ms * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
+-        [[MTLCaptureManager sharedCaptureManager] stopCapture];
++    /* Off the main thread: stopping a capture waits for the GPU work in flight, which
++     * can need this thread to finish presenting. */
++    if (!capture_queue) capture_queue = dispatch_queue_create("winemac.metal-capture", DISPATCH_QUEUE_SERIAL);
++    dispatch_async(capture_queue, ^{
++        MTLCaptureManager* manager = [MTLCaptureManager sharedCaptureManager];
++        MTLCaptureDescriptor* descriptor;
++        NSDateFormatter* formatter;
++        NSString* path;
++        NSError* error = nil;
++
++        if (manager.isCapturing) return;
++        if (![manager supportsDestination:MTLCaptureDestinationGPUTraceDocument])
++        {
++            ERR(@"Metal capture unavailable: MTL_CAPTURE_ENABLED=1 was not set at process start\n");
++            dispatch_async(dispatch_get_main_queue(), ^{ NSBeep(); });
++            return;
++        }
++        formatter = [[[NSDateFormatter alloc] init] autorelease];
++        formatter.dateFormat = @"yyyyMMdd-HHmmss";
++        path = [folder stringByAppendingPathComponent:[NSString stringWithFormat:@"capture-%@.gputrace",
++                                                       [formatter stringFromDate:[NSDate date]]]];
++        descriptor = [[[MTLCaptureDescriptor alloc] init] autorelease];
++        descriptor.captureObject = [[MTLCopyAllDevices() autorelease] firstObject];
++        descriptor.destination = MTLCaptureDestinationGPUTraceDocument;
++        descriptor.outputURL = [NSURL fileURLWithPath:path];
++        if (![manager startCaptureWithDescriptor:descriptor error:&error])
++        {
++            ERR(@"Metal capture failed to start: %@\n", error);
++            dispatch_async(dispatch_get_main_queue(), ^{ NSBeep(); });
++            return;
++        }
++        ERR(@"Metal capture started for %ld ms: %@\n", duration_ms, path);
++        usleep(duration_ms * 1000);
++        ERR(@"Metal capture stopping\n");
++        [manager stopCapture];
+         ERR(@"Metal capture written\n");
+-        NSBeep();
++        dispatch_async(dispatch_get_main_queue(), ^{ NSBeep(); });
+     });
+     return TRUE;
+ }

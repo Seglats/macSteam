@@ -10,15 +10,15 @@ int main(int argc, char **argv)
     long size;
     void *in, *out;
     size_t out_size;
-    unsigned n, cb;
+    unsigned n, cb, nf = 0;
 
     if (argc != 3 || !(f = fopen(argv[1], "rb"))) return 2;
     fseek(f, 0, SEEK_END); size = ftell(f); fseek(f, 0, SEEK_SET);
     if (size <= 0 || !(in = malloc(size)) || fread(in, 1, size, f) != (size_t)size) return 2;
     fclose(f);
-    if (!(n = dxil_rewrite_container(in, size, &out, &out_size, &cb))) return 1;
+    if (!(n = dxil_rewrite_container(in, size, &out, &out_size, &cb, !!getenv("MACFINALS_NO_DISCARD"), NULL, !!getenv("MACFINALS_NO_FAST"), &nf, !!getenv("MACFINALS_PRECISE_DISCARD")))) return 1;
     if (!(f = fopen(argv[2], "wb")) || fwrite(out, 1, out_size, f) != out_size) return 2;
     fclose(f);
-    printf("%u %u\n", n, cb);
+    printf("%u %u %u\n", n, cb, nf);
     return 0;
 }

@@ -106,8 +106,7 @@ included) is not registered and keeps macOS `%gs`, so there is no conflict. libd
 exports only `register_non_native_code_region` and `supports_non_native_code_regions`
 (no unregister).
 
-The other CrossOver THE FINALS package (`~/Downloads/THE FINALS — CrossOver 26.3 —
-lists and comment lines were read.
+
 
 **New plan (supersedes §3):** a Wine patch in `dlls/ntdll/unix/virtual.c` that registers
 every Windows executable range with `register_non_native_code_region`: executable

@@ -1,0 +1,17 @@
+--- a/dlls/winemac.drv/cocoa_main.m
++++ b/dlls/winemac.drv/cocoa_main.m
+@@ -68,6 +68,14 @@
+
+     @autoreleasepool
+     {
++        /* WINEMAC_APPKIT_UPDATE_CYCLE=0: AppKit's display-synchronized event loop off. Executables
++           built with the macOS 26 SDK or later get it by default, and it holds input back to the
++           display refresh. AppKit reads this while NSApplication starts, so it has to come first
++           (tests/finals_bisect/update_cycle_check.py). */
++        const char* update_cycle = getenv("WINEMAC_APPKIT_UPDATE_CYCLE");
++        if (update_cycle && *update_cycle == '0')
++            [[NSUserDefaults standardUserDefaults] registerDefaults:@{ @"NSApplicationUpdateCycleEnabled" : @NO }];
++
+         if (!NSApp)
+         {
+             [WineApplication sharedApplication];

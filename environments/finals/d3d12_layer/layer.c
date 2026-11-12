@@ -265,6 +265,39 @@ static struct cache_entry *cache_find(const BYTE *digest, BOOL *found)
     return NULL;                        /* full */
 }
 
+/* MACFINALS_NO_DISCARD (debug): "1" disables pixel-shader discards everywhere, "LLLL-HHHH"
+ * (hex) only for shaders whose first two checksum bytes are in that range, to search for
+ * the shader whose discard removes an object. */
+static int nd_on;
+static unsigned nd_lo, nd_hi;
+/* MACFINALS_NO_FAST (debug), same forms: drop the fast-math flags from those shaders. */
+static int nf_on;
+/* Exact math for what a discard's condition depends on (see dxil_rewrite.c); on unless
+ * MACFINALS_PRECISE_DISCARD=0. */
+static int precise_discard = 1;
+static unsigned nf_lo, nf_hi;
+
+static int parse_hex4(const char *s, unsigned *out)
+{
+    unsigned v = 0, i;
+    for (i = 0; i < 4; i++)
+    {
+        char c = s[i];
+        if (c >= '0' && c <= '9') v = v * 16 + (c - '0');
+        else if (c >= 'a' && c <= 'f') v = v * 16 + (c - 'a' + 10);
+        else if (c >= 'A' && c <= 'F') v = v * 16 + (c - 'A' + 10);
+        else return 0;
+    }
+    *out = v;
+    return 1;
+}
+
+static int parse_range(const char *v, unsigned *lo, unsigned *hi)
+{
+    if (!strcmp(v, "1")) { *lo = 0; *hi = 0xffff; return 1; }
+    return strlen(v) == 9 && v[4] == '-' && parse_hex4(v, lo) && parse_hex4(v + 5, hi);
+}
+
 /* Returns the rewritten bytecode (owned by the cache) or NULL to keep the original. */
 static const void *rewrite_bytecode(const void *code, SIZE_T size, SIZE_T *out_size)
 {
@@ -272,7 +305,8 @@ static const void *rewrite_bytecode(const void *code, SIZE_T size, SIZE_T *out_s
     struct cache_entry *e;
     void *out = NULL;
     size_t new_size = 0;
-    unsigned reads, cb_reads;
+    unsigned reads, cb_reads, discards = 0, fast_ops = 0, prefix;
+    int no_discard, no_fast;
     BOOL found;
 
     if (!enabled || !cache || !code || size < 32 || memcmp(code, "DXBC", 4)) return NULL;
@@ -281,8 +315,19 @@ static const void *rewrite_bytecode(const void *code, SIZE_T size, SIZE_T *out_s
     if (found) { *out_size = e->size; LeaveCriticalSection(&cache_cs); return e->blob; }
     LeaveCriticalSection(&cache_cs);
 
-    if ((reads = dxil_rewrite_container(code, size, &out, &new_size, &cb_reads)))
+    prefix = digest[0] << 8 | digest[1];
+    no_discard = nd_on && prefix >= nd_lo && prefix <= nd_hi;
+    no_fast = nf_on && prefix >= nf_lo && prefix <= nf_hi;
+    if ((reads = dxil_rewrite_container(code, size, &out, &new_size, &cb_reads, no_discard, &discards, no_fast, &fast_ops, precise_discard)))
     {
+        if (fast_ops && !no_fast) TRACE("shader %02x%02x%02x%02x: %u discard-condition operation(s) made exact\n",
+                                        digest[0], digest[1], digest[2], digest[3], fast_ops);
+        if (fast_ops && no_fast)
+            ERR("no-fast: shader %02x%02x%02x%02x%02x%02x%02x%02x, %u operation(s) changed\n",
+                digest[0], digest[1], digest[2], digest[3], digest[4], digest[5], digest[6], digest[7], fast_ops);
+        if (discards)
+            ERR("no-discard: shader %02x%02x%02x%02x%02x%02x%02x%02x, %u discard(s) disabled\n",
+                digest[0], digest[1], digest[2], digest[3], digest[4], digest[5], digest[6], digest[7], discards);
         LONG n = InterlockedIncrement(&rewritten_shaders);
         LONG cb = cb_reads ? InterlockedIncrement(&cbuffer_shaders) : cbuffer_shaders;
         InterlockedExchangeAdd(&rewritten_reads, (LONG)reads);
@@ -634,6 +679,12 @@ static BOOL CALLBACK init_once(INIT_ONCE *once, void *param, void **context)
     int i;
 
     if ((v = getenv("MACFINALS_SKIN_FIX")) && !strcmp(v, "0")) enabled = 0;
+    if ((v = getenv("MACFINALS_PRECISE_DISCARD")) && !strcmp(v, "0")) precise_discard = 0;
+    if ((v = getenv("MACFINALS_NO_FAST")) && (nf_on = parse_range(v, &nf_lo, &nf_hi)))
+        ERR("MACFINALS_NO_FAST: fast-math flags dropped for shader ids %04x-%04x (debug only)\n", nf_lo, nf_hi);
+    if ((v = getenv("MACFINALS_NO_DISCARD")) && (nd_on = parse_range(v, &nd_lo, &nd_hi)))
+        ERR("MACFINALS_NO_DISCARD: pixel-shader discards disabled for shader ids %04x-%04x (debug only)\n",
+            nd_lo, nd_hi);
     InitializeCriticalSection(&cache_cs);
     cache = calloc(CACHE_SIZE, sizeof(*cache));
     pso_tls = TlsAlloc();

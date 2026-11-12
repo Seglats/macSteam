@@ -59,7 +59,7 @@ env=(
   ROSETTA_ADVERTISE_AVX=$(( ${+on[avx]} ))
 )
 # The environment is cleared below, so pass the d3d12 layer's switch through explicitly.
-for v in MACFINALS_SKIN_FIX; do
+for v in MACFINALS_SKIN_FIX MACFINALS_PRECISE_DISCARD MACFINALS_NO_DISCARD MACFINALS_NO_FAST MTL_CAPTURE_ENABLED WINEMAC_METAL_CAPTURE WINEMAC_METAL_CAPTURE_MS; do
   [[ -z ${(P)v:-} ]] || env+=("$v=${(P)v}")
 done
 (( ! ${+on[msync]} ))     || env+=(WINEMSYNC=1)

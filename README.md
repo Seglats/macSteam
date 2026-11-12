@@ -121,11 +121,17 @@ SteamDriver builds on:
 - [Recall](https://github.com/AsherJN/recall) by Joshua Asher Nelson;
 - Wine from CodeWeavers' published CrossOver sources;
 - DXMT by Feifan He through NerRobDog's fork;
-- Soju's runtime build recipe.
+- Soju's runtime build recipe;
+- the design of THE FINALS' Rosetta hook, which draws on
+  [rosettax87_jit](https://github.com/Lifeisawful/rosettax87_jit) by Lifeisawful.
 
 THE FINALS' route uses NotProton's Steam bridge (GPL-3.0; Valve's lsteamclient and steam-helper
 from Proton) unchanged, from your NotProton install. Apple's D3DMetal comes from your own Game
 Porting Toolkit and is never redistributed.
+
+This route was prompted by seeing
+[zzoko's compatibility setup run THE FINALS](https://www.youtube.com/watch?v=_2PVUeov3_A).
+This was promted by it having low fps aswell as the requirment with developer mode on.
 
 The original code is licensed under [Apache 2.0](LICENSE). Dependencies and patches keep their own
 licenses: see the [third-party notices](THIRD_PARTY_NOTICES.md) and [NOTICE](NOTICE).

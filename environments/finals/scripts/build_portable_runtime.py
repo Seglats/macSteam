@@ -160,6 +160,13 @@ WINE_PATCHES = [
     # into the prefix by the tool), the way Proton's Wine does it. Inert when lsteamclient.dll
     # can't be loaded, so the own-Steam prefix (Windows Steam inside) is unaffected.
     'wine-steamclient-lsteamclient.patch',
+    # Diagnostics only: Control-Option-G saves a Metal capture (.gputrace) when
+    # WINEMAC_METAL_CAPTURE names a folder and MTL_CAPTURE_ENABLED=1. Inert otherwise.
+    'wine-winemac-metal-capture.patch',
+    # The capture runs on its own queue: stopping it on the main thread never finished in THE FINALS.
+    'wine-winemac-metal-capture-queue.patch',
+    # WINEMAC_APPKIT_UPDATE_CYCLE=0 turns off AppKit's display-synchronized event loop. Inert otherwise.
+    'wine-winemac-update-cycle.patch',
 ]
 
 

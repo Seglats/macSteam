@@ -1,0 +1,59 @@
+--- a/dlls/user32/dialog.c
++++ b/dlls/user32/dialog.c
+@@ -776,14 +776,56 @@
+ /***********************************************************************
+  *           DIALOG_DoDialogBox
+  */
++/* MacFinals: a modal dialog whose title WINE_MSGBOX_ACCEPT lists (exact titles, separated by
++ * '|') and whose only button is a single push button is answered by clicking that button before
++ * it is shown: the dialog's own code gets the same WM_COMMAND a click sends. For programs that
++ * build their own message box from a dialog template (THE FINALS' minimum-spec warning). */
++static BOOL dialog_accepted( HWND hwnd, int *id )
++{
++    WCHAR title[256], list[1024], cls[16], *p, *next;
++    BOOL listed = FALSE;
++    HWND child, button = 0;
++    DWORD len;
++
++    len = GetEnvironmentVariableW( L"WINE_MSGBOX_ACCEPT", list, ARRAY_SIZE(list) );
++    if (!len || len >= ARRAY_SIZE(list)) return FALSE;
++    if (!GetWindowTextW( hwnd, title, ARRAY_SIZE(title) )) return FALSE;
++    for (p = list; p && !listed; p = next)
++    {
++        if ((next = wcschr( p, '|' ))) *next++ = 0;
++        listed = *p && !wcscmp( p, title );
++    }
++    if (!listed) return FALSE;
++    for (child = GetWindow( hwnd, GW_CHILD ); child; child = GetWindow( child, GW_HWNDNEXT ))
++    {
++        LONG type = GetWindowLongW( child, GWL_STYLE ) & BS_TYPEMASK;
++
++        if (!GetClassNameW( child, cls, ARRAY_SIZE(cls) ) || wcsicmp( cls, L"Button" )) continue;
++        if ((type != BS_PUSHBUTTON && type != BS_DEFPUSHBUTTON) || button)
++        {
++            ERR( "not answering %s: it has more than one button\n", debugstr_w(title) );
++            return FALSE;
++        }
++        button = child;
++    }
++    if (!button) return FALSE;
++    *id = GetDlgCtrlID( button );
++    ERR( "answered %s with its only button (%d) without showing it (WINE_MSGBOX_ACCEPT)\n", debugstr_w(title), *id );
++    return TRUE;
++}
++
+ INT DIALOG_DoDialogBox( HWND hwnd, HWND owner )
+ {
+     DIALOGINFO * dlgInfo;
+     MSG msg;
+     INT retval;
+     BOOL bFirstEmpty;
++    int id;
+ 
+     if (!(dlgInfo = DIALOG_get_info( hwnd, FALSE ))) return -1;
++
++    if (!(dlgInfo->flags & DF_END) && dialog_accepted( hwnd, &id ))
++        SendMessageW( hwnd, WM_COMMAND, MAKEWPARAM( id, BN_CLICKED ), (LPARAM)GetDlgItem( hwnd, id ) );
+ 
+     bFirstEmpty = TRUE;
+     if (!(dlgInfo->flags & DF_END)) /* was EndDialog called in WM_INITDIALOG ? */

@@ -1,0 +1,53 @@
+--- a/dlls/ntdll/unix/virtual.c
++++ b/dlls/ntdll/unix/virtual.c
+@@ -4547,11 +4547,31 @@
+ /***********************************************************************
+  *           virtual_alloc_thread_stack
+  */
++/* MacFinals: where the last thread stack went. Without a hint every new stack searched from the
++ * bottom of the address space, and on macOS that walks past the host's and Rosetta's mappings: THE
++ * FINALS creates about 45 threads a second, each failing some 800 fixed-address mappings while
++ * holding virtual_mutex (2026-11-12). The next search starts here, usually finding the slot of a
++ * stack freed since; a failed search falls back to the whole range. MACFINALS_STACK_HINT=0 turns
++ * it off. virtual_mutex protects it. */
++static void *thread_stack_hint;
++
++static BOOL thread_stack_hint_enabled(void)
++{
++    static int enabled = -1;
++    if (enabled < 0)
++    {
++        const char *value = getenv( "MACFINALS_STACK_HINT" );
++        enabled = !value || *value != '0';
++    }
++    return enabled;
++}
++
+ NTSTATUS virtual_alloc_thread_stack( INITIAL_TEB *stack, ULONG_PTR limit_low, ULONG_PTR limit_high,
+                                      SIZE_T reserve_size, SIZE_T commit_size, BOOL guard_page )
+ {
+     struct file_view *view;
+-    NTSTATUS status;
++    NTSTATUS status = STATUS_NO_MEMORY;
++    ULONG_PTR hint;
+     sigset_t sigset;
+     SIZE_T size;
+ 
+@@ -4564,9 +4584,15 @@
+ 
+     server_enter_uninterrupted_section( &virtual_mutex, &sigset );
+ 
+-    status = map_view( &view, NULL, size, 0, VPROT_READ | VPROT_WRITE | VPROT_COMMITTED,
+-                       limit_low, limit_high, 0 );
++    hint = (ULONG_PTR)thread_stack_hint;
++    if (hint && hint > limit_low && (!limit_high || hint + size - 1 <= limit_high) && thread_stack_hint_enabled())
++        status = map_view( &view, NULL, size, 0, VPROT_READ | VPROT_WRITE | VPROT_COMMITTED,
++                           hint, limit_high, 0 );
++    if (status != STATUS_SUCCESS)
++        status = map_view( &view, NULL, size, 0, VPROT_READ | VPROT_WRITE | VPROT_COMMITTED,
++                           limit_low, limit_high, 0 );
+     if (status != STATUS_SUCCESS) goto done;
++    thread_stack_hint = view->base;
+ 
+ #ifdef VALGRIND_STACK_REGISTER
+     VALGRIND_STACK_REGISTER( view->base, (char *)view->base + view->size );

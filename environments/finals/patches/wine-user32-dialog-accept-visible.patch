@@ -1,0 +1,42 @@
+--- a/dlls/user32/dialog.c
++++ b/dlls/user32/dialog.c
+@@ -442,6 +442,30 @@
+  *       is never disabled if the dialog fails because of an invalid template)
+  */
+ static BOOL dialog_accepted( HWND hwnd, int *id );
++
++/* MacFinals: a modeless dialog is answered once it is on screen, the way a player would click it:
++ * clicking it at creation, before its owner's loop was ready, left THE FINALS stuck in one launch
++ * of two (2026-11-12). Every 250 ms for up to 10 s; destroying the window ends the timer. */
++#define DIALOG_ACCEPT_TIMER 0x4d46
++static void CALLBACK dialog_accept_timer( HWND hwnd, UINT msg, UINT_PTR timer, DWORD time )
++{
++    UINT_PTR tries = (UINT_PTR)GetPropW( hwnd, L"MacFinalsAcceptTries" ) + 1;
++    int id;
++
++    SetPropW( hwnd, L"MacFinalsAcceptTries", (HANDLE)tries );
++    if (IsWindowVisible( hwnd ))
++    {
++        KillTimer( hwnd, DIALOG_ACCEPT_TIMER );
++        if (dialog_accepted( hwnd, &id ))
++            SendMessageW( hwnd, WM_COMMAND, MAKEWPARAM( id, BN_CLICKED ), (LPARAM)GetDlgItem( hwnd, id ) );
++        return;
++    }
++    if (tries >= 40)
++    {
++        ERR( "dialog %p never became visible; leaving it\n", hwnd );
++        KillTimer( hwnd, DIALOG_ACCEPT_TIMER );
++    }
++}
+ 
+ static HWND DIALOG_CreateIndirect( HINSTANCE hInst, LPCVOID dlgTemplate,
+                                    HWND owner, DLGPROC dlgProc, LPARAM param,
+@@ -714,7 +738,7 @@
+             ERR( "dialog %s created, %s, accept list %u chars\n", debugstr_w(title),
+                  modal_owner ? "modal" : "modeless", GetEnvironmentVariableW( L"WINE_MSGBOX_ACCEPT", NULL, 0 ) );
+             if (!modal_owner && dialog_accepted( hwnd, &id ))
+-                PostMessageW( hwnd, WM_COMMAND, MAKEWPARAM( id, BN_CLICKED ), (LPARAM)GetDlgItem( hwnd, id ) );
++                SetTimer( hwnd, DIALOG_ACCEPT_TIMER, 250, dialog_accept_timer );
+         }
+ 
+         if (template.style & WS_VISIBLE && !(GetWindowLongW( hwnd, GWL_STYLE ) & WS_VISIBLE))

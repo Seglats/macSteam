@@ -1,0 +1,46 @@
+--- a/dlls/user32/dialog.c
++++ b/dlls/user32/dialog.c
+@@ -441,6 +441,8 @@
+  *       (it's more compatible to do it here, as under Windows the owner
+  *       is never disabled if the dialog fails because of an invalid template)
+  */
++static BOOL dialog_accepted( HWND hwnd, int *id );
++
+ static HWND DIALOG_CreateIndirect( HINSTANCE hInst, LPCVOID dlgTemplate,
+                                    HWND owner, DLGPROC dlgProc, LPARAM param,
+                                    BOOL unicode, HWND *modal_owner )
+@@ -701,6 +703,20 @@
+         if (modal_owner && (capture = GetCapture()))
+             SendMessageW( capture, WM_CANCELMODE, 0, 0 );
+ 
++        {
++            /* MacFinals: every dialog is logged (err class: rare, and the evidence when a
++               WINE_MSGBOX_ACCEPT title does not match). A modeless one is answered by posting
++               its button's click, which its owner's message loop delivers. */
++            WCHAR title[256] = {0};
++            int id;
++
++            GetWindowTextW( hwnd, title, ARRAY_SIZE(title) );
++            ERR( "dialog %s created, %s, accept list %u chars\n", debugstr_w(title),
++                 modal_owner ? "modal" : "modeless", GetEnvironmentVariableW( L"WINE_MSGBOX_ACCEPT", NULL, 0 ) );
++            if (!modal_owner && dialog_accepted( hwnd, &id ))
++                PostMessageW( hwnd, WM_COMMAND, MAKEWPARAM( id, BN_CLICKED ), (LPARAM)GetDlgItem( hwnd, id ) );
++        }
++
+         if (template.style & WS_VISIBLE && !(GetWindowLongW( hwnd, GWL_STYLE ) & WS_VISIBLE))
+         {
+             NtUserShowWindow( hwnd, SW_SHOWNORMAL ); /* SW_SHOW doesn't always work */
+@@ -836,6 +852,13 @@
+             {
+                 if (bFirstEmpty)
+                 {
++                    /* MacFinals: the title may have been set by a posted message: check again */
++                    if (dialog_accepted( hwnd, &id ))
++                    {
++                        SendMessageW( hwnd, WM_COMMAND, MAKEWPARAM( id, BN_CLICKED ), (LPARAM)GetDlgItem( hwnd, id ) );
++                        if (!IsWindow( hwnd )) return 0;
++                        if (dlgInfo->flags & DF_END) break;
++                    }
+                     /* ShowWindow the first time the queue goes empty */
+                     NtUserShowWindow( hwnd, SW_SHOWNORMAL );
+                     bFirstEmpty = FALSE;

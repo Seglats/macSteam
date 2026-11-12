@@ -1,0 +1,42 @@
+--- a/dlls/user32/msgbox.c
++++ b/dlls/user32/msgbox.c
+@@ -510,6 +510,30 @@
+     if (!IS_INTRESOURCE(captionW.Buffer)) RtlFreeUnicodeString(&captionW);
+     if (!IS_INTRESOURCE(iconW.Buffer)) RtlFreeUnicodeString(&iconW);
+     return ret;
++}
++
++/* MacFinals: WINE_MSGBOX_ACCEPT lists, separated by '|', the exact titles of message boxes whose
++ * only button is OK that are answered OK without being shown, as if the user had clicked it.
++ * Anything else, a question included, is shown as before. */
++static BOOL msgbox_accepted( const MSGBOXPARAMSW *msgbox )
++{
++    WCHAR list[1024], *p, *next;
++    DWORD len;
++
++    if ((msgbox->dwStyle & MB_TYPEMASK) != MB_OK) return FALSE;
++    if (!msgbox->lpszCaption || IS_INTRESOURCE( msgbox->lpszCaption )) return FALSE;
++    len = GetEnvironmentVariableW( L"WINE_MSGBOX_ACCEPT", list, ARRAY_SIZE(list) );
++    if (!len || len >= ARRAY_SIZE(list)) return FALSE;
++    for (p = list; p; p = next)
++    {
++        if ((next = wcschr( p, '|' ))) *next++ = 0;
++        if (*p && !wcscmp( p, msgbox->lpszCaption ))
++        {
++            TRACE( "answered %s with OK without showing it\n", debugstr_w(msgbox->lpszCaption) );
++            return TRUE;
++        }
++    }
++    return FALSE;
+ }
+ 
+ /**************************************************************************
+@@ -523,6 +547,8 @@
+     UINT i;
+     struct ThreadWindows threadWindows;
+ 
++    if (msgbox_accepted( msgbox )) return IDOK;
++
+     if (!(hRes = FindResourceExW(user32_module, (LPWSTR)RT_DIALOG, L"MSGBOX", msgbox->dwLanguageId)))
+     {
+         if (!msgbox->dwLanguageId ||

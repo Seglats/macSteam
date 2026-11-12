@@ -1,0 +1,62 @@
+--- a/dlls/user32/dialog.c
++++ b/dlls/user32/dialog.c
+@@ -447,23 +447,29 @@
+  * clicking it at creation, before its owner's loop was ready, left THE FINALS stuck in one launch
+  * of two (2026-11-12). Every 250 ms for up to 10 s; destroying the window ends the timer. */
+ #define DIALOG_ACCEPT_TIMER 0x4d46
++/* The click, once: the first time the dialog's own loop hands one of its messages to
++ * IsDialogMessage (proof that the program is running the dialog), or from the timer below as a
++ * safety net. Posted, so it arrives through that loop like a real click. */
++static void dialog_accept_click( HWND hwnd, const char *why )
++{
++    int id;
++
++    if (!RemovePropW( hwnd, L"MacFinalsAcceptPending" )) return;
++    NtUserKillTimer( hwnd, DIALOG_ACCEPT_TIMER );
++    ERR( "dialog %p: clicking at %lu ms (%s, %s)\n", hwnd, (unsigned long)GetTickCount(), why,
++         IsWindowVisible( hwnd ) ? "on screen" : "not on screen yet" );
++    if (dialog_accepted( hwnd, &id ))
++        PostMessageW( hwnd, WM_COMMAND, MAKEWPARAM( id, BN_CLICKED ), (LPARAM)GetDlgItem( hwnd, id ) );
++}
++
+ static void CALLBACK dialog_accept_timer( HWND hwnd, UINT msg, UINT_PTR timer, DWORD time )
+ {
+     UINT_PTR tries = (UINT_PTR)GetPropW( hwnd, L"MacFinalsAcceptTries" ) + 1;
+-    BOOL visible = IsWindowVisible( hwnd );
+-    int id;
+ 
+     SetPropW( hwnd, L"MacFinalsAcceptTries", (HANDLE)tries );
+-    /* On screen, or half a second after creation even if not: with the game in the background the
+-       dialog may not be shown until the player switches to it (2026-11-12). */
+-    if (visible || tries >= 2)
+-    {
+-        NtUserKillTimer( hwnd, DIALOG_ACCEPT_TIMER );
+-        ERR( "dialog %p: check %Iu at %lu ms, %s\n", hwnd, tries, (unsigned long)GetTickCount(),
+-             visible ? "on screen" : "not on screen yet" );
+-        if (dialog_accepted( hwnd, &id ))
+-            SendMessageW( hwnd, WM_COMMAND, MAKEWPARAM( id, BN_CLICKED ), (LPARAM)GetDlgItem( hwnd, id ) );
+-    }
++    /* Safety net if the program never calls IsDialogMessage for it: on screen, or half a
++       second after creation even if not (a game in the background may not show it). */
++    if (IsWindowVisible( hwnd ) || tries >= 2) dialog_accept_click( hwnd, "timer" );
+ }
+ 
+ static HWND DIALOG_CreateIndirect( HINSTANCE hInst, LPCVOID dlgTemplate,
+@@ -739,6 +745,7 @@
+             if (!modal_owner && dialog_accepted( hwnd, &id ))
+             {
+                 ERR( "dialog %p: created at %lu ms\n", hwnd, (unsigned long)GetTickCount() );
++                SetPropW( hwnd, L"MacFinalsAcceptPending", (HANDLE)1 );
+                 SetTimer( hwnd, DIALOG_ACCEPT_TIMER, 250, dialog_accept_timer );
+             }
+         }
+@@ -1245,6 +1252,9 @@
+ 
+     if (!IsWindow( hwndDlg ))
+         return FALSE;
++
++    if (GetPropW( hwndDlg, L"MacFinalsAcceptPending" ))
++        dialog_accept_click( WIN_GetFullHandle( hwndDlg ), "its loop is running" );
+ 
+     if (NtUserCallMsgFilter( msg, MSGF_DIALOGBOX )) return TRUE;
+ 

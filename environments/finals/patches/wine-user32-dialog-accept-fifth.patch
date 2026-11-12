@@ -1,0 +1,31 @@
+--- a/dlls/user32/dialog.c
++++ b/dlls/user32/dialog.c
+@@ -462,10 +462,10 @@
+         PostMessageW( hwnd, WM_COMMAND, MAKEWPARAM( id, BN_CLICKED ), (LPARAM)GetDlgItem( hwnd, id ) );
+ }
+ 
+-/* Fires 0.1 s after the dialog's loop first ran it, or 1 s after creation as a safety net. */
++/* Fires 0.2 s after the dialog's loop first ran it, or 1 s after creation as a safety net. */
+ static void CALLBACK dialog_accept_timer( HWND hwnd, UINT msg, UINT_PTR timer, DWORD time )
+ {
+-    dialog_accept_click( hwnd, GetPropW( hwnd, L"MacFinalsAcceptLoop" ) ? "0.1 s after its loop started"
++    dialog_accept_click( hwnd, GetPropW( hwnd, L"MacFinalsAcceptLoop" ) ? "0.2 s after its loop started"
+                                                                          : "1 s safety net" );
+ }
+ 
+@@ -1250,11 +1250,13 @@
+     if (!IsWindow( hwndDlg ))
+         return FALSE;
+ 
+-    /* The program is running the dialog: click it 0.1 s from now (replaces the 1 s safety net). */
++    /* The program is running the dialog: click it 0.2 s from now (replaces the 1 s safety net;
++       0.1 s left THE FINALS stuck in one launch of about ten, 2026-11-12). */
+     if (GetPropW( hwndDlg, L"MacFinalsAcceptPending" ) && !GetPropW( hwndDlg, L"MacFinalsAcceptLoop" ))
+     {
+         SetPropW( hwndDlg, L"MacFinalsAcceptLoop", (HANDLE)1 );
+-        SetTimer( WIN_GetFullHandle( hwndDlg ), DIALOG_ACCEPT_TIMER, 100, dialog_accept_timer );
++        ERR( "dialog %p: its loop started at %lu ms\n", hwndDlg, (unsigned long)GetTickCount() );
++        SetTimer( WIN_GetFullHandle( hwndDlg ), DIALOG_ACCEPT_TIMER, 200, dialog_accept_timer );
+     }
+ 
+     if (NtUserCallMsgFilter( msg, MSGF_DIALOGBOX )) return TRUE;

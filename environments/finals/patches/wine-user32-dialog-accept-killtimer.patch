@@ -1,0 +1,20 @@
+--- a/dlls/user32/dialog.c
++++ b/dlls/user32/dialog.c
+@@ -455,7 +455,7 @@
+     SetPropW( hwnd, L"MacFinalsAcceptTries", (HANDLE)tries );
+     if (IsWindowVisible( hwnd ))
+     {
+-        KillTimer( hwnd, DIALOG_ACCEPT_TIMER );
++        NtUserKillTimer( hwnd, DIALOG_ACCEPT_TIMER );
+         if (dialog_accepted( hwnd, &id ))
+             SendMessageW( hwnd, WM_COMMAND, MAKEWPARAM( id, BN_CLICKED ), (LPARAM)GetDlgItem( hwnd, id ) );
+         return;
+@@ -463,7 +463,7 @@
+     if (tries >= 40)
+     {
+         ERR( "dialog %p never became visible; leaving it\n", hwnd );
+-        KillTimer( hwnd, DIALOG_ACCEPT_TIMER );
++        NtUserKillTimer( hwnd, DIALOG_ACCEPT_TIMER );
+     }
+ }
+ 

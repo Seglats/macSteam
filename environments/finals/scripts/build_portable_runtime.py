@@ -167,6 +167,33 @@ WINE_PATCHES = [
     'wine-winemac-metal-capture-queue.patch',
     # WINEMAC_APPKIT_UPDATE_CYCLE=0 turns off AppKit's display-synchronized event loop. Inert otherwise.
     'wine-winemac-update-cycle.patch',
+    # Thread stacks: the next search starts where the last stack went (MACFINALS_STACK_HINT=0 off).
+    'wine-ntdll-thread-stack-hint.patch',
+    # WINE_MSGBOX_ACCEPT: OK-only message boxes with these exact titles are answered OK unseen.
+    'wine-user32-msgbox-accept.patch',
+    # The same list for TaskDialog, which is what the game's minimum-spec warning actually uses.
+    'wine-comctl32-taskdialog-accept.patch',
+    # Single-choice task dialogs too (one button of their own), and every dialog title logged.
+    'wine-dialog-accept-single-choice.patch',
+    # The same list for modal dialogs built from a template with a single push button: what
+    # THE FINALS' minimum-spec warning really is (template title "Dialog", text box, OK).
+    'wine-user32-dialog-accept.patch',
+    # Every dialog logged; checked again before it is first shown, and modeless ones too.
+    'wine-user32-dialog-accept-late.patch',
+    # Modeless: click once the dialog is on screen, not at creation (that could leave the game stuck).
+    'wine-user32-dialog-accept-visible.patch',
+    # user32 links NtUserKillTimer, not KillTimer.
+    'wine-user32-dialog-accept-killtimer.patch',
+    # Click a second after creation even if not yet on screen (game started in the background).
+    'wine-user32-dialog-accept-background.patch',
+    # Half a second instead of one.
+    'wine-user32-dialog-accept-half-second.patch',
+    # Click when the program first runs the dialog through IsDialogMessage; the timer stays as a net.
+    'wine-user32-dialog-accept-loop.patch',
+    # Click 0.1 s after the dialog's loop first runs it; 1 s safety net.
+    'wine-user32-dialog-accept-tenth.patch',
+    # 0.2 s instead of 0.1 s, and log when the dialog's loop starts.
+    'wine-user32-dialog-accept-fifth.patch',
 ]
 
 

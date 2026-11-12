@@ -20,6 +20,9 @@
 #   STEAMDRIVER_MSYNC=0, STEAMDRIVER_AVX=0      MSync / ROSETTA_ADVERTISE_AVX off
 #   STEAMDRIVER_GAME_MODE=1                     start Discovery.exe from its game app, so macOS can
 #                                                turn Game Mode on (needs native fullscreen)
+#   STEAMDRIVER_GPU_WARNING=1                   always show the game's "Minimum Hardware Requirements Not
+#                                                Met" box (by default it is shown on the first launch only;
+#                                                afterwards Wine answers it OK unseen, as if clicked)
 #   WINEDEBUG=...                               Wine's channels (default: errors and DLL loads)
 #   STEAMDRIVER_PERF=1                          per-process performance counters, 10 a second, in
 #                                                <compatdata>/perf/<date>/; read them with
@@ -97,6 +100,12 @@ export WINEESYNC=0
 [[ ${STEAMDRIVER_MSYNC:-1} == 0 ]] && unset WINEMSYNC || export WINEMSYNC=1
 export ROSETTA_ADVERTISE_AVX=$([[ ${STEAMDRIVER_AVX:-1} == 0 ]] && print 0 || print 1)
 export WINEDEBUG=${WINEDEBUG:-err+all,fixme-all,+loaddll}
+# The game's minimum-spec warning (Unreal's, every start on a Mac GPU): shown on the first launch
+# in this prefix, then answered OK as if clicked. Deleting the marker shows it once more.
+gpu_warning_seen=$compat/steamdriver-gpu-warning-seen
+if [[ ${STEAMDRIVER_GPU_WARNING:-0} == 0 && -f $gpu_warning_seen ]]; then
+  export WINE_MSGBOX_ACCEPT='Minimum Hardware Requirements Not Met'
+fi
 
 # SteamDriver's Mac driver mouse (its NotProton rows, docs/NOTPROTON.md).
 case ${STEAMDRIVER_MOUSE:-precise} in
@@ -140,10 +149,22 @@ case $verb in
       export MTL_CAPTURE_ENABLED=1 WINEMAC_METAL_CAPTURE=$compat/captures
       say "Metal capture on: Control-Option-G saves to $compat/captures"
     fi
+    # Wine's output is appended every launch; keep one previous copy past 200 MB.
+    wlog=$compat/steamdriver-wine.log
+    if [[ -f $wlog ]] && (( $(/usr/bin/stat -f %z "$wlog") > 200000000 )); then
+      /bin/mv -f "$wlog" "$wlog.old"
+      say "Wine log rotated to steamdriver-wine.log.old"
+    fi
     say "launching: $shim $*"
+    started=$SECONDS
     "$WINELOADER" "$shim" "$@" >> "$compat/steamdriver-wine.log" 2>&1
     rc=$?
     say "game exited ($rc); ending the prefix's Wine session"
+    # The warning appears at start: a session that lasted past it has shown it.
+    if [[ ! -f $gpu_warning_seen ]] && (( SECONDS - started > 30 )); then
+      : > "$gpu_warning_seen"
+      say "the minimum-spec warning has been shown once; later launches answer it"
+    fi
     "$WINESERVER" -k 2>/dev/null
     exit $rc ;;
   runinprefix)

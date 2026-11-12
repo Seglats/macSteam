@@ -1,0 +1,88 @@
+--- a/dlls/comctl32_v6/taskdialog.c
++++ b/dlls/comctl32_v6/taskdialog.c
+@@ -1375,28 +1375,39 @@
+  * TaskDialogIndirect [COMCTL32.@]
+  */
+ /* MacFinals: WINE_MSGBOX_ACCEPT lists, separated by '|', the exact window titles of task dialogs
+- * that only offer OK (no other buttons, radio buttons or check box) and are answered OK without
+- * being shown, as if the user had clicked it. The same list user32's MessageBox reads. */
+-static BOOL taskdialog_accepted(const TASKDIALOGCONFIG *taskconfig)
++ * with a single choice (OK, or one button of their own; no radio buttons or check box) that are
++ * answered with it without being shown, as if the user had clicked it. The same list user32's
++ * MessageBox reads. Every task dialog is logged (err class: rare, and the evidence when a title
++ * does not match). */
++static BOOL taskdialog_accepted(const TASKDIALOGCONFIG *taskconfig, int *id)
+ {
++    const WCHAR *title = taskconfig->pszWindowTitle;
+     WCHAR list[1024], *p, *next;
++    BOOL listed = FALSE;
+     DWORD len;
+ 
+-    if (taskconfig->cButtons || taskconfig->cRadioButtons || taskconfig->pszVerificationText) return FALSE;
+-    if (taskconfig->dwCommonButtons && taskconfig->dwCommonButtons != TDCBF_OK_BUTTON) return FALSE;
+-    if (!taskconfig->pszWindowTitle || IS_INTRESOURCE(taskconfig->pszWindowTitle)) return FALSE;
++    ERR("task dialog %s: %u button(s), common %#x, %u radio, check %s, flags %#x\n",
++        IS_INTRESOURCE(title) ? wine_dbg_sprintf("#%Iu", (ULONG_PTR)title) : debugstr_w(title),
++        taskconfig->cButtons, taskconfig->dwCommonButtons, taskconfig->cRadioButtons,
++        debugstr_w(taskconfig->pszVerificationText), taskconfig->dwFlags);
++    if (!title || IS_INTRESOURCE(title)) return FALSE;
+     len = GetEnvironmentVariableW(L"WINE_MSGBOX_ACCEPT", list, ARRAY_SIZE(list));
+     if (!len || len >= ARRAY_SIZE(list)) return FALSE;
+-    for (p = list; p; p = next)
++    for (p = list; p && !listed; p = next)
+     {
+         if ((next = wcschr(p, '|'))) *next++ = 0;
+-        if (*p && !wcscmp(p, taskconfig->pszWindowTitle))
+-        {
+-            TRACE("answered %s with OK without showing it\n", debugstr_w(taskconfig->pszWindowTitle));
+-            return TRUE;
+-        }
++        listed = *p && !wcscmp(p, title);
+     }
+-    return FALSE;
++    if (!listed) return FALSE;
++    if (taskconfig->cRadioButtons || taskconfig->pszVerificationText) return FALSE;
++    if (!taskconfig->cButtons && (!taskconfig->dwCommonButtons || taskconfig->dwCommonButtons == TDCBF_OK_BUTTON))
++        *id = IDOK;
++    else if (taskconfig->cButtons == 1 && !taskconfig->dwCommonButtons && taskconfig->pButtons)
++        *id = taskconfig->pButtons[0].nButtonID;
++    else
++        return FALSE;
++    ERR("answered %s with button %d without showing it (WINE_MSGBOX_ACCEPT)\n", debugstr_w(title), *id);
++    return TRUE;
+ }
+ 
+ HRESULT WINAPI TaskDialogIndirect(const TASKDIALOGCONFIG *taskconfig, int *button,
+@@ -1411,9 +1422,9 @@
+     if (!taskconfig || taskconfig->cbSize != sizeof(TASKDIALOGCONFIG))
+         return E_INVALIDARG;
+ 
+-    if (taskdialog_accepted(taskconfig))
++    if (taskdialog_accepted(taskconfig, &ret))
+     {
+-        if (button) *button = IDOK;
++        if (button) *button = ret;
+         if (radio_button) *radio_button = 0;
+         if (verification_flag_checked) *verification_flag_checked = FALSE;
+         return S_OK;
+--- a/dlls/user32/msgbox.c
++++ b/dlls/user32/msgbox.c
+@@ -520,6 +520,9 @@
+     WCHAR list[1024], *p, *next;
+     DWORD len;
+ 
++    ERR( "message box %s: style %#lx\n", IS_INTRESOURCE( msgbox->lpszCaption ) ?
++         wine_dbg_sprintf( "#%Iu", (ULONG_PTR)msgbox->lpszCaption ) : debugstr_w( msgbox->lpszCaption ),
++         msgbox->dwStyle );
+     if ((msgbox->dwStyle & MB_TYPEMASK) != MB_OK) return FALSE;
+     if (!msgbox->lpszCaption || IS_INTRESOURCE( msgbox->lpszCaption )) return FALSE;
+     len = GetEnvironmentVariableW( L"WINE_MSGBOX_ACCEPT", list, ARRAY_SIZE(list) );
+@@ -529,7 +532,7 @@
+         if ((next = wcschr( p, '|' ))) *next++ = 0;
+         if (*p && !wcscmp( p, msgbox->lpszCaption ))
+         {
+-            TRACE( "answered %s with OK without showing it\n", debugstr_w(msgbox->lpszCaption) );
++            ERR( "answered %s with OK without showing it (WINE_MSGBOX_ACCEPT)\n", debugstr_w(msgbox->lpszCaption) );
+             return TRUE;
+         }
+     }

@@ -1,0 +1,49 @@
+--- a/dlls/comctl32_v6/taskdialog.c
++++ b/dlls/comctl32_v6/taskdialog.c
+@@ -1374,6 +1374,31 @@
+ /***********************************************************************
+  * TaskDialogIndirect [COMCTL32.@]
+  */
++/* MacFinals: WINE_MSGBOX_ACCEPT lists, separated by '|', the exact window titles of task dialogs
++ * that only offer OK (no other buttons, radio buttons or check box) and are answered OK without
++ * being shown, as if the user had clicked it. The same list user32's MessageBox reads. */
++static BOOL taskdialog_accepted(const TASKDIALOGCONFIG *taskconfig)
++{
++    WCHAR list[1024], *p, *next;
++    DWORD len;
++
++    if (taskconfig->cButtons || taskconfig->cRadioButtons || taskconfig->pszVerificationText) return FALSE;
++    if (taskconfig->dwCommonButtons && taskconfig->dwCommonButtons != TDCBF_OK_BUTTON) return FALSE;
++    if (!taskconfig->pszWindowTitle || IS_INTRESOURCE(taskconfig->pszWindowTitle)) return FALSE;
++    len = GetEnvironmentVariableW(L"WINE_MSGBOX_ACCEPT", list, ARRAY_SIZE(list));
++    if (!len || len >= ARRAY_SIZE(list)) return FALSE;
++    for (p = list; p; p = next)
++    {
++        if ((next = wcschr(p, '|'))) *next++ = 0;
++        if (*p && !wcscmp(p, taskconfig->pszWindowTitle))
++        {
++            TRACE("answered %s with OK without showing it\n", debugstr_w(taskconfig->pszWindowTitle));
++            return TRUE;
++        }
++    }
++    return FALSE;
++}
++
+ HRESULT WINAPI TaskDialogIndirect(const TASKDIALOGCONFIG *taskconfig, int *button,
+                                   int *radio_button, BOOL *verification_flag_checked)
+ {
+@@ -1386,6 +1411,14 @@
+     if (!taskconfig || taskconfig->cbSize != sizeof(TASKDIALOGCONFIG))
+         return E_INVALIDARG;
+ 
++    if (taskdialog_accepted(taskconfig))
++    {
++        if (button) *button = IDOK;
++        if (radio_button) *radio_button = 0;
++        if (verification_flag_checked) *verification_flag_checked = FALSE;
++        return S_OK;
++    }
++
+     dialog_info.taskconfig = taskconfig;
+ 
+     template = create_taskdialog_template(taskconfig);

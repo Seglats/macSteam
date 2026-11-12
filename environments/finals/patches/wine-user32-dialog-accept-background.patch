@@ -1,0 +1,40 @@
+--- a/dlls/user32/dialog.c
++++ b/dlls/user32/dialog.c
+@@ -450,20 +450,19 @@
+ static void CALLBACK dialog_accept_timer( HWND hwnd, UINT msg, UINT_PTR timer, DWORD time )
+ {
+     UINT_PTR tries = (UINT_PTR)GetPropW( hwnd, L"MacFinalsAcceptTries" ) + 1;
++    BOOL visible = IsWindowVisible( hwnd );
+     int id;
+ 
+     SetPropW( hwnd, L"MacFinalsAcceptTries", (HANDLE)tries );
+-    if (IsWindowVisible( hwnd ))
++    /* On screen, or a second after creation even if not: with the game in the background the
++       dialog may not be shown until the player switches to it (2026-11-12). */
++    if (visible || tries >= 4)
+     {
+         NtUserKillTimer( hwnd, DIALOG_ACCEPT_TIMER );
++        ERR( "dialog %p: check %Iu at %lu ms, %s\n", hwnd, tries, (unsigned long)GetTickCount(),
++             visible ? "on screen" : "not on screen yet" );
+         if (dialog_accepted( hwnd, &id ))
+             SendMessageW( hwnd, WM_COMMAND, MAKEWPARAM( id, BN_CLICKED ), (LPARAM)GetDlgItem( hwnd, id ) );
+-        return;
+-    }
+-    if (tries >= 40)
+-    {
+-        ERR( "dialog %p never became visible; leaving it\n", hwnd );
+-        NtUserKillTimer( hwnd, DIALOG_ACCEPT_TIMER );
+     }
+ }
+ 
+@@ -738,7 +737,10 @@
+             ERR( "dialog %s created, %s, accept list %u chars\n", debugstr_w(title),
+                  modal_owner ? "modal" : "modeless", GetEnvironmentVariableW( L"WINE_MSGBOX_ACCEPT", NULL, 0 ) );
+             if (!modal_owner && dialog_accepted( hwnd, &id ))
++            {
++                ERR( "dialog %p: created at %lu ms\n", hwnd, (unsigned long)GetTickCount() );
+                 SetTimer( hwnd, DIALOG_ACCEPT_TIMER, 250, dialog_accept_timer );
++            }
+         }
+ 
+         if (template.style & WS_VISIBLE && !(GetWindowLongW( hwnd, GWL_STYLE ) & WS_VISIBLE))

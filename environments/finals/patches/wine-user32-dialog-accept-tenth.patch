@@ -1,0 +1,44 @@
+--- a/dlls/user32/dialog.c
++++ b/dlls/user32/dialog.c
+@@ -462,14 +462,11 @@
+         PostMessageW( hwnd, WM_COMMAND, MAKEWPARAM( id, BN_CLICKED ), (LPARAM)GetDlgItem( hwnd, id ) );
+ }
+ 
++/* Fires 0.1 s after the dialog's loop first ran it, or 1 s after creation as a safety net. */
+ static void CALLBACK dialog_accept_timer( HWND hwnd, UINT msg, UINT_PTR timer, DWORD time )
+ {
+-    UINT_PTR tries = (UINT_PTR)GetPropW( hwnd, L"MacFinalsAcceptTries" ) + 1;
+-
+-    SetPropW( hwnd, L"MacFinalsAcceptTries", (HANDLE)tries );
+-    /* Safety net if the program never calls IsDialogMessage for it: on screen, or half a
+-       second after creation even if not (a game in the background may not show it). */
+-    if (IsWindowVisible( hwnd ) || tries >= 2) dialog_accept_click( hwnd, "timer" );
++    dialog_accept_click( hwnd, GetPropW( hwnd, L"MacFinalsAcceptLoop" ) ? "0.1 s after its loop started"
++                                                                         : "1 s safety net" );
+ }
+ 
+ static HWND DIALOG_CreateIndirect( HINSTANCE hInst, LPCVOID dlgTemplate,
+@@ -746,7 +743,7 @@
+             {
+                 ERR( "dialog %p: created at %lu ms\n", hwnd, (unsigned long)GetTickCount() );
+                 SetPropW( hwnd, L"MacFinalsAcceptPending", (HANDLE)1 );
+-                SetTimer( hwnd, DIALOG_ACCEPT_TIMER, 250, dialog_accept_timer );
++                SetTimer( hwnd, DIALOG_ACCEPT_TIMER, 1000, dialog_accept_timer );
+             }
+         }
+ 
+@@ -1253,8 +1250,12 @@
+     if (!IsWindow( hwndDlg ))
+         return FALSE;
+ 
+-    if (GetPropW( hwndDlg, L"MacFinalsAcceptPending" ))
+-        dialog_accept_click( WIN_GetFullHandle( hwndDlg ), "its loop is running" );
++    /* The program is running the dialog: click it 0.1 s from now (replaces the 1 s safety net). */
++    if (GetPropW( hwndDlg, L"MacFinalsAcceptPending" ) && !GetPropW( hwndDlg, L"MacFinalsAcceptLoop" ))
++    {
++        SetPropW( hwndDlg, L"MacFinalsAcceptLoop", (HANDLE)1 );
++        SetTimer( WIN_GetFullHandle( hwndDlg ), DIALOG_ACCEPT_TIMER, 100, dialog_accept_timer );
++    }
+ 
+     if (NtUserCallMsgFilter( msg, MSGF_DIALOGBOX )) return TRUE;
+ 

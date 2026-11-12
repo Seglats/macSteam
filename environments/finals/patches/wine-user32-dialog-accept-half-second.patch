@@ -1,0 +1,14 @@
+--- a/dlls/user32/dialog.c
++++ b/dlls/user32/dialog.c
+@@ -454,9 +454,9 @@
+     int id;
+ 
+     SetPropW( hwnd, L"MacFinalsAcceptTries", (HANDLE)tries );
+-    /* On screen, or a second after creation even if not: with the game in the background the
++    /* On screen, or half a second after creation even if not: with the game in the background the
+        dialog may not be shown until the player switches to it (2026-11-12). */
+-    if (visible || tries >= 4)
++    if (visible || tries >= 2)
+     {
+         NtUserKillTimer( hwnd, DIALOG_ACCEPT_TIMER );
+         ERR( "dialog %p: check %Iu at %lu ms, %s\n", hwnd, tries, (unsigned long)GetTickCount(),

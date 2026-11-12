@@ -2,6 +2,22 @@
 
 Start here after a context reset. Details live in the linked files.
 
+## Newest (2026-11-12): thread stacks, the popup, the Rosetta start-up crash
+
+- **Runtime `macfinals-92`** is installed in the Steam tool by hand. The rope fix from `-65` is
+  confirmed in game.
+- **Thread stacks:** Wine tries the last stack's place first. In an A/B, the VM lock is held half
+  as long and about 20k failed mappings a second are gone, but FPS and hitches don't change.
+  `MACFINALS_STACK_HINT=0` turns it off.
+- **The minimum-spec popup** is shown on the first launch in a prefix, then clicked OK
+  automatically (`WINE_MSGBOX_ACCEPT`, marker file, `STEAMDRIVER_GPU_WARNING=1` always shows it).
+- **Open: Rosetta crashes the game during start-up** (`rosetta error: no code fragment associated
+  with the given arm pc`). It shows up as Denuvo's "taking longer to start than expected". It
+  hits about 1 launch in 9, and nearly half with `STEAMDRIVER_PERF=1`.
+- **GameThread is the limit** (about 86 % of a core in play). Little left to gain on the Wine
+  side.
+- Full account: `R23_STACKS_POPUP_ROSETTA_CRASH.md`.
+
 ## Newest (2026-11-10): the missing rope, and new debug tools
 
 - **Runtime `macfinals-65`** is installed in the Steam tool by hand. It adds Metal capture

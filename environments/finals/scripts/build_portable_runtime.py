@@ -171,7 +171,7 @@ WINE_PATCHES = [
     'wine-ntdll-thread-stack-hint.patch',
     # WINE_MSGBOX_ACCEPT: OK-only message boxes with these exact titles are answered OK unseen.
     'wine-user32-msgbox-accept.patch',
-    # The same list for TaskDialog, which is what the game's minimum-spec warning actually uses.
+    # The same list for TaskDialog (THE FINALS' warning turned out not to be one).
     'wine-comctl32-taskdialog-accept.patch',
     # Single-choice task dialogs too (one button of their own), and every dialog title logged.
     'wine-dialog-accept-single-choice.patch',

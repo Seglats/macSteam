@@ -1,0 +1,224 @@
+--- a/dlls/winemac.drv/cocoa_app.h
++++ b/dlls/winemac.drv/cocoa_app.h
+@@ -188,4 +188,13 @@
+ /* When each D3DMetal frame reached the screen (WINEMAC_INPUT_STATS), cocoa_app.m. */
+ extern int macdrv_present_stats_on;
+ extern void macdrv_present_record(double presented, double requested, double acquired);
++/* One frame for the per-frame file <prefix>-frames-<pid>.csv (cocoa_app.m, macdrv_present_frame). */
++struct macdrv_present_frame
++{
++    double requested, acquired, handed, target, presented;
++    char how;                     /* p = present, t = presentAtTime:, m = presentAfterMinimumDuration:, - = not seen */
++    unsigned char sync, transaction, drawables;
++    unsigned short width, height;
++};
++extern void macdrv_present_frame(const struct macdrv_present_frame *frame);
+ void LogErrorv(const char* func, NSString* format, va_list args);
+--- a/dlls/winemac.drv/cocoa_app.m
++++ b/dlls/winemac.drv/cocoa_app.m
+@@ -1285,7 +1285,65 @@
+     }
+     os_unfair_lock_unlock(&present_lock);
+ }
++
++/* Per-frame record for <prefix>-frames-<pid>.csv (2026-11-13), to find where a frame that took
++ * a refresh longer than its neighbours to reach the display lost the time: requested/acquired
++ * (nextDrawable), handed = when D3DMetal's present of the drawable ran (the command buffer was
++ * scheduled), target = the time asked for with presentAtTime:, presented = on the display (0 =
++ * never shown). Plus the layer settings D3DMetal chose. Written by the per-second report, so
++ * nothing but a memory copy happens per frame. */
++#define PRESENT_RING 8192
++static struct macdrv_present_frame present_ring[PRESENT_RING];
++static unsigned int present_ring_count, present_ring_lost;
++static FILE *present_frames_file;
++static double present_frames_t0;
+ 
++void macdrv_present_frame(const struct macdrv_present_frame *frame)
++{
++    os_unfair_lock_lock(&present_lock);
++    if (present_ring_count < PRESENT_RING) present_ring[present_ring_count++] = *frame;
++    else present_ring_lost++;
++    os_unfair_lock_unlock(&present_lock);
++}
++
++static void macdrv_present_frames_flush(void)
++{
++    static struct macdrv_present_frame frames[PRESENT_RING];
++    unsigned int count, lost, i;
++    const char *prefix;
++
++    os_unfair_lock_lock(&present_lock);
++    count = present_ring_count;
++    lost = present_ring_lost;
++    memcpy(frames, present_ring, count * sizeof(frames[0]));
++    present_ring_count = present_ring_lost = 0;
++    os_unfair_lock_unlock(&present_lock);
++    if (!count) return;
++    if (!present_frames_file)
++    {
++        char path[PATH_MAX];
++
++        /* Opened at the first frame, so processes that never draw leave no file. */
++        if (!(prefix = getenv("WINEMAC_INPUT_STATS")) ||
++            snprintf(path, sizeof(path), "%s-frames-%d.csv", prefix, getpid()) >= sizeof(path) ||
++            !(present_frames_file = fopen(path, "a")))
++            return;
++        present_frames_t0 = frames[0].requested;
++        fprintf(present_frames_file, "# t0 %.6f (CACurrentMediaTime s); times in ms after t0, presented -1 = never shown\n"
++                "requested,acquired,handed,target,presented,how,sync,transaction,drawables,width,height\n",
++                present_frames_t0);
++    }
++#define REL(t) ((t) > 0 ? ((t) - present_frames_t0) * 1000 : -1.0)
++    for (i = 0; i < count; i++)
++        fprintf(present_frames_file, "%.3f,%.3f,%.3f,%.3f,%.3f,%c,%u,%u,%u,%u,%u\n",
++                REL(frames[i].requested), REL(frames[i].acquired), REL(frames[i].handed), REL(frames[i].target),
++                REL(frames[i].presented), frames[i].how, frames[i].sync, frames[i].transaction,
++                frames[i].drawables, frames[i].width, frames[i].height);
++#undef REL
++    if (lost) fprintf(present_frames_file, "# %u frames lost (ring full)\n", lost);
++    fflush(present_frames_file);
++}
++
+ static void macdrv_present_take(char *out, size_t size)
+ {
+     __typeof__(present_stats) p;
+@@ -3331,6 +3389,7 @@
+         TAKE(main_waits); TAKE(main_wait_ns); TAKE(main_wait_max_ns);
+         TAKE(key_checks); TAKE(key_checks_cached); TAKE(key_check_ns); TAKE(key_check_max_ns); TAKE(key_query_ns);
+ #undef TAKE
++        macdrv_present_frames_flush();
+         wine.consumer_tid = macdrv_input_stats.consumer_tid;
+         wine.setpos_tid = macdrv_input_stats.setpos_tid;
+         if (raw_queue)
+--- a/dlls/winemac.drv/d3dmetal_objc.m
++++ b/dlls/winemac.drv/d3dmetal_objc.m
+@@ -26,6 +26,7 @@
+ #import <QuartzCore/QuartzCore.h>
+ #import <Metal/Metal.h>
+ #import <objc/runtime.h>
++#include <os/lock.h>
+ 
+ #include "macdrv_cocoa.h"
+ #import "cocoa_app.h"
+@@ -36,6 +37,87 @@
+ #pragma GCC diagnostic ignored "-Wdeclaration-after-statement"
+ 
+ 
++/* WINEMAC_INPUT_STATS per-frame file: when D3DMetal's present of a drawable ran. The drawable
++ * gets a subclass of its own class (as key-value observing does) whose present methods note the
++ * time and call the original; -class still answers the original class. Only with the stats on. */
++struct present_timing
++{
++    double handed, target;
++    char how;
++};
++static char present_timing_key;
++
++static void present_timing_mark(id drawable, char how, double target)
++{
++    NSMutableData *data = objc_getAssociatedObject(drawable, &present_timing_key);
++    struct present_timing *t = data.mutableBytes;
++
++    if (t && !t->handed)
++    {
++        t->handed = CACurrentMediaTime();
++        t->target = target;
++        t->how = how;
++    }
++}
++
++static IMP present_timing_super(id self, SEL cmd)
++{
++    return class_getMethodImplementation(class_getSuperclass(object_getClass(self)), cmd);
++}
++
++static void present_timing_present(id self, SEL cmd)
++{
++    present_timing_mark(self, 'p', 0);
++    ((void (*)(id, SEL))present_timing_super(self, cmd))(self, cmd);
++}
++
++static void present_timing_present_at(id self, SEL cmd, CFTimeInterval when)
++{
++    present_timing_mark(self, 't', when);
++    ((void (*)(id, SEL, CFTimeInterval))present_timing_super(self, cmd))(self, cmd, when);
++}
++
++static void present_timing_present_after(id self, SEL cmd, CFTimeInterval duration)
++{
++    present_timing_mark(self, 'm', 0);
++    ((void (*)(id, SEL, CFTimeInterval))present_timing_super(self, cmd))(self, cmd, duration);
++}
++
++static Class present_timing_class(id self, SEL cmd)
++{
++    return class_getSuperclass(object_getClass(self));
++}
++
++static Class present_timing_subclass(Class base)
++{
++    static os_unfair_lock lock = OS_UNFAIR_LOCK_INIT;
++    static Class last_base, last_sub;
++    char name[256];
++    Class sub;
++
++    os_unfair_lock_lock(&lock);
++    if (base == last_base)
++    {
++        sub = last_sub;
++        os_unfair_lock_unlock(&lock);
++        return sub;
++    }
++    snprintf(name, sizeof(name), "WinePresentTimed_%s", class_getName(base));
++    if (!(sub = objc_getClass(name)) && (sub = objc_allocateClassPair(base, name, 0)))
++    {
++        class_addMethod(sub, @selector(present), (IMP)present_timing_present, "v@:");
++        class_addMethod(sub, @selector(presentAtTime:), (IMP)present_timing_present_at, "v@:d");
++        class_addMethod(sub, @selector(presentAfterMinimumDuration:), (IMP)present_timing_present_after, "v@:d");
++        class_addMethod(sub, @selector(class), (IMP)present_timing_class, "#@:");
++        objc_registerClassPair(sub);
++        ERR(@"timing presents of %s drawables for the per-frame file\n", class_getName(base));
++    }
++    last_base = base;
++    last_sub = sub;
++    os_unfair_lock_unlock(&lock);
++    return sub;
++}
++
+ @implementation WineMetalLayer
+ 
+     /* Extend [CAMetalLayer nextDrawable] so client_surface_present() can be
+@@ -76,8 +158,33 @@
+         if (drawable && macdrv_present_stats_on)
+         {
+             CFTimeInterval acquired = CACurrentMediaTime();
++            NSMutableData *timing = [NSMutableData dataWithLength:sizeof(struct present_timing)];
++            Class sub = present_timing_subclass(object_getClass(drawable));
++            struct macdrv_present_frame frame = {0};
++            CGSize size = self.drawableSize;
++
++            if (sub)
++            {
++                objc_setAssociatedObject(drawable, &present_timing_key, timing, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
++                object_setClass(drawable, sub);
++            }
++            frame.requested = requested;
++            frame.acquired = acquired;
++            frame.sync = self.displaySyncEnabled;
++            frame.transaction = self.presentsWithTransaction;
++            frame.drawables = self.maximumDrawableCount;
++            frame.width = size.width;
++            frame.height = size.height;
+             [drawable addPresentedHandler:^(id<MTLDrawable> shown) {
++                struct macdrv_present_frame f = frame;
++                const struct present_timing *t = timing.bytes;
++
+                 macdrv_present_record(shown.presentedTime, requested, acquired);
++                f.handed = t->handed;
++                f.target = t->target;
++                f.how = t->how ? t->how : '-';
++                f.presented = shown.presentedTime;
++                macdrv_present_frame(&f);
+             }];
+         }
+         return drawable;

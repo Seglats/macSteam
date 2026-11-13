@@ -1,0 +1,14 @@
+--- a/dlls/ntdll/unix/loader.c
++++ b/dlls/ntdll/unix/loader.c
+@@ -669,6 +669,11 @@
+     BOOL all;
+ 
+     if (!list || !image_path || !dll_dir) return;
++    /* Only in place of a loader that is there: ntdll first tries the other architecture's
++     * loader (lib/wine/i386-unix/wine for a 64-bit program), which may not exist, and then
++     * falls back to its own. A game app started for the missing one finds no ntdll.so through
++     * argv[0] and exits. */
++    if (!argv[0] || access( argv[0], X_OK )) return;
+     if ((p = strrchr( name, '\\' ))) name = p + 1;
+     if ((p = strrchr( name, '/' ))) name = p + 1;
+     len = strlen( name );

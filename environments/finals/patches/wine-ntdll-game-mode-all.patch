@@ -1,0 +1,37 @@
+--- a/dlls/ntdll/unix/loader.c
++++ b/dlls/ntdll/unix/loader.c
+@@ -658,18 +658,22 @@
+  * name and separated by commas, the programs that start from such a bundle: for
+  * Overwatch.exe, a copy of the loader at <dll_dir>/game-mode/Overwatch.app/Contents/MacOS/wine.
+  * argv[0] stays the usual loader's path; the copy finds ntdll.so through it (loader/main.c
+- * tries argv[0] after its own path). Any other program, or a missing bundle, starts as before. */
++ * tries argv[0] after its own path). Any other program, or a missing bundle, starts as before.
++ * SteamDriver: WINE_GAME_MODE=* lists every program (its Wine runs games only); a program
++ * without a bundle of its own starts from <dll_dir>/game-mode/Game.app. */
+ static void game_mode_exec( char **argv, const char *image_path )
+ {
+     const char *list = getenv( "WINE_GAME_MODE" ), *name = image_path, *p, *end;
+     size_t len;
+     char *path;
++    BOOL all;
+ 
+     if (!list || !image_path || !dll_dir) return;
+     if ((p = strrchr( name, '\\' ))) name = p + 1;
+     if ((p = strrchr( name, '/' ))) name = p + 1;
+     len = strlen( name );
+-    for (p = list; ; p = end + 1)
++    all = !strcmp( list, "*" );
++    for (p = list; !all; p = end + 1)
+     {
+         if (!(end = strchr( p, ',' ))) end = p + strlen( p );
+         if (end - p == len && len && !strncasecmp( p, name, len )) break;
+@@ -679,6 +683,9 @@
+     if (asprintf( &path, "%s/game-mode/%.*s.app/Contents/MacOS/wine", dll_dir, (int)len, name ) < 0) return;
+     if (!access( path, X_OK )) execv( path, argv );
+     free( path );
++    if (!all || asprintf( &path, "%s/game-mode/Game.app/Contents/MacOS/wine", dll_dir ) < 0) return;
++    if (!access( path, X_OK )) execv( path, argv );
++    free( path );
+ }
+ #endif
+ 

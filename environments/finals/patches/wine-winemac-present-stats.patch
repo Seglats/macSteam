@@ -1,0 +1,152 @@
+--- a/dlls/winemac.drv/cocoa_app.h
++++ b/dlls/winemac.drv/cocoa_app.h
+@@ -184,4 +184,8 @@
+ void OnMainThreadAsync(dispatch_block_t block);
+ 
+ void LogError(const char* func, NSString* format, ...);
++
++/* When each D3DMetal frame reached the screen (WINEMAC_INPUT_STATS), cocoa_app.m. */
++extern int macdrv_present_stats_on;
++extern void macdrv_present_record(double presented);
+ void LogErrorv(const char* func, NSString* format, va_list args);
+--- a/dlls/winemac.drv/cocoa_app.m
++++ b/dlls/winemac.drv/cocoa_app.m
+@@ -1198,7 +1198,73 @@
+     if (source) CFRelease(source);
+     return layout;
+ }
++
++/* Present timing of the D3DMetal picture, with WINEMAC_INPUT_STATS (2026-11-12). WineMetalLayer
++ * puts a presented handler on every drawable the game takes (d3dmetal_objc.m); Core Animation
++ * reports when that frame reached the display, or 0 if it never did (replaced before a refresh).
++ * The time between two frames reaching the display is how long the first stayed on screen: on a
++ * 160 Hz display 6.25 ms, 12.5 ms for a frame held over a refresh, less than 6.25 ms only when the
++ * display path did not wait for a refresh. Counted per second into present_* fields of the input
++ * report: frames shown, frames never shown, and those intervals in buckets with upper edges
++ * 4, 5.5, 7, 9, 11, 13.5, 17, 25 ms and a last open one. Costs one block per frame. */
++int macdrv_present_stats_on;
++static os_unfair_lock present_lock = OS_UNFAIR_LOCK_INIT;
++static const double present_edges_ms[] = { 4, 5.5, 7, 9, 11, 13.5, 17, 25 };
++#define PRESENT_BUCKETS (sizeof(present_edges_ms) / sizeof(present_edges_ms[0]) + 1)
++static struct
++{
++    unsigned long long shown, dropped, buckets[PRESENT_BUCKETS];
++    double sum_ms, max_ms;
++} present_stats;
++static double present_last;
+ 
++void macdrv_present_record(double presented)
++{
++    os_unfair_lock_lock(&present_lock);
++    if (presented <= 0)
++        present_stats.dropped++;
++    else
++    {
++        present_stats.shown++;
++        if (present_last > 0 && presented > present_last)
++        {
++            double ms = (presented - present_last) * 1000;
++            unsigned int i = 0;
++
++            while (i < PRESENT_BUCKETS - 1 && ms >= present_edges_ms[i]) i++;
++            present_stats.buckets[i]++;
++            present_stats.sum_ms += ms;
++            if (ms > present_stats.max_ms) present_stats.max_ms = ms;
++        }
++        present_last = presented;
++    }
++    os_unfair_lock_unlock(&present_lock);
++}
++
++static void macdrv_present_take(char *out, size_t size)
++{
++    __typeof__(present_stats) p;
++    unsigned long long intervals = 0;
++    unsigned int i;
++    int used;
++
++    os_unfair_lock_lock(&present_lock);
++    p = present_stats;
++    memset(&present_stats, 0, sizeof(present_stats));
++    os_unfair_lock_unlock(&present_lock);
++    out[0] = 0;
++    if (!macdrv_present_stats_on) return;
++    for (i = 0; i < PRESENT_BUCKETS; i++) intervals += p.buckets[i];
++    used = snprintf(out, size, ",\"present_shown\":%llu,\"present_dropped\":%llu,\"present_ms_avg\":%.3f,"
++                    "\"present_ms_max\":%.3f,\"present_hist\":[", p.shown, p.dropped,
++                    intervals ? p.sum_ms / intervals : 0.0, p.max_ms);
++    for (i = 0; i < PRESENT_BUCKETS && used > 0 && used < (int)size; i++)
++        used += snprintf(out + used, size - used, "%s%llu", i ? "," : "", p.buckets[i]);
++    if (used > 0 && used < (int)size - 1) strcat(out, "]");
++    else out[0] = 0;
++}
++
++
+ @implementation WineApplicationController
+ 
+     @synthesize keyboardType, lastFlagsChanged;
+@@ -3170,6 +3236,7 @@
+         if (!prefix || !*prefix) return;
+         if (snprintf(path, sizeof(path), "%s-%d.jsonl", prefix, getpid()) >= sizeof(path)) return;
+         if (!(inputStatsFile = fopen(path, "a"))) return;
++        macdrv_present_stats_on = 1;
+         inputStatsTimer = [[NSTimer timerWithTimeInterval:1.0 target:self selector:@selector(reportInputStats:)
+                                                  userInfo:nil repeats:YES] retain];
+         [[NSRunLoop mainRunLoop] addTimer:inputStatsTimer forMode:NSRunLoopCommonModes];
+@@ -3177,6 +3244,7 @@
+ 
+     - (void) reportInputStats:(NSTimer*)timer
+     {
++        char present[320];
+         struct macdrv_input_stats wine;
+         char marks[sizeof(test_marks_ms) / sizeof(test_marks_ms[0]) * 24], nearest[32];
+         __block __typeof__(raw_stats) raw = {0};
+@@ -3243,6 +3311,7 @@
+                 used += snprintf(marks + used, sizeof(marks) - used, "%s%.0f", i ? "," : "", test_marks_ms[i]);
+         }
+ 
++        macdrv_present_take(present, sizeof(present));
+         fprintf(inputStatsFile,
+                 "{\"schema\":1,\"unix_ms\":%.0f,\"pid\":%d,\"exe\":\"%s\",\"allowed\":%s,\"mode\":\"%s\","
+                 "\"app_active\":%s,\"hidden\":%s,\"transparent\":%s,\"clipping\":%s,\"hidden_warp\":%s,\"clip_handler\":\"%s\","
+@@ -3281,7 +3350,7 @@
+                 "\"click_gaps\":%llu,\"click_gap_ms_avg\":%.3f,\"click_gap_ms_max\":%.3f,"
+                 "\"click_counts_avg\":%.1f,\"click_counts_max\":%.1f,"
+                 "\"rearms\":%llu,\"inputs_replaced\":%llu,\"counts_per_point\":%.4f,"
+-                "\"consumer_tid\":%u,\"setpos_tid\":%u}\n",
++                "\"consumer_tid\":%u,\"setpos_tid\":%u%s}\n",
+                 [[NSDate date] timeIntervalSince1970] * 1000, getpid(), mouselook_process,
+                 mouselook_allowed ? "true" : "false",
+                 __atomic_load_n(&raw_on, __ATOMIC_ACQUIRE) ? "raw" : mouselookWindow ? "mouselook" : "legacy",
+@@ -3324,7 +3393,7 @@
+                 buttons.gaps, buttons.gaps ? buttons.gap_ns / 1e6 / buttons.gaps : 0.0, buttons.gap_max_ns / 1e6,
+                 buttons.gaps ? buttons.gap_counts / buttons.gaps : 0.0, buttons.gap_counts_max,
+                 cocoa_stats.rearms, cocoa_stats.inputs_replaced, [rawMice count] ? [self rawCountsPerPoint] : 0.0,
+-                wine.consumer_tid, wine.setpos_tid);
++                wine.consumer_tid, wine.setpos_tid, present);
+         fflush(inputStatsFile);
+         memset(&cocoa_stats, 0, sizeof(cocoa_stats));
+         memset(&main_lag, 0, sizeof(main_lag));
+--- a/dlls/winemac.drv/d3dmetal_objc.m
++++ b/dlls/winemac.drv/d3dmetal_objc.m
+@@ -24,6 +24,7 @@
+ 
+ #import <AppKit/AppKit.h>
+ #import <QuartzCore/QuartzCore.h>
++#import <Metal/Metal.h>
+ #import <objc/runtime.h>
+ 
+ #include "macdrv_cocoa.h"
+@@ -69,7 +70,11 @@
+             }
+         }
+ 
+-        return [super nextDrawable];
++        id<CAMetalDrawable> drawable = [super nextDrawable];
++        /* When it reaches the display, for the input report (cocoa_app.m, macdrv_present_record). */
++        if (drawable && macdrv_present_stats_on)
++            [drawable addPresentedHandler:^(id<MTLDrawable> shown) { macdrv_present_record(shown.presentedTime); }];
++        return drawable;
+     }
+ 
+ @end

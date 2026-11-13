@@ -1,0 +1,146 @@
+--- a/dlls/winemac.drv/cocoa_app.h
++++ b/dlls/winemac.drv/cocoa_app.h
+@@ -187,5 +187,5 @@
+ 
+ /* When each D3DMetal frame reached the screen (WINEMAC_INPUT_STATS), cocoa_app.m. */
+ extern int macdrv_present_stats_on;
+-extern void macdrv_present_record(double presented);
++extern void macdrv_present_record(double presented, double requested, double acquired);
+ void LogErrorv(const char* func, NSString* format, va_list args);
+--- a/dlls/winemac.drv/cocoa_app.m
++++ b/dlls/winemac.drv/cocoa_app.m
+@@ -1206,21 +1206,48 @@
+  * 160 Hz display 6.25 ms, 12.5 ms for a frame held over a refresh, less than 6.25 ms only when the
+  * display path did not wait for a refresh. Counted per second into present_* fields of the input
+  * report: frames shown, frames never shown, and those intervals in buckets with upper edges
+- * 4, 5.5, 7, 9, 11, 13.5, 17, 25 ms and a last open one. Costs one block per frame. */
++ * 4, 5.5, 7, 9, 11, 13.5, 17, 25 ms and a last open one. Costs one block per frame.
++ *
++ * Also per frame: when the game asked for the drawable (requested) and got it (acquired), on the
++ * same clock as presentedTime. Latency = presented - acquired; its change from one shown frame to
++ * the next is what makes an object moving at constant speed jump on screen even when every frame
++ * stays exactly one refresh (present_latency_jump_hist, buckets 0.5, 1, 2, 4 ms and open). Wait =
++ * acquired - requested (no free drawable). Request interval = between two requests: how evenly
++ * the game itself delivers frames. */
+ int macdrv_present_stats_on;
+ static os_unfair_lock present_lock = OS_UNFAIR_LOCK_INIT;
+ static const double present_edges_ms[] = { 4, 5.5, 7, 9, 11, 13.5, 17, 25 };
+ #define PRESENT_BUCKETS (sizeof(present_edges_ms) / sizeof(present_edges_ms[0]) + 1)
++static const double present_jump_edges_ms[] = { 0.5, 1, 2, 4 };
++#define PRESENT_JUMPS (sizeof(present_jump_edges_ms) / sizeof(present_jump_edges_ms[0]) + 1)
+ static struct
+ {
+     unsigned long long shown, dropped, buckets[PRESENT_BUCKETS];
+     double sum_ms, max_ms;
++    unsigned long long latencies, jumps[PRESENT_JUMPS], requests;
++    double latency_sum, latency_sq, latency_max, wait_sum, wait_max, request_sum, request_sq, request_max;
+ } present_stats;
+-static double present_last;
++static double present_last, present_last_latency, present_last_request;
+ 
+-void macdrv_present_record(double presented)
++void macdrv_present_record(double presented, double requested, double acquired)
+ {
++    double wait = (acquired - requested) * 1000;
++
+     os_unfair_lock_lock(&present_lock);
++    present_stats.wait_sum += wait;
++    if (wait > present_stats.wait_max) present_stats.wait_max = wait;
++    if (present_last_request > 0 && requested > present_last_request)
++    {
++        double ms = (requested - present_last_request) * 1000;
++        if (ms < 250)  /* not across a pause */
++        {
++            present_stats.requests++;
++            present_stats.request_sum += ms;
++            present_stats.request_sq += ms * ms;
++            if (ms > present_stats.request_max) present_stats.request_max = ms;
++        }
++    }
++    present_last_request = requested;
+     if (presented <= 0)
+         present_stats.dropped++;
+     else
+@@ -1237,6 +1264,24 @@
+             if (ms > present_stats.max_ms) present_stats.max_ms = ms;
+         }
+         present_last = presented;
++        if (presented > acquired)
++        {
++            double latency = (presented - acquired) * 1000;
++
++            present_stats.latencies++;
++            present_stats.latency_sum += latency;
++            present_stats.latency_sq += latency * latency;
++            if (latency > present_stats.latency_max) present_stats.latency_max = latency;
++            if (present_last_latency > 0)
++            {
++                double jump = fabs(latency - present_last_latency);
++                unsigned int j = 0;
++
++                while (j < PRESENT_JUMPS - 1 && jump >= present_jump_edges_ms[j]) j++;
++                present_stats.jumps[j]++;
++            }
++            present_last_latency = latency;
++        }
+     }
+     os_unfair_lock_unlock(&present_lock);
+ }
+@@ -1260,8 +1305,26 @@
+                     intervals ? p.sum_ms / intervals : 0.0, p.max_ms);
+     for (i = 0; i < PRESENT_BUCKETS && used > 0 && used < (int)size; i++)
+         used += snprintf(out + used, size - used, "%s%llu", i ? "," : "", p.buckets[i]);
+-    if (used > 0 && used < (int)size - 1) strcat(out, "]");
+-    else out[0] = 0;
++    if (used > 0 && used < (int)size - 1) used += snprintf(out + used, size - used, "]");
++    if (used > 0 && used < (int)size)
++    {
++        double n = p.latencies, r = p.requests;
++        double mean = n ? p.latency_sum / n : 0, rmean = r ? p.request_sum / r : 0;
++
++        used += snprintf(out + used, size - used,
++                         ",\"present_latency_ms_avg\":%.3f,\"present_latency_ms_sd\":%.3f,\"present_latency_ms_max\":%.3f,"
++                         "\"present_latency_jump_hist\":[",
++                         mean, n ? sqrt(fmax(0, p.latency_sq / n - mean * mean)) : 0.0, p.latency_max);
++        for (i = 0; i < PRESENT_JUMPS && used > 0 && used < (int)size; i++)
++            used += snprintf(out + used, size - used, "%s%llu", i ? "," : "", p.jumps[i]);
++        if (used > 0 && used < (int)size)
++            used += snprintf(out + used, size - used,
++                             "],\"present_wait_ms_avg\":%.3f,\"present_wait_ms_max\":%.3f,"
++                             "\"present_request_ms_avg\":%.3f,\"present_request_ms_sd\":%.3f,\"present_request_ms_max\":%.3f",
++                             p.shown + p.dropped ? p.wait_sum / (p.shown + p.dropped) : 0.0, p.wait_max,
++                             rmean, r ? sqrt(fmax(0, p.request_sq / r - rmean * rmean)) : 0.0, p.request_max);
++    }
++    if (used <= 0 || used >= (int)size) out[0] = 0;
+ }
+ 
+ 
+@@ -3244,7 +3307,7 @@
+ 
+     - (void) reportInputStats:(NSTimer*)timer
+     {
+-        char present[320];
++        char present[768];
+         struct macdrv_input_stats wine;
+         char marks[sizeof(test_marks_ms) / sizeof(test_marks_ms[0]) * 24], nearest[32];
+         __block __typeof__(raw_stats) raw = {0};
+--- a/dlls/winemac.drv/d3dmetal_objc.m
++++ b/dlls/winemac.drv/d3dmetal_objc.m
+@@ -70,10 +70,16 @@
+             }
+         }
+ 
++        CFTimeInterval requested = macdrv_present_stats_on ? CACurrentMediaTime() : 0;
+         id<CAMetalDrawable> drawable = [super nextDrawable];
+         /* When it reaches the display, for the input report (cocoa_app.m, macdrv_present_record). */
+         if (drawable && macdrv_present_stats_on)
+-            [drawable addPresentedHandler:^(id<MTLDrawable> shown) { macdrv_present_record(shown.presentedTime); }];
++        {
++            CFTimeInterval acquired = CACurrentMediaTime();
++            [drawable addPresentedHandler:^(id<MTLDrawable> shown) {
++                macdrv_present_record(shown.presentedTime, requested, acquired);
++            }];
++        }
+         return drawable;
+     }
+ 

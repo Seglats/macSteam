@@ -27,9 +27,16 @@ ROOT = Path(__file__).resolve().parents[1]
 HOOK = ROOT / 'tests/rosetta_nt/hooklib.dylib'
 HOOK_NAME = 'lib/macfinals-nt-hook.dylib'
 EXECUTABLES = ('bin/wine', 'bin/wineserver', 'lib/wine/x86_64-unix/wine')
-# ntdll starts Discovery.exe from this bundle when WINE_GAME_MODE lists it (compat-tool/run).
-FINALS_BUNDLE = 'lib/wine/game-mode/Discovery.app'
-FINALS_IDENTIFIER = 'app.steamdriver.thefinals'
+# ntdll starts a program from game-mode/<name>.app when WINE_GAME_MODE lists it, and with
+# WINE_GAME_MODE=* every other program from game-mode/Game.app (compat-tool/run).
+GAME_APPS = (
+    ('lib/wine/game-mode/Discovery.app', 'app.steamdriver.thefinals', 'THE FINALS',
+     "THE FINALS looks up your Mac's address on your local network.",
+     'THE FINALS uses the microphone for voice chat.'),
+    ('lib/wine/game-mode/Game.app', 'app.steamdriver.game', 'SteamDriver Game',
+     "The game looks up your Mac's address on your local network.",
+     'The game uses the microphone for voice chat.'),
+)
 
 
 def resign_ad_hoc(path, identifier=None):
@@ -51,25 +58,24 @@ def resign_ad_hoc(path, identifier=None):
         raise ValueError(f'{path} is not signed ad hoc without the hardened runtime')
 
 
-def add_finals_game_app(dest):
-    """The game app that lets macOS turn Game Mode on for THE FINALS: the runtime's game app
-    (already re-signed ad hoc) under Discovery.exe's name, as ntdll's game_mode_exec looks it
-    up, with its own identity. Returns the files it added."""
-    source, bundle = dest / game_mode_app.BUNDLE, dest / FINALS_BUNDLE
+def add_game_app(dest, relative, identifier, name, network, microphone):
+    """A game app that lets macOS turn Game Mode on: the runtime's game app (already re-signed
+    ad hoc) at RELATIVE, as ntdll's game_mode_exec looks it up, with its own identity.
+    Returns the files it added."""
+    source, bundle = dest / game_mode_app.BUNDLE, dest / relative
     shutil.copytree(source, bundle, symlinks=True)
     plist = bundle / 'Contents/Info.plist'
     info = plistlib.loads(plist.read_bytes())
-    info.update(CFBundleName='THE FINALS', CFBundleIdentifier=FINALS_IDENTIFIER,
-                NSLocalNetworkUsageDescription="THE FINALS looks up your Mac's address on your local network.",
-                NSMicrophoneUsageDescription='THE FINALS uses the microphone for voice chat.')
+    info.update(CFBundleName=name, CFBundleIdentifier=identifier,
+                NSLocalNetworkUsageDescription=network, NSMicrophoneUsageDescription=microphone)
     plist.write_bytes(plistlib.dumps(info))
     executable = bundle / 'Contents/MacOS/wine'
     data = bytearray(executable.read_bytes())
     at = game_mode_app.uuid_offset(data)
-    data[at:at + 16] = uuid.uuid5(uuid.UUID(bytes=bytes(data[at:at + 16])), FINALS_IDENTIFIER).bytes
+    data[at:at + 16] = uuid.uuid5(uuid.UUID(bytes=bytes(data[at:at + 16])), identifier).bytes
     executable.write_bytes(bytes(data))
-    resign_ad_hoc(executable, FINALS_IDENTIFIER)  # inner first; signing the bundle seals it
-    resign_ad_hoc(bundle, FINALS_IDENTIFIER)
+    resign_ad_hoc(executable, identifier)  # inner first; signing the bundle seals it
+    resign_ad_hoc(bundle, identifier)
     run('codesign', '--verify', '--strict', '--deep', bundle)
     return sorted(str(p.relative_to(dest)) for p in bundle.rglob('*') if p.is_file())
 
@@ -115,7 +121,8 @@ def derive(artifacts, base_version, version, hook):
         resign_ad_hoc(bundle)
         changed += [f for f in manifest['files'] if f.startswith(game_mode_app.BUNDLE + '/')
                     and 'symlink' not in manifest['files'][f]]
-        changed += add_finals_game_app(dest)
+        for app in GAME_APPS:
+            changed += add_game_app(dest, *app)
 
     for relative in changed:
         manifest['files'][relative] = {'sha256': sha(dest / relative), 'bytes': (dest / relative).stat().st_size}

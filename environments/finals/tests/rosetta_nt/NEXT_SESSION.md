@@ -2,6 +2,18 @@
 
 Start here after a context reset. Details live in the linked files.
 
+## Newest (2026-11-13): microstutter, and Game Mode for every Wine program
+
+- **Runtime `macfinals-106`** is installed in the Steam tool by hand.
+- **The micro-jumps of moving targets** come from the macOS compositor sometimes showing a
+  finished frame one refresh late. The game, D3DMetal and the GPU deliver on time. DXMT has the
+  same holds. Measured in KovaaK's (no anti-cheat), frame cap 130.
+- **Game Mode is now on for every Wine program** (`WINE_GAME_MODE=*`, `Game.app`): frames reach
+  the screen 1.4 ms sooner, held frames 1.9 % → 1.5 %. On by default; `STEAMDRIVER_GAME_MODE=0`
+  turns it off. **Not yet tried with THE FINALS' anti-cheat.**
+- Fixed: Recall's game-app start crashed every launch on this runtime (missing 32-bit loader).
+- Full account, tools and open items: `R24_MICROSTUTTER_GAME_MODE.md`.
+
 ## Newest (2026-11-12): thread stacks, the popup, the Rosetta start-up crash
 
 - **Runtime `macfinals-92`** is installed in the Steam tool by hand. The rope fix from `-65` is

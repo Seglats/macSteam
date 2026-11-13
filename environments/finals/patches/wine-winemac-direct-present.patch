@@ -1,0 +1,298 @@
+--- a/dlls/winemac.drv/cocoa_window.h
++++ b/dlls/winemac.drv/cocoa_window.h
+@@ -25,6 +25,12 @@
+ @class WineEventQueue;
+ 
+ 
++/* Direct presentation (WINEMAC_DIRECT_PRESENT=1), cocoa_window.m. */
++@class WineWindow;
++extern void macdrv_direct_update(WineWindow *window, const char *why);
++extern void macdrv_direct_release(NSView *view);
++extern NSView *macdrv_direct_home(NSView *view);
++
+ @interface WineWindow : NSPanel <NSWindowDelegate>
+ {
+     BOOL disabled;
+--- a/dlls/winemac.drv/cocoa_window.m
++++ b/dlls/winemac.drv/cocoa_window.m
+@@ -709,6 +709,7 @@
+         _metalView = view;
+ 
+         [(WineWindow*)self.window windowDidDrawContent];
++        macdrv_direct_update((WineWindow*)self.window, "new Metal view");
+ 
+         return _metalView;
+     }
+@@ -1008,8 +1009,188 @@
+     }
+ 
+ @end
++
++
++/* Direct presentation, opt-in with WINEMAC_DIRECT_PRESENT=1 (2026-11-12).
++ *
++ * The window server composites a Wine window every refresh: its Metal layer sits inside the
++ * window's content view and client view, and Instruments reports it never goes straight to the
++ * display ("layer geometry isn't defined in screen space"). In KovaaK's at 160 FPS on a 160 Hz
++ * monitor that held 14 % of frames on screen for two refreshes or more, while the game itself
++ * presented evenly; CrossOver 26.3 measured the same (15 %). A plain borderless window holding
++ * the Metal view goes to the display directly (Recall's overlay presentation for DXMT, measured
++ * 0.1 ms instead of 3-6 ms, cocoa_v1.m).
++ *
++ * So while a Wine window covers its screen (borderless or in a fullscreen Space), is key in the
++ * active app and its D3DMetal picture fills its content area, the Metal view moves into such a
++ * window placed exactly over it: never key and ignoring the mouse, so the Wine window keeps
++ * focus, input and cursor clipping. The view goes back when any of that stops (focus lost, app
++ * hidden or switched away, minimized, ordered out, resized away from covering) or when D3DMetal
++ * releases it. Like Recall's, a throwaway window is shown first on each attach: the first window
++ * created for a fullscreen Space reports no presentation times. One window at a time. Main
++ * thread only. */
++@interface WineDirectOverlay : NSWindow
++@end
++
++@implementation WineDirectOverlay
++    - (BOOL) canBecomeKeyWindow { return NO; }
++    - (BOOL) canBecomeMainWindow { return NO; }
++@end
++
++static NSWindow *directOverlay, *directWarmup;
++static WineMetalView *directView;
++static WineContentView *directHome;
++static WineWindow *directOwner;
++static NSUInteger directSavedMask;
++
++static BOOL direct_enabled(void)
++{
++    static int enabled = -1;
++    if (enabled < 0)
++    {
++        const char *value = getenv("WINEMAC_DIRECT_PRESENT");
++        enabled = value && *value && strcmp(value, "0") != 0;
++    }
++    return enabled;
++}
++
++static NSWindow *direct_make_window(NSRect frame)
++{
++    WineDirectOverlay *window = [[WineDirectOverlay alloc] initWithContentRect:frame styleMask:NSWindowStyleMaskBorderless
++                                                                       backing:NSBackingStoreBuffered defer:NO];
++    [window setReleasedWhenClosed:NO];
++    [window setOpaque:YES];
++    [window setBackgroundColor:[NSColor blackColor]];
++    [window setHasShadow:NO];
++    [window setIgnoresMouseEvents:YES];
++    [window setAnimationBehavior:NSWindowAnimationBehaviorNone];
++    [window setCollectionBehavior:NSWindowCollectionBehaviorCanJoinAllSpaces | NSWindowCollectionBehaviorFullScreenAuxiliary |
++                                  NSWindowCollectionBehaviorStationary | NSWindowCollectionBehaviorIgnoresCycle];
++    window.contentView.wantsLayer = YES;
++    window.contentView.layer.backgroundColor = [NSColor blackColor].CGColor;
++    return window;
++}
+ 
++/* The D3DMetal view of a window and the client view it lives in. */
++static WineMetalView *direct_find_view(NSView *root, WineContentView **home)
++{
++    for (NSView *sub in root.subviews)
++    {
++        WineMetalView *found;
++        if ([sub isKindOfClass:[WineMetalView class]] && [root isKindOfClass:[WineContentView class]])
++        {
++            *home = (WineContentView *)root;
++            return (WineMetalView *)sub;
++        }
++        if ((found = direct_find_view(sub, home))) return found;
++    }
++    return nil;
++}
+ 
++static NSRect direct_screen_rect(WineContentView *home)
++{
++    return [home.window convertRectToScreen:[home convertRect:home.bounds toView:nil]];
++}
++
++static void direct_forget(void)
++{
++    [directView release];
++    directView = nil;
++    [directHome release];
++    directHome = nil;
++    directOwner = nil;
++}
++
++static void direct_detach(const char *why)
++{
++    if (!directView) return;
++    [directOverlay orderOut:nil];
++    if (directView.window == directOverlay && directHome)
++    {
++        [directView removeFromSuperview];
++        [directView setAutoresizingMask:directSavedMask];
++        [directView setFrame:directHome.bounds];
++        [directHome addSubview:directView positioned:NSWindowBelow relativeTo:nil];
++    }
++    ERR(@"direct presentation off for window %p (%s)\n", directOwner, why);
++    direct_forget();
++}
++
++void macdrv_direct_update(WineWindow *window, const char *why)
++{
++    WineContentView *home = nil;
++    WineMetalView *view;
++    BOOL wanted;
++    NSRect screen;
++
++    if (!direct_enabled() || ![NSThread isMainThread] || ![window isKindOfClass:[WineWindow class]]) return;
++    if (directView && directOwner == window)
++    {
++        view = directView;
++        home = directHome;
++    }
++    else
++        view = direct_find_view(window.contentView, &home);
++
++    wanted = view && home && [NSApp isActive] && [window isKeyWindow] && [window isVisible] && ![window isMiniaturized] &&
++             ([window isFullscreen] || ([window styleMask] & NSWindowStyleMaskFullScreen));
++    if (wanted)
++    {
++        /* Only while the picture fills the window: Wine's own window shows nothing else then. */
++        NSRect content = [window contentRectForFrameRect:window.frame];
++        screen = direct_screen_rect(home);
++        if (fabs(screen.size.width - content.size.width) > 1 || fabs(screen.size.height - content.size.height) > 1)
++            wanted = NO;
++    }
++    if (!wanted)
++    {
++        if (directOwner == window) direct_detach(why);
++        return;
++    }
++    if (directView && directOwner != window) direct_detach("another window");
++
++    if (!directView)
++    {
++        [directWarmup orderOut:nil];
++        [directWarmup release];
++        directWarmup = direct_make_window(screen);
++        [directWarmup orderFrontRegardless];
++        [directWarmup orderOut:nil];
++        [directOverlay release];
++        directOverlay = direct_make_window(screen);
++
++        directView = [view retain];
++        directHome = [home retain];
++        directOwner = window;
++        directSavedMask = view.autoresizingMask;
++        [view removeFromSuperview];
++        [view setAutoresizingMask:NSViewWidthSizable | NSViewHeightSizable];
++        [directOverlay.contentView addSubview:view];
++        ERR(@"direct presentation on for window %p, %.0fx%.0f at %.0f,%.0f (%s)\n", window,
++            screen.size.width, screen.size.height, screen.origin.x, screen.origin.y, why);
++    }
++    [directOverlay setLevel:MAX([window level] + 1, NSMainMenuWindowLevel + 1)];
++    if (!NSEqualRects(directOverlay.frame, screen)) [directOverlay setFrame:screen display:NO];
++    if (!NSEqualRects(directView.frame, directOverlay.contentView.bounds)) [directView setFrame:directOverlay.contentView.bounds];
++    if (![directOverlay isVisible]) [directOverlay orderFrontRegardless];
++}
++
++/* D3DMetal is releasing its view (macdrv_view_release_metal_view). */
++void macdrv_direct_release(NSView *view)
++{
++    if (!view || view != directView) return;
++    [directOverlay orderOut:nil];
++    ERR(@"direct presentation off for window %p (view released)\n", directOwner);
++    direct_forget();
++}
++
++/* The client view a view in the overlay belongs to, for WineMetalLayer's present event. */
++NSView *macdrv_direct_home(NSView *view)
++{
++    return view && view == directView ? directHome : nil;
++}
++
++
+ @implementation WineWindow
+ 
+     static WineWindow* causing_becomeKeyWindow;
+@@ -1986,6 +2167,7 @@
+ 
+         [self endWindowDragging];
+         [controller windowWillOrderOut:self];
++        if (directOwner == self) direct_detach("ordered out");
+ 
+         if (enteringFullScreen || exitingFullScreen)
+         {
+@@ -2054,6 +2236,7 @@
+         // Also when nothing changed here: a window covering the screen as it leaves a
+         // fullscreen Space was skipped while the Space lasted.
+         [controller updateCoveringPresentation];
++        macdrv_direct_update(self, "frame");
+     }
+ 
+     - (void) setFrameAndWineFrame:(NSRect)frame
+@@ -3218,6 +3401,7 @@
+         [self restoreMinimizedOnScreen];
+         [controller windowGotFocus:self];
+         macdrv_v1_canvas_focus(self, TRUE);
++        macdrv_direct_update(self, "focus");
+     }
+ 
+     - (void) windowDidChangeOcclusionState:(NSNotification*)notification
+@@ -3325,6 +3509,8 @@
+     {
+         macdrv_event* event;
+ 
++        macdrv_direct_update(self, "minimized");
++
+         if (fullscreen && [self isOnActiveSpace])
+             [[WineApplicationController sharedController] updateFullscreenWindows];
+ 
+@@ -3348,6 +3534,7 @@
+         if ([[WineApplicationController sharedController] temporarilyIgnoreResignEventsForDialog]) return;
+ 
+         macdrv_v1_canvas_focus(self, FALSE);
++        macdrv_direct_update(self, "focus lost");
+         event = macdrv_create_event(WINDOW_LOST_FOCUS, self);
+         [queue postEvent:event];
+         macdrv_release_event(event);
+@@ -4108,6 +4295,7 @@
+         NSRect oldFrame = [view frame];
+ 
+         macdrv_v1_canvas_view_frame((WineWindow *)view.window, view, newFrame);
++        dispatch_async(dispatch_get_main_queue(), ^{ macdrv_direct_update((WineWindow *)view.window, "client frame"); });
+         if (!NSEqualRects(oldFrame, newFrame))
+         {
+             [[view superview] setNeedsDisplayInRect:oldFrame];
+@@ -4275,6 +4463,7 @@
+ {
+     WineMetalView* view = (WineMetalView*)v;
+     OnMainThread(^{
++        macdrv_direct_release(view);
+         [view removeFromSuperview];
+         [view release];
+     });
+--- a/dlls/winemac.drv/d3dmetal_objc.m
++++ b/dlls/winemac.drv/d3dmetal_objc.m
+@@ -50,17 +50,19 @@
+         if ([self.delegate isKindOfClass:NSClassFromString(@"WineMetalView")])
+         {
+             NSView* view = (NSView *)self.delegate;
+-            if ([view.superview isKindOfClass:NSClassFromString(@"WineContentView")] &&
+-                [view.window    isKindOfClass:NSClassFromString(@"WineWindow")])
++            NSView* home = macdrv_direct_home(view);   /* in the direct presentation window */
++            if (!home) home = view.superview;
++            if ([home isKindOfClass:NSClassFromString(@"WineContentView")] &&
++                [home.window isKindOfClass:NSClassFromString(@"WineWindow")])
+             {
+-                void *client_surface = macdrv_get_view_d3dmetal_client_surface((macdrv_view)view.superview);
++                void *client_surface = macdrv_get_view_d3dmetal_client_surface((macdrv_view)home);
+                 if (client_surface)
+                 {
+                     macdrv_event* event;
+-                    event = macdrv_create_event(CLIENT_SURFACE_PRESENTED, (WineWindow*)view.window);
++                    event = macdrv_create_event(CLIENT_SURFACE_PRESENTED, (WineWindow*)home.window);
+                     event->client_surface_presented.client_surface = client_surface;
+ 
+-                    WineEventQueue *queue = [(WineWindow*)view.window queue];
++                    WineEventQueue *queue = [(WineWindow*)home.window queue];
+                     [queue postEvent:event];
+                     macdrv_release_event(event);
+                 }

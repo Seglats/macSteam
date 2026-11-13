@@ -18,8 +18,12 @@
 #                                                macOS then asks for Input Monitoring for Steam)
 #   STEAMDRIVER_NT_HOOK=0                       without the Rosetta syscall hook
 #   STEAMDRIVER_MSYNC=0, STEAMDRIVER_AVX=0      MSync / ROSETTA_ADVERTISE_AVX off
-#   STEAMDRIVER_GAME_MODE=1                     start Discovery.exe from its game app, so macOS can
-#                                                turn Game Mode on (needs native fullscreen)
+#   STEAMDRIVER_GAME_MODE=0                     without game apps. By default every program starts from a
+#                                                game app (Discovery.exe from its own, others from
+#                                                Game.app), so macOS can turn Game Mode on
+#   WINEMAC_DIRECT_PRESENT=1                    a covering, focused game window presents through a plain
+#                                                overlay window the window server shows directly, instead
+#                                                of compositing it (microstutter test, 2026-11-12)
 #   STEAMDRIVER_GPU_WARNING=1                   always show the game's "Minimum Hardware Requirements Not
 #                                                Met" box (by default it is shown on the first launch only;
 #                                                afterwards Wine answers it OK unseen, as if clicked)
@@ -107,11 +111,13 @@ if [[ ${STEAMDRIVER_GPU_WARNING:-0} == 0 && -f $gpu_warning_seen ]]; then
   export WINE_MSGBOX_ACCEPT='Minimum Hardware Requirements Not Met'
 fi
 
-# SteamDriver's Mac driver mouse (its NotProton rows, docs/NOTPROTON.md).
+# SteamDriver's Mac driver mouse (its NotProton rows, docs/NOTPROTON.md). The list names each
+# game's own executable: THE FINALS, and KovaaK's (no anti-cheat, so it can be profiled for the
+# movement stutter both games share).
 case ${STEAMDRIVER_MOUSE:-precise} in
   off) ;;
   *)
-    export WINEMAC_MOUSELOOK='Discovery.exe' WINEMAC_INPUT_VARIANT=precise WINEMAC_RAW_STATUS=$compat/hid-status.json
+    export WINEMAC_MOUSELOOK='Discovery.exe;FPSAimTrainer-Win64-Shipping.exe' WINEMAC_INPUT_VARIANT=precise WINEMAC_RAW_STATUS=$compat/hid-status.json
     [[ ${STEAMDRIVER_MOUSE:-} == classic ]] && export WINEMAC_INPUT_VARIANT=classic
     [[ ${STEAMDRIVER_MOUSE:-} == hid ]] && export WINEMAC_RAW_SOURCE=hid WINEMAC_RAW_REQUEST=1
     ;;
@@ -134,9 +140,9 @@ case $verb in
     # The game. Helpers (verb run: Steam's iscriptevaluator.exe with a script path relative to
     # Steam's folder) keep the working directory Steam gave them; see the last case.
     [[ -n ${STEAM_COMPAT_INSTALL_PATH:-} && -d $STEAM_COMPAT_INSTALL_PATH ]] && cd "$STEAM_COMPAT_INSTALL_PATH"
-    if [[ ${STEAMDRIVER_GAME_MODE:-0} != 0 ]]; then
-      export WINE_GAME_MODE=Discovery.exe
-      say "Game Mode app on"
+    if [[ ${STEAMDRIVER_GAME_MODE:-1} != 0 ]]; then
+      export WINE_GAME_MODE='*'
+      say "Game Mode apps on"
     fi
     if [[ ${STEAMDRIVER_PERF:-0} != 0 ]]; then
       perf=$compat/perf/$(/bin/date +%Y%m%d-%H%M%S)

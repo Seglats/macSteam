@@ -194,6 +194,24 @@ WINE_PATCHES = [
     'wine-user32-dialog-accept-tenth.patch',
     # 0.2 s instead of 0.1 s, and log when the dialog's loop starts.
     'wine-user32-dialog-accept-fifth.patch',
+    # WINEMAC_DIRECT_PRESENT=1: a covering, focused D3DMetal window presents through a plain
+    # borderless overlay window, which the window server shows directly instead of compositing.
+    'wine-winemac-direct-present.patch',
+    # Back to direct presentation on returning to the app (AppKit makes the window key late),
+    # and a log line saying why a covering window is not presented directly.
+    'wine-winemac-direct-present-reactivate.patch',
+    # With WINEMAC_INPUT_STATS: when each D3DMetal frame reached the display (present_* fields).
+    'wine-winemac-present-stats.patch',
+    # And per frame: drawable request -> acquired -> on screen (latency, its frame-to-frame change).
+    'wine-winemac-present-latency.patch',
+    # And a per-frame file (<prefix>-frames-<pid>.csv): also when D3DMetal's present ran, and
+    # the layer settings, to place each frame that reached the display a refresh late.
+    'wine-winemac-present-frames.patch',
+    # WINE_GAME_MODE=* starts every program from a game app (game-mode/Game.app unless it has its
+    # own), so macOS can turn Game Mode on for any game.
+    'wine-ntdll-game-mode-all.patch',
+    # A game app only in place of a loader that exists (the other architecture's may not).
+    'wine-ntdll-game-mode-loader-check.patch',
 ]
 
 

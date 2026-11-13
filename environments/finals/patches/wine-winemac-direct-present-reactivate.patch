@@ -1,0 +1,97 @@
+--- a/dlls/winemac.drv/cocoa_window.m
++++ b/dlls/winemac.drv/cocoa_window.m
+@@ -1114,6 +1114,20 @@
+     }
+     ERR(@"direct presentation off for window %p (%s)\n", directOwner, why);
+     direct_forget();
++}
++
++static void direct_observe(void);
++
++/* Why a covering window is not presented directly, logged once per change. */
++static void direct_waiting(WineWindow *window, const char *reason)
++{
++    static WineWindow *last_window;
++    static const char *last_reason;
++
++    if (window == last_window && reason == last_reason) return;
++    last_window = window;
++    last_reason = reason;
++    if (reason) ERR(@"direct presentation waiting for window %p: %s\n", window, reason);
+ }
+ 
+ void macdrv_direct_update(WineWindow *window, const char *why)
+@@ -1122,8 +1136,10 @@
+     WineMetalView *view;
+     BOOL wanted;
+     NSRect screen;
++    const char *waiting = NULL;
+ 
+     if (!direct_enabled() || ![NSThread isMainThread] || ![window isKindOfClass:[WineWindow class]]) return;
++    direct_observe();
+     if (directView && directOwner == window)
+     {
+         view = directView;
+@@ -1134,19 +1150,30 @@
+ 
+     wanted = view && home && [NSApp isActive] && [window isKeyWindow] && [window isVisible] && ![window isMiniaturized] &&
+              ([window isFullscreen] || ([window styleMask] & NSWindowStyleMaskFullScreen));
++    if (view && home && [window isVisible] && ([window isFullscreen] || ([window styleMask] & NSWindowStyleMaskFullScreen)))
++    {
++        if (![NSApp isActive]) waiting = "app not active";
++        else if (![window isKeyWindow]) waiting = "window not key";
++        else if ([window isMiniaturized]) waiting = "minimized";
++    }
+     if (wanted)
+     {
+         /* Only while the picture fills the window: Wine's own window shows nothing else then. */
+         NSRect content = [window contentRectForFrameRect:window.frame];
+         screen = direct_screen_rect(home);
+         if (fabs(screen.size.width - content.size.width) > 1 || fabs(screen.size.height - content.size.height) > 1)
++        {
+             wanted = NO;
++            waiting = "picture does not fill the window";
++        }
+     }
+     if (!wanted)
+     {
+         if (directOwner == window) direct_detach(why);
++        if ([NSApp isActive]) direct_waiting(window, waiting);
+         return;
+     }
++    direct_waiting(window, NULL);
+     if (directView && directOwner != window) direct_detach("another window");
+ 
+     if (!directView)
+@@ -1173,6 +1200,31 @@
+     if (!NSEqualRects(directOverlay.frame, screen)) [directOverlay setFrame:screen display:NO];
+     if (!NSEqualRects(directView.frame, directOverlay.contentView.bounds)) [directView setFrame:directOverlay.contentView.bounds];
+     if (![directOverlay isVisible]) [directOverlay orderFrontRegardless];
++}
++
++/* Coming back to the app: AppKit makes the Wine window key again some time after activation
++ * (Recall measured about a second), so the check runs at activation and 0.3 s and 1 s later. */
++static void direct_recheck(void)
++{
++    for (NSWindow *window in [NSApp windows])
++        if ([window isKindOfClass:[WineWindow class]] && [window isVisible])
++            macdrv_direct_update((WineWindow *)window, "app active");
++}
++
++static void direct_observe(void)
++{
++    static BOOL observing;
++    NSNotificationCenter *center = [NSNotificationCenter defaultCenter];
++    void (^later)(NSNotification *) = ^(NSNotification *note) {
++        direct_recheck();
++        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ direct_recheck(); });
++        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ direct_recheck(); });
++    };
++
++    if (observing) return;
++    observing = YES;
++    [center addObserverForName:NSApplicationDidBecomeActiveNotification object:nil queue:[NSOperationQueue mainQueue] usingBlock:later];
++    [center addObserverForName:NSApplicationDidUnhideNotification object:nil queue:[NSOperationQueue mainQueue] usingBlock:later];
+ }
+ 
+ /* D3DMetal is releasing its view (macdrv_view_release_metal_view). */

@@ -1,0 +1,148 @@
+--- a/dlls/ntdll/unix/loader.c
++++ b/dlls/ntdll/unix/loader.c
+@@ -861,6 +861,22 @@
+ static __thread UINT64 syscall_log_start[SYSCALL_LOG_DEPTH];
+ static __thread ULONG_PTR syscall_log_args[SYSCALL_LOG_DEPTH][SYSCALL_LOG_ARGS];
+ static __thread unsigned int syscall_log_depth;
++
++/* Per thread (2026-11-13): each thread's own NT calls, counted and timed in a small table only
++ * that thread writes, so the log can say which calls the busiest threads make ("tcalls:"). */
++#define SYSCALL_LOG_TSLOTS 512
++#define SYSCALL_LOG_TCALLS 64
++struct syscall_log_tcalls
++{
++    UINT64 tid;
++    UINT16 key[SYSCALL_LOG_TCALLS];   /* (idx << 12 | num) + 1, 0 = free */
++    LONG64 count[SYSCALL_LOG_TCALLS];
++    LONG64 time[SYSCALL_LOG_TCALLS];
++};
++static struct syscall_log_tcalls syscall_log_tc[SYSCALL_LOG_TSLOTS];
++static LONG syscall_log_tc_used;
++static __thread struct syscall_log_tcalls *syscall_log_my;
++static __thread int syscall_log_my_slot[SYSCALL_LOG_DEPTH];
+ int wine_diag_enabled;
+ LONG64 wine_diag_counts[DIAG_COUNTERS];
+ struct wine_diag_lock_stats wine_diag_vm_lock;
+@@ -996,7 +1012,7 @@
+     static LONG64 last_sigsys[2][4096];
+     static LONG64 last_rax_count[64];
+     UINT64 last_bsd = 0, last_mach = 0, last_faults = 0, last_csw = 0, last_pageins = 0;
+-    char name[32], line[4096];
++    char name[32], line[8192];
+ 
+     for (;;)
+     {
+@@ -1091,6 +1107,52 @@
+         for (i = 0; i < nbusy; i++)
+             syscall_log_append( line, sizeof(line), &pos, " %s#%04x=%.1f+%.1f", busy[i].name,
+                                 (unsigned int)(busy[i].id & 0xffff), busy[i].user / 1e6, busy[i].system / 1e6 );
++        /* the busiest threads' own top calls: name#tid>call:count:ms */
++        {
++            static LONG64 last_tc_count[SYSCALL_LOG_TSLOTS][SYSCALL_LOG_TCALLS];
++            static LONG64 last_tc_time[SYSCALL_LOG_TSLOTS][SYSCALL_LOG_TCALLS];
++            LONG used = min( __atomic_load_n( &syscall_log_tc_used, __ATOMIC_RELAXED ), SYSCALL_LOG_TSLOTS );
++            BOOL first = TRUE;
++            LONG t;
++
++            for (t = 0; t < used; t++)
++            {
++                struct syscall_log_tcalls *tc = &syscall_log_tc[t];
++                UINT64 tid = __atomic_load_n( &tc->tid, __ATOMIC_ACQUIRE );
++                struct syscall_log_entry top[4] = {{0}};
++                LONG64 ms[4] = {0};
++                int k, b, j;
++
++                for (b = 0; b < nbusy; b++) if (busy[b].id == tid) break;
++                for (k = 0; k < SYSCALL_LOG_TCALLS; k++)
++                {
++                    UINT16 key = __atomic_load_n( &tc->key[k], __ATOMIC_ACQUIRE );
++                    LONG64 c = __atomic_load_n( &tc->count[k], __ATOMIC_RELAXED ), dc = c - last_tc_count[t][k];
++                    LONG64 tm = __atomic_load_n( &tc->time[k], __ATOMIC_RELAXED ), dt = tm - last_tc_time[t][k];
++
++                    last_tc_count[t][k] = c;
++                    last_tc_time[t][k] = tm;
++                    if (!key || !dc || b == nbusy) continue;
++                    for (j = 0; j < 4 && top[j].value >= dc; j++);
++                    if (j == 4) continue;
++                    memmove( &top[j + 1], &top[j], (3 - j) * sizeof(top[0]) );
++                    memmove( &ms[j + 1], &ms[j], (3 - j) * sizeof(ms[0]) );
++                    top[j].idx = (key - 1) >> 12;
++                    top[j].num = (key - 1) & 0xfff;
++                    top[j].value = dc;
++                    ms[j] = dt;
++                }
++                for (j = 0; j < 4 && top[j].value; j++)
++                {
++                    if (first) syscall_log_append( line, sizeof(line), &pos, " | tcalls:" );
++                    first = FALSE;
++                    syscall_log_append( line, sizeof(line), &pos, " %s#%04x>%s:%lld:%.2f", busy[b].name,
++                                        (unsigned int)(tid & 0xffff),
++                                        syscall_log_name( top[j].idx, top[j].num, name, sizeof(name) ),
++                                        (long long)top[j].value, ms[j] / 1e6 );
++                }
++            }
++        }
+ #endif
+         {
+             struct syscall_log_entry direct[4] = {{0}};
+@@ -1208,8 +1270,48 @@
+     if (syscall_log_file)
+     {
+         if (idx < SYSCALL_LOG_TABLES) __atomic_fetch_add( &syscall_log_count[idx][num], 1, __ATOMIC_RELAXED );
++        if (!syscall_log_my)
++        {
++            LONG slot = __atomic_fetch_add( &syscall_log_tc_used, 1, __ATOMIC_RELAXED );
++            UINT64 tid = 0;
++
++            if (slot < SYSCALL_LOG_TSLOTS)
++            {
++#ifdef __APPLE__
++                pthread_threadid_np( NULL, &tid );  /* the id thread_info reports */
++#else
++                tid = (UINT64)pthread_self();
++#endif
++                syscall_log_my = &syscall_log_tc[slot];
++                __atomic_store_n( &syscall_log_my->tid, tid, __ATOMIC_RELEASE );
++            }
++            else syscall_log_my = (void *)1;  /* table full: this thread isn't counted */
++        }
+         if (syscall_log_depth < SYSCALL_LOG_DEPTH)
+         {
++            int slot = -1;
++
++            if (syscall_log_my != (void *)1)
++            {
++                UINT16 key = (idx << 12 | num) + 1;
++                unsigned int i, at = num % SYSCALL_LOG_TCALLS;
++
++                for (i = 0; i < SYSCALL_LOG_TCALLS; i++, at = (at + 1) % SYSCALL_LOG_TCALLS)
++                {
++                    if (syscall_log_my->key[at] == key) break;
++                    if (!syscall_log_my->key[at])
++                    {
++                        __atomic_store_n( &syscall_log_my->key[at], key, __ATOMIC_RELEASE );
++                        break;
++                    }
++                }
++                if (i < SYSCALL_LOG_TCALLS)
++                {
++                    __atomic_store_n( &syscall_log_my->count[at], syscall_log_my->count[at] + 1, __ATOMIC_RELAXED );
++                    slot = at;
++                }
++            }
++            syscall_log_my_slot[syscall_log_depth] = slot;
+             ULONG i, count = min( len / sizeof(ULONG_PTR), SYSCALL_LOG_ARGS );
+             for (i = 0; i < SYSCALL_LOG_ARGS; i++) syscall_log_args[syscall_log_depth][i] = i < count ? args[i] : 0;
+             syscall_log_start[syscall_log_depth] = syscall_log_now_ns();
+@@ -1243,6 +1345,11 @@
+         {
+             UINT64 elapsed = syscall_log_now_ns() - syscall_log_start[syscall_log_depth];
+             __atomic_fetch_add( &syscall_log_time[idx][num], elapsed, __ATOMIC_RELAXED );
++            if (syscall_log_my && syscall_log_my != (void *)1 && syscall_log_my_slot[syscall_log_depth] >= 0)
++            {
++                int at = syscall_log_my_slot[syscall_log_depth];
++                __atomic_store_n( &syscall_log_my->time[at], syscall_log_my->time[at] + elapsed, __ATOMIC_RELAXED );
++            }
+             if (elapsed > SYSCALL_LOG_LONG_NS)
+                 syscall_log_long( idx, num, elapsed, syscall_log_args[syscall_log_depth], retval );
+         }

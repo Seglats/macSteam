@@ -154,7 +154,9 @@ static const u32 IRET_INSERT[4] = {0x36280091u, 0xd1000836u, 0xd2801237u, 0xd420
  *   X+16  movk x26,#stub,32   no pc-relative word anywhere (replication
  *   X+20  movk x26,#stub,48   preserves immediates, 24/24 dumps)
  *   X+24  blr x26        d63f0340  divert; lr = X+28
- *   X+28  b #-28         17fffff9  bail: back to X = the REAL relocated bl
+ *   X+28  nop            d503201f  r25: was `b #-28` (bail back to X); bails now go
+ *                               to lr - 28 = X directly, since the backward branch
+ *                               tripped Rosetta's StateRecovery loop analysis
  *   X+32  (the emitter's own bl lands here: unrelocated, dead code)
  *
  * Fall-through enters the b at X-4 and skips X. A stream copy rebuilt from
@@ -235,6 +237,7 @@ struct slot {
     u32 D, T;    /* gather: compose reg, dead lsr temp */
     u32 budget;  /* words left before giving up (fail-open to IDLE) */
     u32 sysc_last; /* r21: last site-family word before the bl (the replay) */
+    u64 sysc_rip;  /* r25: the site's x86 RIP, from its movz/movk x28 carrier */
     u64 key;     /* bufobj pointer, written only under the lock */
     u64 last;    /* last cursor seen: a backwards step = buffer reused */
 };
@@ -491,7 +494,7 @@ static int insert8(u64 *bo, u64 addr, u32 lastw) {
     p[4] = 0xf2c00000u | ((((u32)(addr >> 32)) & 0xffffu) << 5) | 26u; /* movk x26,#,32*/
     p[5] = 0xf2e00000u | ((((u64)addr >> 48)  & 0xffffu) << 5) | 26u; /* movk x26,#,48*/
     p[6] = 0xd63f0340u;                                       /* blr x26 (lr = the bail b) */
-    p[7] = 0x17fffff9u;                                       /* b #-28 (back to the real bl) */
+    p[7] = 0xd503201fu;                                       /* nop: r25, bails go to X directly (a b #-28 here tripped StateRecovery) */
     bo[1] = cur + 32;
     if (g_ctl) g_ctl[46] = (u64)p;   /* r21b: the PHYSICAL chain address (X) */
     return 1;
@@ -510,10 +513,45 @@ void ntfix_init(u32 *ring, u32 ring_words, u64 *ctl) {
  * no init call from the translated side is ever needed. */
 static void step(struct slot *s, u64 *bo, u32 w);
 
+/* r25: x86 RIP of the site from its carrier words; sites in the macOS shared cache
+ * (>= 0x7ff000000000: libsystem_kernel's own wrappers, which the fast path is not
+ * for) are left stock. ctl[98] counts the skips. */
+static void sysc_rip_word(struct slot *s, u32 w) {
+    u64 imm = (w >> 5) & 0xffffu;
+    if (IS_SYSC_MOVK16_X28(w)) s->sysc_rip = (s->sysc_rip & ~0xffff0000ull) | (imm << 16);
+    else s->sysc_rip = (s->sysc_rip & ~0xffffull) | imm;
+}
+static int sysc_skip(struct slot *s) {
+    /* r25 diagnostics (trace only): the RIP of every site that reaches the insert,
+     * ctl[200..263] ring, ctl[199] = count */
+    if (g_ring && g_ctl) {
+        u64 k = __atomic_fetch_add(&g_ctl[199], 1, __ATOMIC_RELAXED);
+        g_ctl[200 + (k & 63)] = s->sysc_rip;
+    }
+    if (s->sysc_rip < 0x7ff000000000ull) return 0;
+    ctl_inc(98);
+    return 1;
+}
+
 void ntfix_append(u64 *bo, u32 w, u64 *ctl, u32 *ring) {
     struct slot *s;
     if (!g_ctl && ctl) { g_ctl = ctl; g_ring = ring; g_ring_at = 0; }
     base_note(bo[0]);   /* r21b census: which buffers this path emits into */
+    /* r25 diagnostics (trace only, g_ring set): remember each translating thread's
+     * context (the stub left x18 in ctl[12]) in ctl[128..191], so hooklib's poll can
+     * dump every thread's pending word ctx+0x1c8 and parked mask ctx+0x1cc. */
+    if (g_ring && g_ctl) {
+        u64 cx = g_ctl[12] & 0x7fffffffffffffffull;
+        for (u32 i = 128; i < 192 && cx; i++) {
+            u64 cur = __atomic_load_n(&g_ctl[i], __ATOMIC_RELAXED);
+            if (cur == cx) break;
+            if (!cur) {
+                u64 zero = 0;
+                if (__atomic_compare_exchange_n(&g_ctl[i], &zero, cx, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED)
+                    || zero == cx) break;
+            }
+        }
+    }
 
     /* r13 timing experiment: burn cycles in the hook with every chain
      * disarmed. If Steam still crashes, the crash is translation-latency
@@ -582,6 +620,7 @@ static void idle_word(struct slot *s, u32 w) {
     else if (IS_SYSC_MOVZ_X28(w) && !(g_ctl && g_ctl[33])) {
         s->state = ST_SYSC_MOVZ; s->budget = 6;
         s->sysc_last = w;   /* no movk follows: this is the X-4 replay word */
+        s->sysc_rip = (u64)((w >> 5) & 0xffffu) << 32;
     }
 }
 
@@ -738,11 +777,12 @@ static void step(struct slot *s, u64 *bo, u32 w) {
      * sysc_last remembers the newest site word so insert8 can verify and
      * replay the one sitting at X-4. */
     case ST_SYSC_MOVZ:
-        if (IS_SYSC_MOVK16_X28(w) || IS_SYSC_MOVK0_X28(w)) { s->state = ST_SYSC_MOVK; s->budget = 3; s->sysc_last = w; }
+        if (IS_SYSC_MOVK16_X28(w) || IS_SYSC_MOVK0_X28(w)) { s->state = ST_SYSC_MOVK; s->budget = 3; s->sysc_last = w; sysc_rip_word(s, w); }
         else if (IS_BL(w)) {
             u64 stub = (u64)&ntfix_macfast;
             inslog(6, bo, w, 0, 0);
-            if (insert8(bo, stub, s->sysc_last)) {
+            if (sysc_skip(s)) ;
+            else if (insert8(bo, stub, s->sysc_last)) {
                 ctl_inc(CTL_SYSC_INS); note_event(6); base_tally_insert(bo[0]);
             } else ctl_inc(CTL_SYSC_MISS);
             s->state = ST_IDLE;
@@ -753,12 +793,13 @@ static void step(struct slot *s, u64 *bo, u32 w) {
         if (IS_BL(w)) {
             u64 stub = (u64)&ntfix_macfast;
             inslog(6, bo, w, 0, 0);
-            if (insert8(bo, stub, s->sysc_last)) {
+            if (sysc_skip(s)) ;
+            else if (insert8(bo, stub, s->sysc_last)) {
                 ctl_inc(CTL_SYSC_INS); note_event(6); base_tally_insert(bo[0]);
             } else ctl_inc(CTL_SYSC_MISS);
             s->state = ST_IDLE;
         }
-        else if (IS_SYSC_MOVK16_X28(w) || IS_SYSC_MOVK0_X28(w)) { s->sysc_last = w; /* stay: address words */ }
+        else if (IS_SYSC_MOVK16_X28(w) || IS_SYSC_MOVK0_X28(w)) { s->sysc_last = w; sysc_rip_word(s, w); /* stay: address words */ }
         else if (!--s->budget) { ctl_inc(CTL_SYSC_MISS); idle_word(s, w); }
         break;
 
@@ -1040,6 +1081,12 @@ __attribute__((naked)) void ntfix_macfast(void)
         "   strb w24, [x23, #0x147]\n"
         "   b    99f\n"
         "23:\n"
+        /* r25: bail straight to X (the relocated real bl) = lr - 28, not through a
+         * `b #-28` at X+28: that backward branch made the block look like a loop to
+         * Rosetta's StateRecovery, which asserted ("unexpected direct branch in Loop CFG",
+         * determine_loop_properties) when a signal landed in a diverted block. From
+         * here on x30, the parked target and ctx+0x8 all hold X. */
+        "   sub  x30, x30, #28\n"
         /* park the bail target: lr does not survive the table[0] call (nor
          * the restore's ctx+0x8 load); sp is ours until the resume */
         "   str  x30, [sp, #-16]!\n"
@@ -1078,60 +1125,62 @@ __attribute__((naked)) void ntfix_macfast(void)
         "   bic  x14, x14, #0x10\n"           /* EFL_sig &= ~0x100     */
         "   str  x14, [x18, #0x98]\n"
         "2: str  w13, [x23, #0xb4]\n"         /* frame->restore_flags  */
-        /* resolve + resume: the page-epilogue call, verbatim shape */
-        "   ldr  x14, [x18, #0x8]\n"          /* baseline              */
-        "   adr  x29, .\n"
-        "   str  x29, [x18, #0x1d0]\n"        /* recorded pc           */
-        "   mov  w29, #1\n"
-        "   strb w29, [x18, #0x208]\n"        /* in-runtime byte       */
+        /* r25: resume through Rosetta's own page epilogue instead of a copy of it.
+         * runtime_exitljmp (rosetta/runtime +0x22560, the routine the thunk's page
+         * epilogue at page+0x2560 is a copy of) calls table[0](ctx, lr, x86 RIP) —
+         * install at ctx+0x8 when bit9 is queued — then, if bit1 is set (a signal was
+         * deferred: mask parked at ctx+0x1cc, every signal blocked), restores the mask
+         * with __pthread_sigmask at a pc Rosetta's signal handler classifies and can
+         * deliver at, restores the guest registers from ctx and rets into ctx+0x8.
+         * Our earlier copy left that mask step out: a SIGUSR1 deferred in our code was
+         * never delivered (suspension hung, teardown_check --mode suspendonly).
+         * Contract: x18 = ctx, x28 = x86 RIP, guest state parked in ctx (done above),
+         * bit9 queued. With no install ctx+0x8 is still the saved lr (X+28, the bail
+         * word), so the ret takes the stock path exactly like the clean bail below.
+         * hooklib publishes the routine's address in ctl[96] after a word check;
+         * unpublished -> clean bail (stock path). R25_SIGNAL_IN_STUB.md. */
+        "   adrp x26, _g_ctl@PAGE\n"
+        "   ldr  x26, [x26, _g_ctl@PAGEOFF]\n"
+        "   ldr  x26, [x26, #0x300]\n"        /* ctl[96] runtime_exitljmp */
+        "   cbz  x26, 5f\n"                   /* unpublished: clean bail */
         /* ais8: table[0]'s install is CONDITIONAL on the pending word —
          * 0x5908 swp's ctx+0x1c8 to 0, returns the OLD value, and 0x5964
          * takes the install path (0x59c4 → TB lookup → str ctx+0x8) only
          * when bit9 is set in it. The epilogue's callers always have bit9
-         * queued; our calls had w=0 → no install → bail5 on every entry.
-         * Queue the continuation ourselves — fail-closed: anything already
-         * pending (word != 0) belongs to the stock flow, bail. bit0 stays
-         * clear: that path parks rip at ctx+0x1d8 and calls 0xebc4
-         * (exception-server notify), which is not our case. */
-        "   ldr  w13, [x18, #0x1c8]\n"        /* pending FLAGS — 32-bit!  */
+         * queued. Queue the continuation ourselves — fail-closed: anything
+         * already pending (word != 0) belongs to the stock flow, bail. bit0
+         * stays clear: that path parks rip at ctx+0x1d8 and calls 0xebc4
+         * (exception-server notify), which is not our case.
+         * r25: with a compare-and-swap. The code lives where Rosetta defers
+         * signals (hooklib relocates it into libRosettaRuntime), so a deferral
+         * can set bit1 at any instruction; a plain ldr/str would erase it. */
+        "   add  x12, x18, #0x1c8\n"
+        "   mov  w13, #0\n"
+        "   mov  w29, #0x200\n"
+        "   casal w13, w29, [x12]\n"           /* 0 -> 0x200, w13 = old    */
         "   cbz  w13, 21f\n"                  /* 0x1cc is a SEPARATE      */
         "   adrp x23, _g_ctl@PAGE\n"          /* payload field; a 64-bit  */
         "   ldr  x23, [x23, _g_ctl@PAGEOFF]\n"/* access reads/writes both */
         "   str  x13, [x23, #0x130]\n"        /* (ais10: busy-bails were  */
-        "   b    5f\n"                        /* the payload, flags were  */
-        "21: mov  w13, #0x200\n"              /* 0 — zero-extended dump)  */
-        "   str  w13, [x18, #0x1c8]\n"        /* bit9: RIP continuation   */
-        "   adr  x1, 3f\n"                    /* lr = after the blr    */
-        "   mov  x2, x25\n"                   /* x86 RIP = prolog_end  */
-        "   ldr  x29, [x18]\n"
-        "   ldr  x29, [x29]\n"                /* table[0]              */
-        "   mov  x0, x18\n"
-        "   blr  x29\n"
-        "3: strb wzr, [x18, #0x208]\n"
-        "   ldr  x15, [x18, #0x8]\n"
-        "   cmp  x15, x14\n"
-        "   b.eq 5f\n"                        /* no entry: clean bail  */
-        "   adrp x22, _g_ctl@PAGE\n"          /* count the engage      */
-        "   ldr  x22, [x22, _g_ctl@PAGEOFF]\n"
-        "   cbz  x22, 4f\n"
+        /* r25: exactly bit1 = a signal deferred while this thread was in our code
+         * (or in Rosetta's). The stock invalid-syscall path (brk #5, exception server)
+         * does not restore the parked mask: the thread then ran on with every signal
+         * blocked and the first SuspendThread/GetThreadContext never returned
+         * (teardown_check --mode suspendonly). runtime_exitljmp does: with nothing
+         * queued, table[0] installs nothing, the mask is restored where Rosetta can
+         * deliver the signal, and the ret goes to ctx+0x8 = the saved lr (X+28, the
+         * bail word) = the stock path, as the clean bail. Anything else: plain bail. */
+        "   cmp  w13, #2\n"
+        "   b.ne 5f\n"                        /* the payload, flags were  */
+        "   b    4f\n"
+        "21: adrp x22, _g_ctl@PAGE\n"         /* count the resume (guest  */
+        "   ldr  x22, [x22, _g_ctl@PAGEOFF]\n"/* state is parked in ctx;  */
+        "   cbz  x22, 4f\n"                   /* x18/x26/x28 survive C)  */
         "   mov  x0, #36\n"
         "   bl   _ntfix_ctl_hit\n"
-        "4:\n"
-        /* restore block 0x102e855dc, verbatim; x30 = the installed entry */
-        "   ldp  x29, x17, [x18, #0x90]\n"
-        "   msr  NZCV, x29\n"
-        "   ldp  x14, x15, [x18, #0x80]\n"
-        "   ldp  x12, x13, [x18, #0x70]\n"
-        "   ldp  x10, x11, [x18, #0x60]\n"
-        "   ldp  x8, x9, [x18, #0x50]\n"
-        "   ldp  x6, x7, [x18, #0x40]\n"
-        "   ldp  x4, x5, [x18, #0x30]\n"
-        "   ldp  x2, x3, [x18, #0x20]\n"
-        "   ldp  x0, x1, [x18, #0x10]\n"
-        "   ldr  x30, [x18, #0x8]\n"
-        "   ldr  x27, [sp], #16\n"            /* drop parked target    */
-        "   and  x18, x18, #0x7fffffffffffffff\n"
-        "   ret\n"
+        "4: mov  x28, x25\n"                  /* x86 RIP = prolog_end    */
+        "   ldr  x30, [sp], #16\n"            /* drop parked target; it  */
+        "   br   x26\n"                       /* is table[0]'s lr arg    */
         /* clean bail: the same restore un-does every live clobber (compose
          * and the runtime call own x0/x1/x19+), then the site's bl re-runs
          * with the original machine state — stock thunk path. */
@@ -1163,7 +1212,43 @@ __attribute__((naked)) void ntfix_macfast(void)
         "   add  w24, w24, #1\n"
         "   strb w24, [x23, #0x146]\n"
         "   b    99f\n"
-        "99: br   x30\n"                      /* guards: lr untouched  */
+        /* r25: a guard bail goes on to the stock path, and for Wine's own class 1/2/3
+         * syscalls (they divert here too) that is the real syscall, which may block.
+         * If a signal was deferred while this thread was in the guard (pending word ==
+         * bit1: mask parked, every signal blocked), blocking now would sleep with
+         * SIGQUIT/SIGUSR1 shut out: exit and suspension hang (THE FINALS' quit on
+         * macfinals-113; teardown_check --mode waitexit). Hand it to runtime_exitljmp
+         * first, as the CAS path does: park the guest state, no bit9 (no install), the
+         * mask is restored where Rosetta delivers the signal, and the ret goes to
+         * ctx+0x8 = our lr (X+28, the bail word) -> the stock path. Flags are live
+         * here: eor/cbnz/tbnz only until NZCV is saved. ctl[97] counts these. */
+        "99: ldr  w22, [x18, #0x1c8]\n"
+        "   eor  w23, w22, #2\n"
+        "   cbnz w23, 94f\n"                  /* not exactly bit1: stock */
+        "   adrp x24, _g_ctl@PAGE\n"
+        "   ldr  x24, [x24, _g_ctl@PAGEOFF]\n"
+        "   cbz  x24, 94f\n"
+        "   add  x25, x24, #0x308\n"          /* &ctl[97]              */
+        "   ldr  x24, [x24, #0x300]\n"        /* ctl[96] runtime_exitljmp */
+        "   cbz  x24, 94f\n"
+        "   mov  x23, #1\n"
+        "   stadd x23, [x25]\n"
+        "   stp  x0, x1, [x18, #0x10]\n"
+        "   stp  x2, x3, [x18, #0x20]\n"
+        "   stp  x4, x5, [x18, #0x30]\n"
+        "   stp  x6, x7, [x18, #0x40]\n"
+        "   stp  x8, x9, [x18, #0x50]\n"
+        "   stp  x10, x11, [x18, #0x60]\n"
+        "   stp  x12, x13, [x18, #0x70]\n"
+        "   stp  x14, x15, [x18, #0x80]\n"
+        "   mrs  x22, NZCV\n"
+        "   str  x22, [x18, #0x90]\n"
+        "   str  x17, [x18, #0x98]\n"
+        "   sub  x30, x30, #28\n"             /* r25: X, see label 23   */
+        "   str  x30, [x18, #0x8]\n"
+        "   br   x24\n"
+        "94: sub  x30, x30, #28\n"            /* r25: straight to X     */
+        "   br   x30\n"                       /* guards: lr untouched  */
     );
 }
 
@@ -1275,10 +1360,11 @@ __attribute__((naked)) void ntfix_trapfast(void)
         /* ais8: queue the RIP continuation — see ntfix_macfast; without
          * bit9 in ctx+0x1c8, 0x5908's swp returns 0 and 0x5964 installs
          * nothing. 32-bit only: ctx+0x1cc is a separate payload field. */
-        "   ldr  w13, [x18, #0x1c8]\n"        /* pending flags (32-bit)  */
+        "   add  x12, x18, #0x1c8\n"          /* r25: CAS, see macfast   */
+        "   mov  w13, #0\n"
+        "   mov  w29, #0x200\n"
+        "   casal w13, w29, [x12]\n"
         "   cbnz w13, 5f\n"                   /* busy → clean bail       */
-        "   mov  w13, #0x200\n"
-        "   str  w13, [x18, #0x1c8]\n"        /* bit9: RIP continuation  */
         "   adr  x1, 3f\n"                    /* lr = after the blr      */
         "   mov  x2, x25\n"                   /* x86 RIP = prolog_end    */
         "   ldr  x29, [x18]\n"
@@ -1286,7 +1372,12 @@ __attribute__((naked)) void ntfix_trapfast(void)
         "   mov  x0, x18\n"
         "   blr  x29\n"
         "3: strb wzr, [x18, #0x208]\n"
-        "   ldr  x15, [x18, #0x8]\n"
+        "   ands w13, w1, #0xfffffdff\n"      /* r25: hand back, bail    */
+        "   b.eq 22f\n"
+        "   add  x12, x18, #0x1c8\n"
+        "   ldsetal w13, w12, [x12]\n"
+        "   b    5f\n"
+        "22: ldr  x15, [x18, #0x8]\n"
         "   cmp  x15, x14\n"
         "   adrp x23, _g_ctl@PAGE\n"          /* ais10: post-call ctx+0x8 */
         "   ldr  x23, [x23, _g_ctl@PAGEOFF]\n"/* at ctl[38] (last writer  */

@@ -1,0 +1,23 @@
+--- a/dlls/ntdll/unix/virtual.c
++++ b/dlls/ntdll/unix/virtual.c
+@@ -4889,6 +4889,20 @@
+                  (unsigned int)HandleToULong( teb->ClientId.UniqueThread ), thread_data->start,
+                  thread_data->param, teb->Tib.StackLimit, teb->Tib.StackBase, thread_data->kernel_stack,
+                  get_signal_stack(), (char *)get_signal_stack() + signal_stack_size );
++            {
++                /* Which module the fault is in and which thread dies (2026-11-13): a hang
++                 * after one of these needs both to say what the game lost. */
++                Dl_info where;
++                char name[64] = "";
++
++                pthread_getname_np( pthread_self(), name, sizeof(name) );
++                if (dladdr( rec->ExceptionAddress, &where ) && where.dli_fname)
++                    ERR( "  fault in %s+%#lx (%s), thread name \"%s\"\n", where.dli_fname,
++                         (unsigned long)((char *)rec->ExceptionAddress - (char *)where.dli_fbase),
++                         where.dli_sname ? where.dli_sname : "?", name );
++                else
++                    ERR( "  fault outside any loaded Mach-O image, thread name \"%s\"\n", name );
++            }
+             abort_thread(1);
+         }
+         WARN( "exception outside of stack limits addr %p stack %p (%p-%p-%p)\n",

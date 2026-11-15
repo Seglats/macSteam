@@ -1,0 +1,125 @@
+--- a/dlls/ntdll/unix/loader.c
++++ b/dlls/ntdll/unix/loader.c
+@@ -869,6 +869,14 @@
+ struct syscall_log_tcalls
+ {
+     UINT64 tid;
++    /* 2026-11-14: what the thread is in right now, for the dump when a lock wait times out
++     * (crashes/C16). Written by the thread, read by the log thread; races only blur a line. */
++    UINT32 wtid;                      /* Windows thread id, as the lock messages print it */
++    UINT16 cur_key;                   /* current call's key (as key[] below), 0 = none */
++    UINT16 last_key;                  /* last call that returned */
++    UINT64 cur_start;                 /* ns */
++    UINT64 last_ret;                  /* ns */
++    ULONG_PTR cur_args[4];
+     UINT16 key[SYSCALL_LOG_TCALLS];   /* (idx << 12 | num) + 1, 0 = free */
+     LONG64 count[SYSCALL_LOG_TCALLS];
+     LONG64 time[SYSCALL_LOG_TCALLS];
+@@ -877,6 +885,8 @@
+ static LONG syscall_log_tc_used;
+ static __thread struct syscall_log_tcalls *syscall_log_my;
+ static __thread int syscall_log_my_slot[SYSCALL_LOG_DEPTH];
++static __thread UINT16 syscall_log_my_key[SYSCALL_LOG_DEPTH];
++static LONG syscall_log_dump_wanted;
+ int wine_diag_enabled;
+ LONG64 wine_diag_counts[DIAG_COUNTERS];
+ struct wine_diag_lock_stats wine_diag_vm_lock;
+@@ -1030,7 +1040,46 @@
+         fputs( syscall_log_long_ring[slot], file );
+     }
+ }
++
++/* When a lock wait times out (an NT call returning STATUS_TIMEOUT after >= 59 s: the 60 s
++ * retry in RtlpWaitForCriticalSection), say what every thread is in, so the lock's owner can
++ * be found by its Windows thread id. */
++static void syscall_log_stuck_dump( FILE *file )
++{
++    static UINT64 last_dump;
++    UINT64 now = syscall_log_now_ns();
++    LONG used = min( __atomic_load_n( &syscall_log_tc_used, __ATOMIC_ACQUIRE ), SYSCALL_LOG_TSLOTS );
++    char name[32];
++    struct timeval tv;
++    LONG t;
+ 
++    if (last_dump && now - last_dump < 55000000000ull) return;
++    last_dump = now;
++    gettimeofday( &tv, NULL );
++    fprintf( file, "%lld.%03d stuck-dump: a lock wait timed out; every thread's NT call:\n",
++             (long long)tv.tv_sec, (int)(tv.tv_usec / 1000) );
++    for (t = 0; t < used; t++)
++    {
++        struct syscall_log_tcalls *tc = &syscall_log_tc[t];
++        UINT16 key = __atomic_load_n( &tc->cur_key, __ATOMIC_ACQUIRE );
++
++        if (!tc->wtid) continue;
++        if (key)
++            fprintf( file, "  %04x (#%llx) in %s for %.1f s args=%lx,%lx,%lx,%lx\n",
++                     tc->wtid, (unsigned long long)tc->tid,
++                     syscall_log_name( (key - 1) >> 12, (key - 1) & 0xfff, name, sizeof(name) ),
++                     (now - tc->cur_start) / 1e9, (unsigned long)tc->cur_args[0],
++                     (unsigned long)tc->cur_args[1], (unsigned long)tc->cur_args[2],
++                     (unsigned long)tc->cur_args[3] );
++        else if (tc->last_key)
++            fprintf( file, "  %04x (#%llx) not in an NT call; last %s returned %.1f s ago\n",
++                     tc->wtid, (unsigned long long)tc->tid,
++                     syscall_log_name( (tc->last_key - 1) >> 12, (tc->last_key - 1) & 0xfff, name, sizeof(name) ),
++                     (now - tc->last_ret) / 1e9 );
++    }
++    fflush( file );
++}
++
+ static void *syscall_log_thread( void *arg )
+ {
+     static LONG64 last_count[SYSCALL_LOG_TABLES][4096], last_time[SYSCALL_LOG_TABLES][4096];
+@@ -1059,6 +1108,8 @@
+ 
+         usleep( 100000 );
+         syscall_log_long_drain( syscall_log_file );
++        if (__atomic_exchange_n( &syscall_log_dump_wanted, 0, __ATOMIC_ACQ_REL ))
++            syscall_log_stuck_dump( syscall_log_file );
+         for (idx = 0; idx < SYSCALL_LOG_TABLES; idx++)
+             for (num = 0; num < 4096; num++)
+             {
+@@ -1331,6 +1382,7 @@
+                 tid = (UINT64)pthread_self();
+ #endif
+                 syscall_log_my = &syscall_log_tc[slot];
++                syscall_log_my->wtid = HandleToULong( NtCurrentTeb()->ClientId.UniqueThread );
+                 __atomic_store_n( &syscall_log_my->tid, tid, __ATOMIC_RELEASE );
+             }
+             else syscall_log_my = (void *)1;  /* table full: this thread isn't counted */
+@@ -1363,6 +1415,13 @@
+             ULONG i, count = min( len / sizeof(ULONG_PTR), SYSCALL_LOG_ARGS );
+             for (i = 0; i < SYSCALL_LOG_ARGS; i++) syscall_log_args[syscall_log_depth][i] = i < count ? args[i] : 0;
+             syscall_log_start[syscall_log_depth] = syscall_log_now_ns();
++            syscall_log_my_key[syscall_log_depth] = (idx << 12 | num) + 1;
++            if (syscall_log_my != (void *)1)
++            {
++                for (i = 0; i < 4; i++) syscall_log_my->cur_args[i] = syscall_log_args[syscall_log_depth][i];
++                syscall_log_my->cur_start = syscall_log_start[syscall_log_depth];
++                __atomic_store_n( &syscall_log_my->cur_key, syscall_log_my_key[syscall_log_depth], __ATOMIC_RELEASE );
++            }
+         }
+         /* Calls that never return the normal way (a callback's NtCallbackReturn, NtContinue)
+          * must not add a level, or a thread that pumps messages climbs past the depth limit
+@@ -1403,6 +1462,20 @@
+             }
+             if (elapsed > SYSCALL_LOG_LONG_NS)
+                 syscall_log_long( idx, num, elapsed, syscall_log_args[syscall_log_depth], retval );
++            if (retval == STATUS_TIMEOUT && elapsed >= 59000000000ull)
++                __atomic_store_n( &syscall_log_dump_wanted, 1, __ATOMIC_RELEASE );
++            if (syscall_log_my && syscall_log_my != (void *)1)
++            {
++                UINT d = syscall_log_depth;
++                syscall_log_my->last_key = syscall_log_my_key[d];
++                syscall_log_my->last_ret = syscall_log_now_ns();
++                if (d)  /* back in the outer call (a callback returned) */
++                {
++                    syscall_log_my->cur_start = syscall_log_start[d - 1];
++                    __atomic_store_n( &syscall_log_my->cur_key, syscall_log_my_key[d - 1], __ATOMIC_RELEASE );
++                }
++                else __atomic_store_n( &syscall_log_my->cur_key, 0, __ATOMIC_RELEASE );
++            }
+         }
+         if (!TRACE_ON(syscall)) return;
+     }

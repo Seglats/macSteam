@@ -132,7 +132,7 @@ if [[ ${STEAMDRIVER_NT_HOOK:-1} != 0 && -f $engine/lib/macfinals-nt-hook.dylib ]
 fi
 
 say "WINEDLLOVERRIDES=$WINEDLLOVERRIDES"
-say "hook=${DYLD_INSERT_LIBRARIES:-off} mouse=${STEAMDRIVER_MOUSE:-precise} msync=${WINEMSYNC:-0} avx=$ROSETTA_ADVERTISE_AVX"
+say "hook=${DYLD_INSERT_LIBRARIES:-off} mouse=${STEAMDRIVER_MOUSE:-precise} msync=${WINEMSYNC:-0} avx=$ROSETTA_ADVERTISE_AVX nt_off=${MACFINALS_NT_OFF:--}"
 shim='C:\Program Files (x86)\Steam\steam.exe'
 
 case $verb in

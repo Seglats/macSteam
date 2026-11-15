@@ -94,6 +94,8 @@ static int g_fd = -1;
 static uint64_t *g_ctl;        /* [16] counters, see payload_arm64.c */
 static uint32_t *g_ring;
 static uint32_t *g_payload;    /* MAP_TRANSLATED_ALLOW_EXECUTE page  */
+static uint32_t *g_exec;       /* r25: where the payload code runs (cave or g_payload) */
+static int g_no_reloc;         /* r25: MACFINALS_NT_OFF=reloc keeps it on g_payload */
 static int g_installed;        /* 1 = append hook, 2 = converters    */
 
 /* ---- debug output: Wine's channel model, channel "macfinals_hook" ----------
@@ -314,10 +316,123 @@ static int cow_write(mach_vm_address_t page, unsigned off, const void *data, uns
     return 0;
 }
 
+/* ---- r25: run our native code where Rosetta defers signals ----------------
+ *
+ * A signal (SIGQUIT at process exit, SIGUSR1 for a suspension) that lands while a
+ * thread runs our code on the payload page kills the process: Rosetta's signal
+ * handler classifies the pc (classify_arm_pc, TranslationCacheAbi.cpp), finds neither a
+ * translation nor runtime code, and aborts with "no code fragment associated with the
+ * given arm pc". A pc inside libRosettaRuntime that is not in its runtime_entry or
+ * runtime_savdnzcv sections (abi_for_address returns 0 there) is runtime code: the
+ * handler parks the thread's signal mask at ctx+0x1cc, sets bit1 of ctx+0x1c8, re-queues
+ * the signal with every signal blocked, and the runtime's exit path (runtime_exit_sys)
+ * restores the mask later, where the signal can be delivered. So the payload code and
+ * the append stub are copied into the unused tail of libRosettaRuntime's __TEXT
+ * (0x64e34-0x68000 on this UUID; we use the 16K-page-internal 4K-aligned 0x65000 on).
+ * The payload's data page stays where it is; only the adrp's that reach it are
+ * rebased. Anything unexpected keeps the old placement (fail-closed = today's
+ * behaviour). tests/rosetta_nt/R25_SIGNAL_IN_STUB.md, teardown_check.py. */
+#define LIB_CAVE_OFF 0x65000u
+#define LIB_CAVE_END 0x68000u
+
+static int insn_is_adrp(uint32_t w) { return (w & 0x9f000000u) == 0x90000000u; }
+
+static int64_t adrp_pages(uint32_t w) {
+    int64_t imm = (int64_t)((((w >> 5) & 0x7ffffu) << 2) | ((w >> 29) & 3u));
+    if (imm & (1 << 20)) imm -= 1 << 21;
+    return imm;
+}
+
+static uint32_t adrp_with_pages(uint32_t w, int64_t pages) {
+    uint32_t imm = (uint32_t)pages & 0x1fffffu;
+    return (w & 0x9f00001fu) | ((imm & 3u) << 29) | ((imm >> 2) << 5);
+}
+
+/* Copy len bytes into libRosettaRuntime with the proven COW write, one 4K window at a
+ * time (the cave's 16K page holds only __cstring/__chain_starts: nothing executes
+ * there while X is briefly off). Returns 0 when the readback matches. */
+static int lib_write(mach_vm_address_t at, const void *data, unsigned len) {
+    const unsigned char *src = data;
+    for (unsigned done = 0; done < len; ) {
+        mach_vm_address_t a = at + done, page = a & ~0xfffull;
+        unsigned n = (unsigned)(page + 0x1000 - a);
+        if (n > len - done) n = len - done;
+        if (cow_write(page, (unsigned)(a - page), src + done, n)) return 1;
+        done += n;
+    }
+    static unsigned char back[LIB_CAVE_END - LIB_CAVE_OFF];
+    if (len > sizeof back || !read_bytes(at, back, len) || memcmp(back, data, len)) return 1;
+    return 0;
+}
+
+/* Build the relocated payload text for dst; 0 = ok. */
+static int relocate_text(uint32_t *out, const uint32_t *p, mach_vm_address_t dst) {
+    memcpy(out, payload_text, P_TEXT_USED);
+    if (((uint64_t)(uintptr_t)p | dst) & 0xfff) return 1;      /* adrp keeps offsets */
+    for (unsigned i = P_CODE_START / 4; i < P_CODE_END / 4; i++) {
+        uint32_t w = out[i];
+        uint64_t pc = (uint64_t)(uintptr_t)p + i * 4ull;
+        if (insn_is_adrp(w)) {
+            uint64_t target = (pc & ~0xfffull) + (uint64_t)(adrp_pages(w) << 12);
+            uint64_t rel = target - (uint64_t)(uintptr_t)p;
+            if (rel < P_TEXT_USED) continue;                   /* into our own text */
+            int64_t pages = (int64_t)(target - ((dst + i * 4ull) & ~0xfffull)) >> 12;
+            if (pages < -(1 << 20) || pages >= (1 << 20)) {
+                WARN("relocate: data page out of adrp range (%llx from %llx)\n",
+                     (unsigned long long)target, (unsigned long long)dst);
+                return 1;
+            }
+            out[i] = adrp_with_pages(w, pages);
+        } else if ((w & 0x7c000000u) == 0x14000000u) {         /* b / bl stay inside */
+            int64_t off = (int64_t)(w & 0x3ffffffu);
+            if (off & (1 << 25)) off -= 1 << 26;
+            int64_t to = (int64_t)i * 4 + off * 4;
+            if (to < 0 || to >= (int64_t)P_TEXT_USED) {
+                WARN("relocate: branch at +%#x leaves the payload\n", i * 4);
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+/* Move the payload code into the cave. Returns the new code base, or NULL to keep
+ * running it from p. */
+static uint32_t *relocate_payload(mach_vm_address_t rb, uint32_t *p) {
+    static uint32_t buf[(LIB_CAVE_END - LIB_CAVE_OFF) / 4];
+    mach_vm_address_t dst = rb + LIB_CAVE_OFF;
+    if (g_no_reloc) { TRACE("relocate: off (MACFINALS_NT_OFF=reloc)\n"); return NULL; }
+    if (P_TEXT_USED + STUB_LEN * 4 > LIB_CAVE_END - LIB_CAVE_OFF) {
+        WARN("relocate: payload (%u bytes) does not fit the cave\n", P_TEXT_USED);
+        return NULL;
+    }
+    if (!read_bytes(dst, buf, sizeof buf)) { WARN("relocate: cave unreadable\n"); return NULL; }
+    for (unsigned i = 0; i < sizeof buf / 4; i++)
+        if (buf[i]) {
+            WARN("relocate: cave not empty at +%#x (%08x) — second load or other build\n",
+                 LIB_CAVE_OFF + i * 4, buf[i]);
+            return NULL;
+        }
+    if (relocate_text(buf, p, dst)) return NULL;
+    if (lib_write(dst, buf, P_TEXT_USED)) { WARN("relocate: write/readback FAILED\n"); return NULL; }
+    uint32_t *x = (uint32_t *)(uintptr_t)dst;
+    /* compare with the relocated words: an entry that starts with an adrp (macfast)
+     * was rebased, so the original W0 no longer applies */
+    if (x[P_NTFIX_APPEND_OFF / 4] != buf[P_NTFIX_APPEND_OFF / 4] ||
+        x[P_NTFIX_MACFAST_OFF / 4] != buf[P_NTFIX_MACFAST_OFF / 4] ||
+        x[P_NTFIX_COMPOSE_OFF / 4] != buf[P_NTFIX_COMPOSE_OFF / 4]) {
+        WARN("relocate: entry words differ after the copy\n");
+        return NULL;
+    }
+    return x;
+}
+
 /* Map the payload layout-preserving (TEXT sealed RX, DATA RW), entries
  * readback-verified fail-closed — as ntstub's map_payload. */
-static uint32_t *map_payload(void) {
-    uint32_t *p = mmap(NULL, PAYLOAD_SPAN, PROT_READ | PROT_WRITE,
+static uint32_t *map_payload(mach_vm_address_t near) {
+    /* r25: near libRosettaRuntime, so the relocated code's adrp's reach the data page */
+    uint32_t *p = mmap((void *)(uintptr_t)(near > 0x40000000ull ? near - 0x40000000ull : 0),
+                       PAYLOAD_SPAN, PROT_READ | PROT_WRITE,
                        MAP_ANON | MAP_PRIVATE | MAP_TRANSLATED_ALLOW_EXECUTE, -1, 0);
     if (p == MAP_FAILED) { ERR("payload mmap FAILED errno=%d\n", errno); return NULL; }
     memcpy(p, payload_text, PAYLOAD_TEXT_WORDS * 4);
@@ -410,7 +525,7 @@ static unsigned g_thunk_scan_gen;       /* rescan guard: bump = rescan all */
  * formulas are the insert6 ones (assembler-verified 2026-11-07, as is
  * adr x27,#-8 = 0x10ffffdb). */
 static void build_trampoline(void) {
-    uint64_t addr = (uint64_t)(g_payload + P_NTFIX_TRAPFAST_OFF / 4);
+    uint64_t addr = (uint64_t)(g_exec + P_NTFIX_TRAPFAST_OFF / 4);
     g_trampoline[0] = 0x10ffffdbu;                                       /* adr  x27,#-8 */
     g_trampoline[1] = 0xd2800000u | (((uint32_t)addr          & 0xffffu) << 5) | 26u;
     g_trampoline[2] = 0xf2a00000u | ((((uint32_t)(addr >> 16)) & 0xffffu) << 5) | 26u;
@@ -624,6 +739,7 @@ static int install_append(mach_vm_address_t rb) {
                 else if (!strcmp(t, "scatter")) g_ctl[29] = 1;
                 else if (!strcmp(t, "iret")) g_ctl[15] = 1;
                 else if (!strcmp(t, "syscall")) g_ctl[33] = 1;
+                else if (!strcmp(t, "reloc")) g_no_reloc = 1;
                 else if (!strcmp(t, "scatterzero")) zero = 1;
                 else if (!strcmp(t, "scatternop")) nop = 1;
                 else if (!strcmp(t, "scattertail")) tail = 1;
@@ -653,8 +769,10 @@ static int install_append(mach_vm_address_t rb) {
      * on it in Rosetta's emitter. */
     g_ring = TRACE_ON() ? (uint32_t *)(dp + 0x1000) : NULL;
 
-    g_payload = map_payload();
+    g_payload = map_payload(rb);
     if (!g_payload) return 1;
+    g_exec = relocate_payload(rb, g_payload);
+    if (!g_exec) g_exec = g_payload;
 
     uint32_t *sp = mmap(NULL, 0x4000, PROT_READ | PROT_WRITE,
                         MAP_ANON | MAP_PRIVATE | MAP_TRANSLATED_ALLOW_EXECUTE, -1, 0);
@@ -664,7 +782,7 @@ static int install_append(mach_vm_address_t rb) {
         uint32_t *s = sp;
         uint64_t want[4] = {0xDEAD000000000001ull, 0xDEAD000000000003ull,
                             0xDEAD000000000004ull, 0xDEAD000000000002ull};
-        uint64_t vals[4] = {(uint64_t)(g_payload + P_NTFIX_APPEND_OFF / 4),
+        uint64_t vals[4] = {(uint64_t)(g_exec + P_NTFIX_APPEND_OFF / 4),
                             (uint64_t)g_ctl, (uint64_t)g_ring,
                             rb + OFF_APPEND + 16};
         unsigned offs[4] = {PCALL_OFF, PCTL_OFF, PRING_OFF, PBACK_OFF};
@@ -684,11 +802,57 @@ static int install_append(mach_vm_address_t rb) {
         ERR("stub page R|X FAILED\n");
         return 1;
     }
-    if (patch_abs_jump(rb, OFF_APPEND, sp)) return 1;
+    /* r25: the stub runs inside the translator too; with the payload in the cave, put
+     * it right after it (it only reaches its own literals, adr-relative) */
+    void *stub = sp;
+    if (g_exec != g_payload) {
+        mach_vm_address_t sdst = (mach_vm_address_t)(uintptr_t)g_exec + P_TEXT_USED;
+        if (lib_write(sdst, sp, STUB_LEN * 4) == 0) stub = (void *)(uintptr_t)sdst;
+        else WARN("relocate: append stub write FAILED — stub stays on its own page\n");
+    }
+    if (patch_abs_jump(rb, OFF_APPEND, stub)) return 1;
     TRACE("append hook installed at libRosettaRuntime %016llx+0x18a0 "
-         "(payload %p ctl %p ring %p)\n",
-         (unsigned long long)rb, (void *)g_payload, (void *)g_ctl, (void *)g_ring);
+         "(payload code %p%s, stub %p, data %p ctl %p ring %p)\n",
+         (unsigned long long)rb, (void *)g_exec,
+         g_exec != g_payload ? " in libRosettaRuntime" : " on its own page", stub,
+         (void *)g_payload, (void *)g_ctl, (void *)g_ring);
+    if (g_exec == g_payload)
+        WARN("payload code NOT relocated: a signal inside it aborts the process "
+             "(R25_SIGNAL_IN_STUB.md)\n");
     return 0;
+}
+
+/* r25: the syscall fast path resumes through Rosetta's own runtime_exitljmp (the page
+ * epilogue), which also delivers a signal that was deferred while the thread was in our
+ * code. Its address goes to ctl[96] only if the routine's words are the ones this
+ * runtime UUID has; otherwise the fast path bails to the stock path (fail-closed). */
+#define OFF_EXITLJMP 0x22560u
+#define CTL_EXITLJMP 96u
+static void publish_exitljmp(mach_vm_address_t rt) {
+    static const struct { unsigned off; uint32_t w; } sig[] = {
+        {0x00, 0xb941ca5bu},   /* ldr  w27, [x18, #0x1c8]   pending word        */
+        {0x34, 0xd63f03a0u},   /* blr  x29                  table[0]            */
+        {0x50, 0xb941ca5bu},   /* ldr  w27, [x18, #0x1c8]   again, | w1         */
+        {0x6c, 0xd2802930u},   /* mov  x16, #329            __pthread_sigmask   */
+        {0x70, 0xd4001001u},   /* svc  #0x80                                     */
+        {0xa4, 0xf940065eu},   /* ldr  x30, [x18, #0x8]     installed entry     */
+        {0xac, 0xd65f03c0u},   /* ret                                            */
+    };
+    uint32_t v[0xb0 / 4];
+    if (!g_ctl) return;
+    if (!read_bytes(rt + OFF_EXITLJMP, v, sizeof v)) {
+        WARN("runtime_exitljmp unreadable — syscall fast path stays on the stock path\n");
+        return;
+    }
+    for (unsigned i = 0; i < sizeof sig / sizeof sig[0]; i++)
+        if (v[sig[i].off / 4] != sig[i].w) {
+            WARN("runtime_exitljmp +%#x is %08x, want %08x — syscall fast path stays on "
+                 "the stock path\n", sig[i].off, v[sig[i].off / 4], sig[i].w);
+            return;
+        }
+    g_ctl[CTL_EXITLJMP] = rt + OFF_EXITLJMP;
+    TRACE("syscall fast path resumes through runtime_exitljmp %016llx\n",
+          (unsigned long long)(rt + OFF_EXITLJMP));
 }
 
 /* converter replacements (r9). 0 = installed, 1 = image not mapped yet
@@ -709,9 +873,10 @@ static int install_converters(void) {
              v[0], v[1], v[2], v[3]);
         return 2;
     }
-    if (patch_abs_jump(rt, OFF_COMPOSE, g_payload + P_NTFIX_COMPOSE_OFF / 4) ||
-        patch_abs_jump(rt, OFF_DECOMPOSE, g_payload + P_NTFIX_DECOMPOSE_OFF / 4))
+    if (patch_abs_jump(rt, OFF_COMPOSE, g_exec + P_NTFIX_COMPOSE_OFF / 4) ||
+        patch_abs_jump(rt, OFF_DECOMPOSE, g_exec + P_NTFIX_DECOMPOSE_OFF / 4))
         return 2;
+    publish_exitljmp(rt);
     TRACE("converters installed at rosetta/runtime %016llx "
          "(compose+decompose, readback verified)\n", (unsigned long long)rt);
     return 0;
@@ -817,7 +982,7 @@ static void dump_counters(const char *when) {
      * entries [39] clean bails; driver counts: thunks patched / bad writes /
      * signature near-misses) */
     TRACE("sysc %s: thunks %u badwrite %u nearmiss %u ins %llu miss %llu hits %llu disarm %llu "
-         "target %llx entered %llu bail5 %llu guards %016llx c38 %llx\n", when,
+         "target %llx entered %llu bail5 %llu guards %016llx c38 %llx deferred-guard %llu shared-skip %llu\n", when,
          g_thunks_patched, g_thunks_badwrite, g_thunks_skipcfg,
          (unsigned long long)g_ctl[32], (unsigned long long)g_ctl[34],
          (unsigned long long)g_ctl[36], (unsigned long long)g_ctl[33],
@@ -832,7 +997,35 @@ static void dump_counters(const char *when) {
          (unsigned long long)(g_ctl[40] & 0xffffffffffffffffull),
          /* ais10: last-writer diagnostic — busy-bail stores the pending
           * word, the post-call path stores ctx+0x8 (small mask vs JIT ptr) */
-         (unsigned long long)g_ctl[38]);
+         (unsigned long long)g_ctl[38], (unsigned long long)g_ctl[97],
+         (unsigned long long)g_ctl[98]);
+    /* r25 diagnostics: every translating thread's pending word and parked mask (the
+     * payload records the contexts when trace is on). A thread stuck with bit1 set
+     * has a deferred signal whose mask was never restored. */
+    {
+        char line[1024];
+        int n = 0;
+        for (unsigned i = 128; i < 192 && g_ctl[i] && n < (int)sizeof line - 120; i++) {
+            uint32_t w[2] = {0, 0};
+            uint64_t ret = 0, rec = 0;
+            uint8_t inrt = 0;
+            if (read_bytes(g_ctl[i] + 0x1c8, w, sizeof w) && w[0]) {
+                read_bytes(g_ctl[i] + 0x8, &ret, 8);
+                read_bytes(g_ctl[i] + 0x1d0, &rec, 8);
+                read_bytes(g_ctl[i] + 0x208, &inrt, 1);
+                n += snprintf(line + n, sizeof line - n, " %llx:%x/%x ret %llx rec %llx inrt %u",
+                              (unsigned long long)(g_ctl[i] & 0xffffff), w[0], w[1],
+                              (unsigned long long)ret, (unsigned long long)rec, inrt);
+            } else if (w[0] == 0)
+                n += snprintf(line + n, sizeof line - n, " %llx:0",
+                              (unsigned long long)(g_ctl[i] & 0xffffff));
+        }
+        if (n) TRACE("ctx %s:%s\n", when, line);
+        n = 0;
+        for (unsigned i = 0; i < 64 && i < g_ctl[199] && n < (int)sizeof line - 24; i++)
+            n += snprintf(line + n, sizeof line - n, " %llx", (unsigned long long)g_ctl[200 + i]);
+        if (n) TRACE("sites %s (%llu):%s\n", when, (unsigned long long)g_ctl[199], line);
+    }
     /* r21c/ais5: guard-5b pointer dump — what TPIDRRO actually holds in a
      * translated Wine thread (set only when guard 5b has fired). ctl[45]
      * (ais6+): full-word 5b fail count — the byte lane at 0x144 wrapped at

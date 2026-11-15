@@ -1,0 +1,108 @@
+From: MacFinals
+Subject: ntdll: the stuck-dump printed the name buffer, not the name
+
+syscall_log_name only writes the caller's buffer for unnamed calls (its "%u:%03x"
+fallback); for named ones it returns a pointer into the static table and leaves the
+buffer untouched. The stuck-scan code ignored the return value and printed the
+untouched stack buffer instead, so every stuck-dump from the first macfinals-120/121
+probe run had garbage or empty names ("in ?", "in X^X" - bytes that can even contain
+newlines), and the NtTerminateThread comparison behind the "exited" rendering was
+comparing that same garbage.
+
+Use the return value everywhere: the scan's header name is copied into
+syscall_log_dump_name from whichever pointer comes back, and the dump body prints and
+compares the returned pointer.
+
+---
+ dlls/ntdll/unix/loader.c | 35 ++++++++++++++++++++++--------------
+ 1 file changed, 21 insertions(+), 14 deletions(-)
+
+--- a/dlls/ntdll/unix/loader.c
++++ b/dlls/ntdll/unix/loader.c
+@@ -1041,9 +1041,8 @@
+     }
+ }
+ 
+-/* When a lock wait times out (an NT call returning STATUS_TIMEOUT after >= 59 s: the 60 s
+- * retry in RtlpWaitForCriticalSection), say what every thread is in, so the lock's owner can
+- * be found by its Windows thread id. */
++/* Say what every thread is in when something looks stuck, so a lock's owner or a stuck
++ * send's target can be found by Windows thread id. */
+ #define SYSCALL_LOG_STUCK_NS 60000000000ull
+ static UINT32 syscall_log_dump_wtid;
+ static char syscall_log_dump_name[36];
+@@ -1062,11 +1061,17 @@
+     {
+         struct syscall_log_tcalls *tc = &syscall_log_tc[t];
+         UINT16 key = __atomic_load_n( &tc->cur_key, __ATOMIC_ACQUIRE );
++        const char *what;
+ 
+         if (!tc->wtid || !key || !tc->cur_start) continue;
+         if (now - tc->cur_start < SYSCALL_LOG_STUCK_NS) continue;
+-        syscall_log_name( (key - 1) >> 12, (key - 1) & 0xfff,
+-                          syscall_log_dump_name, sizeof(syscall_log_dump_name) );
++        /* syscall_log_name only fills the buffer for unnamed calls; for named ones it
++         * returns a pointer into the static table and leaves the buffer untouched, so
++         * the return value is the name either way. */
++        what = syscall_log_name( (key - 1) >> 12, (key - 1) & 0xfff,
++                                 syscall_log_dump_name, sizeof(syscall_log_dump_name) );
++        if (what != syscall_log_dump_name)
++            snprintf( syscall_log_dump_name, sizeof(syscall_log_dump_name), "%s", what );
+         syscall_log_dump_wtid = tc->wtid;
+         __atomic_store_n( &syscall_log_dump_wanted, 1, __ATOMIC_RELEASE );
+         break;
+@@ -1100,8 +1105,8 @@
+         UINT16 key = __atomic_load_n( &tc->cur_key, __ATOMIC_ACQUIRE );
+ 
+         if (!tc->wtid || !key) continue;
+-        syscall_log_name( (key - 1) >> 12, (key - 1) & 0xfff, name, sizeof(name) );
+-        if (strcmp( name, "NtTerminateThread" )) live[nlive++] = tc->wtid;
++        if (strcmp( syscall_log_name( (key - 1) >> 12, (key - 1) & 0xfff, name, sizeof(name) ),
++                    "NtTerminateThread" )) live[nlive++] = tc->wtid;
+     }
+     for (t = 0; t < used; t++)
+     {
+@@ -1112,8 +1117,9 @@
+         if (!tc->wtid) continue;
+         if (key)
+         {
+-            syscall_log_name( (key - 1) >> 12, (key - 1) & 0xfff, name, sizeof(name) );
+-            if (!strcmp( name, "NtTerminateThread" ))
++            const char *what = syscall_log_name( (key - 1) >> 12, (key - 1) & 0xfff,
++                                                 name, sizeof(name) );
++            if (!strcmp( what, "NtTerminateThread" ))
+             {
+                 for (i = 0; i < nlive; i++) if (live[i] == tc->wtid) break;
+                 if (i == nlive) fprintf( file, "  %04x exited\n", tc->wtid );
+@@ -1122,23 +1128,24 @@
+             dur = tc->cur_start ? (now - tc->cur_start) / 1e9 : -1;
+             if (dur >= 0)
+                 fprintf( file, "  %04x (#%llx) in %s for %.1f s args=%lx,%lx,%lx,%lx\n",
+-                         tc->wtid, (unsigned long long)tc->tid, name, dur,
++                         tc->wtid, (unsigned long long)tc->tid, what, dur,
+                          (unsigned long)tc->cur_args[0], (unsigned long)tc->cur_args[1],
+                          (unsigned long)tc->cur_args[2], (unsigned long)tc->cur_args[3] );
+             else
+                 fprintf( file, "  %04x (#%llx) in %s\n",
+-                         tc->wtid, (unsigned long long)tc->tid, name );
++                         tc->wtid, (unsigned long long)tc->tid, what );
+         }
+         else if (tc->last_key)
+         {
+-            syscall_log_name( (tc->last_key - 1) >> 12, (tc->last_key - 1) & 0xfff, name, sizeof(name) );
++            const char *what = syscall_log_name( (tc->last_key - 1) >> 12, (tc->last_key - 1) & 0xfff,
++                                                 name, sizeof(name) );
+             dur = tc->last_ret ? (now - tc->last_ret) / 1e9 : -1;
+             if (dur >= 0 && dur < 1e7)
+                 fprintf( file, "  %04x (#%llx) not in an NT call; last %s returned %.1f s ago\n",
+-                         tc->wtid, (unsigned long long)tc->tid, name, dur );
++                         tc->wtid, (unsigned long long)tc->tid, what, dur );
+             else
+                 fprintf( file, "  %04x (#%llx) not in an NT call; last %s returned moments ago\n",
+-                         tc->wtid, (unsigned long long)tc->tid, name );
++                         tc->wtid, (unsigned long long)tc->tid, what );
+         }
+     }
+     fflush( file );
+-- 
+2.49.0

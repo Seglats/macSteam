@@ -1,0 +1,116 @@
+From: MacFinals
+Subject: win32u: say once who a never-answered SendMessage is waiting for
+
+crashes/C17: at quit, a game thread sat in NtUserMessageCall(WM_GETTEXT) for 69 s and
+counting with nothing in the log, because the window's owning thread had stopped pumping
+messages and wait_message_reply waits INFINITE with no output. Take the send info so the
+wait can name the target: wait in 5 s slices until one ERR line has been printed, then
+wait INFINITE as before. A send that gets its reply (the normal case) returns from the
+slice early, so nothing is added outside the stuck case.
+
+send_hardware_message's second wait_message_reply call now passes its info too; its
+msg/wparam/lparam were never initialised (hardware messages set them on the server side),
+so zero them for the one ERR line that could print them.
+
+---
+ dlls/win32u/message.c | 26 +++++++++++++++++-----
+ 1 file changed, 21 insertions(+), 5 deletions(-)
+
+diff --git a/dlls/win32u/message.c b/dlls/win32u/message.c
+index 1111111..2222222 100644
+--- a/dlls/win32u/message.c
++++ b/dlls/win32u/message.c
+@@ -3748,38 +3748,51 @@ static unsigned int put_message_in_queue( const struct send_message_info *info,
+ /***********************************************************************
+  *           wait_message_reply
+  *
+  * Wait until a sent message gets replied to.
+  */
+-static void wait_message_reply( UINT flags )
++static void wait_message_reply( const struct send_message_info *info )
+ {
+     HANDLE server_queue = get_server_queue_handle();
+-    unsigned int wake_mask = QS_SMRESULT | ((flags & SMTO_BLOCK) ? 0 : QS_SENDMESSAGE);
++    unsigned int wake_mask = QS_SMRESULT | ((info->flags & SMTO_BLOCK) ? 0 : QS_SENDMESSAGE);
++    DWORD start = get_tick_count();
++    BOOL logged = FALSE;
+
+     for (;;)
+     {
+         UINT wake_bits, changed_bits;
+
+         if (check_queue_bits( wake_mask, wake_mask, wake_mask, wake_mask,
+                               &wake_bits, &changed_bits, FALSE ))
+             wake_bits = wake_bits & wake_mask;
+         else SERVER_START_REQ( set_queue_mask )
+         {
+             req->wake_mask    = wake_mask;
+             req->changed_mask = wake_mask;
+             wine_server_call( req );
+             wake_bits = reply->wake_bits & wake_mask;
+         }
+         SERVER_END_REQ;
+
+         if (wake_bits & QS_SMRESULT) return;  /* got a result */
+         if (wake_bits & QS_SENDMESSAGE)
+         {
+             /* Process the sent message immediately */
+             process_sent_messages();
+             continue;
+         }
+
+-        wait_message( 1, &server_queue, INFINITE, wake_mask, wake_mask, 0 );
++        /* MacFinals (crashes/C17): the reply may never come (the receiving thread stopped
++         * pumping messages during shutdown) and the sender then waits here forever with
++         * nothing in the log. Wait in slices and say once who we are waiting for; the
++         * counters' stuck-dump shows what that thread is doing. */
++        wait_message( 1, &server_queue, logged ? INFINITE : 5000, wake_mask, wake_mask, 0 );
++        if (!logged && get_tick_count() - start >= 5000)
++        {
++            ERR( "no reply after %u ms: still waiting for tid %04x (window %p, msg %x (%s))\n",
++                 get_tick_count() - start, info->dest_tid, info->hwnd, info->msg,
++                 debugstr_msg_name( info->msg, info->hwnd ) );
++            logged = TRUE;
++        }
+     }
+ }
+
+@@ -3842,6 +3855,6 @@ static LRESULT send_inter_thread_message( HWND hwnd, UINT msg, WPARAM wparam, LPA
+     /* there's no reply to wait for on notify/callback messages */
+     if (info->type == MSG_NOTIFY || info->type == MSG_CALLBACK) return 1;
+
+-    wait_message_reply( info->flags );
++    wait_message_reply( info );
+     return retrieve_reply( info, reply_size, res_ptr );
+ }
+@@ -3904,13 +3917,16 @@ static void queue_hardware_message( HWND hwnd, UINT message, WPARAM wparam, LPARA
+ NTSTATUS send_hardware_message( HWND hwnd, UINT flags, const INPUT *input, LPARAM lparam )
+ {
+     struct send_message_info info;
+     int prev_x, prev_y, new_x, new_y;
+     NTSTATUS ret;
+     BOOL wait;
+
+     info.type     = MSG_HARDWARE;
+     info.dest_tid = 0;
+     info.hwnd     = hwnd;
++    info.msg      = 0;  /* hardware messages get msg/wparam/lparam on the server side */
++    info.wparam   = 0;
++    info.lparam   = 0;
+     info.flags    = 0;
+     info.timeout  = 0;
+     info.params   = NULL;
+@@ -3988,9 +4004,9 @@ NTSTATUS send_hardware_message( HWND hwnd, UINT flags, const INPUT *input, LPARA
+     if (!ret && (flags & SEND_HWMSG_INJECTED) && (prev_x != new_x || prev_y != new_y))
+         user_driver->pSetCursorPos( new_x, new_y );
+
+     if (wait)
+     {
+         LRESULT ignored;
+-        wait_message_reply( 0 );
++        wait_message_reply( &info );
+         retrieve_reply( &info, 0, &ignored );
+     }
+--
+2.49.0
+

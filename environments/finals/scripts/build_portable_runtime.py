@@ -212,6 +212,44 @@ WINE_PATCHES = [
     'wine-ntdll-game-mode-all.patch',
     # A game app only in place of a loader that exists (the other architecture's may not).
     'wine-ntdll-game-mode-loader-check.patch',
+    # WINE_SYSCALL_LOG: the busiest threads' own NT calls, counted and timed ("tcalls:").
+    'wine-ntdll-syscall-log-threads.patch',
+    # A thread killed for a nested exception: the module and offset of the fault, and the thread's name.
+    'wine-ntdll-nested-exception-where.patch',
+    # WINE_SYSCALL_LOG: NtCallbackReturn/NtContinue don't add a call level (message-pumping threads were lost).
+    'wine-ntdll-syscall-log-noreturn.patch',
+    # WINE_SYSCALL_LOG: long-call lines go through a ring the log thread writes, so no game thread takes the file's lock.
+    'wine-ntdll-syscall-log-long-ring.patch',
+    # SIGQUIT on a thread without a syscall frame: end it directly instead of faulting on NULL+0xa8
+    # (the "nested exception on signal stack" noise at every quit; crashes/C07).
+    'wine-ntdll-quit-handler-no-frame.patch',
+    # WINE_SYSCALL_LOG: when a lock wait times out (60 s retry), dump every thread's current NT call,
+    # so the lock's owner can be found by its thread id (crashes/C16).
+    'wine-ntdll-syscall-log-stuck-dump.patch',
+    # WINE_SYSCALL_LOG: the dump triggers by the log thread scanning for a call >= 60 s, not by a
+    # STATUS_TIMEOUT return (an ordinary 60 s timed wait fired it); exited threads print as one
+    # "exited" line; no more torn-timestamp durations (crashes/C17).
+    'wine-ntdll-syscall-log-stuck-scan.patch',
+    # win32u: a sent message that gets no reply for 5 s says once which tid/window/msg the sender
+    # is stuck on, instead of waiting INFINITE in silence (crashes/C17).
+    'wine-win32u-sendmessage-stuck-log.patch',
+    # WINE_SYSCALL_LOG: the stuck-dump printed syscall_log_name's buffer, but the name is the
+    # return value (the buffer only fills for unnamed calls) — dumps showed garbage names.
+    'wine-ntdll-syscall-log-stuck-name.patch',
+    # WINE_SYSCALL_LOG: dump each stuck condition once (idle >= 60 s waiters would re-dump
+    # every 55 s), never headline an exited thread, and prefer a non-wait call for the
+    # headline (a stuck NtUserMessageCall over a watchdog's sleep).
+    'wine-ntdll-syscall-log-stuck-once.patch',
+    # build fix for the one above: its two anonymous struct arrays are distinct C types.
+    'wine-ntdll-syscall-log-stuck-once-tagfix.patch',
+    # WINE_SYSCALL_LOG: a thread entering a call between the scan's clock read and its slot
+    # read wrapped the duration to ~2^64 — false "stuck" headlines and 18446744073.7 s lines
+    # (seen in the 2026-11-15 game run on macfinals-125).
+    'wine-ntdll-syscall-log-stuck-race.patch',
+    # WINE_SYSCALL_LOG: mark a thread's slot in pthread_exit_wrapper (every death's funnel), so
+    # the dump says "exited; never returned from <call>" instead of a forever-growing duration
+    # (C17 043c); plus an ERR with all four fd numbers when a reply read fails fatally.
+    'wine-ntdll-syscall-log-exited-mark.patch',
 ]
 
 

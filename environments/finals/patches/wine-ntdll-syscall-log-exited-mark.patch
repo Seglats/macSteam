@@ -1,0 +1,148 @@
+Subject: [PATCH] ntdll: mark a thread's syscall-log slot when the thread exits
+
+Every thread death funnels through pthread_exit_wrapper (normal exit,
+NtTerminateThread, a SIGQUIT kill, a fatal "wine client error" abort). A thread
+that dies inside an NT call never returns from it, so its syscall-log slot keeps
+cur_key forever and the WINE_SYSCALL_LOG stuck-dump renders it as "in that call
+for N s" while the thread is long gone - C17 thread 043c read as "in
+NtSetInformationThread for 114 s" after its wineserver connection died. Mark the
+slot in the funnel; the dump then says "exited; never returned from <call>" and
+dead threads stop triggering dumps.
+
+Also ERR-log the fatal reply-read in read_reply_data with the thread's four fd
+numbers and errno: a read giving EBADF means someone closed the reply pipe under
+the thread (a dead server gives EOF/EPIPE), and the next occurrence should show
+which fd went and in what state the connection was.
+
+---
+--- a/dlls/ntdll/unix/loader.c
++++ b/dlls/ntdll/unix/loader.c	2026-11-15 21:34:04
+@@ -877,6 +877,13 @@
+     UINT64 cur_start;                 /* ns */
+     UINT64 last_ret;                  /* ns */
+     ULONG_PTR cur_args[4];
++    /* 2026-11-15: set by syscall_log_thread_exiting() from pthread_exit_wrapper, the funnel
++     * every thread death passes through (normal exit, NtTerminateThread, a SIGQUIT kill, a
++     * fatal "wine client error" abort). A thread that dies inside an NT call keeps its cur_key
++     * forever; without this flag the dump renders that as "in that call for N s" for a thread
++     * that is long gone (crashes/C17: 043c was "in NtSetInformationThread for 114 s" after its
++     * wineserver connection died). */
++    UINT8 exited;
+     UINT16 key[SYSCALL_LOG_TCALLS];   /* (idx << 12 | num) + 1, 0 = free */
+     LONG64 count[SYSCALL_LOG_TCALLS];
+     LONG64 time[SYSCALL_LOG_TCALLS];
+@@ -1079,6 +1086,7 @@
+         int is_wait, known = 0;
+ 
+         if (!tc->wtid || !key || !tc->cur_start) continue;
++        if (tc->exited) continue;  /* pthread_exit_wrapper marked it: a dead thread never triggers */
+         /* cur_start > now: the thread entered this call after this scan read its clock;
+          * the unsigned subtraction would wrap to ~2^64 and pass the 60 s filter (a false
+          * "in NtSetEvent" headline seen in the 2026-11-15 game run) */
+@@ -1153,7 +1161,7 @@
+         struct syscall_log_tcalls *tc = &syscall_log_tc[t];
+         UINT16 key = __atomic_load_n( &tc->cur_key, __ATOMIC_ACQUIRE );
+ 
+-        if (!tc->wtid || !key) continue;
++        if (!tc->wtid || !key || tc->exited) continue;
+         if (strcmp( syscall_log_name( (key - 1) >> 12, (key - 1) & 0xfff, name, sizeof(name) ),
+                     "NtTerminateThread" )) live[nlive++] = tc->wtid;
+     }
+@@ -1164,6 +1172,25 @@
+         double dur;
+ 
+         if (!tc->wtid) continue;
++        if (tc->exited)
++        {
++            for (i = 0; i < nlive; i++) if (live[i] == tc->wtid) break;
++            if (i == nlive)
++            {
++                if (key)
++                {
++                    const char *what = syscall_log_name( (key - 1) >> 12, (key - 1) & 0xfff,
++                                                         name, sizeof(name) );
++                    if (strcmp( what, "NtTerminateThread" ))
++                        fprintf( file, "  %04x exited; never returned from %s\n", tc->wtid, what );
++                    else
++                        fprintf( file, "  %04x exited\n", tc->wtid );
++                }
++                else
++                    fprintf( file, "  %04x exited\n", tc->wtid );
++            }
++            continue;
++        }
+         if (key)
+         {
+             const char *what = syscall_log_name( (key - 1) >> 12, (key - 1) & 0xfff,
+@@ -1466,6 +1493,17 @@
+     return enabled;
+ }
+ 
++/* Called from pthread_exit_wrapper (thread.c), the funnel every thread death passes through:
++ * a thread that dies inside an NT call (killed while waiting, or aborted by a fatal client
++ * error) never returns from it, so its slot keeps cur_key forever. The flag lets the stuck
++ * dump say "exited; never returned from <call>" instead of a duration that grows forever. */
++void syscall_log_thread_exiting(void)
++{
++    /* (void *)1 marks threads past the table end; NULL means never counted */
++    if (syscall_log_my > (void *)1)
++        __atomic_store_n( &syscall_log_my->exited, 1, __ATOMIC_RELEASE );
++}
++
+ static BOOL syscall_log_noreturn( UINT idx, UINT num )
+ {
+     static unsigned char known[SYSCALL_LOG_TABLES][4096];  /* 0 unknown, 1 returns, 2 does not */
+--- a/dlls/ntdll/unix/thread.c
++++ b/dlls/ntdll/unix/thread.c	2026-11-15 21:34:09
+@@ -1104,6 +1104,7 @@
+  */
+ static DECLSPEC_NORETURN void pthread_exit_wrapper( int status )
+ {
++    syscall_log_thread_exiting();  /* mark the slot: a death mid-call must not read as "stuck" */
+     close( ntdll_get_thread_data()->alert_fd );
+     close( ntdll_get_thread_data()->wait_fd[0] );
+     close( ntdll_get_thread_data()->wait_fd[1] );
+--- a/dlls/ntdll/unix/server.c
++++ b/dlls/ntdll/unix/server.c	2026-11-15 21:34:22
+@@ -248,11 +248,12 @@
+  */
+ static void read_reply_data( void *buffer, size_t size )
+ {
++    struct ntdll_thread_data *data = ntdll_get_thread_data();
+     int ret;
+ 
+     for (;;)
+     {
+-        if ((ret = read( ntdll_get_thread_data()->reply_fd, buffer, size )) > 0)
++        if ((ret = read( data->reply_fd, buffer, size )) > 0)
+         {
+             if (!(size -= ret)) return;
+             buffer = (char *)buffer + ret;
+@@ -261,9 +262,17 @@
+         if (!ret) break;
+         if (errno == EINTR) continue;
+         if (errno == EPIPE) break;
++        /* crashes/C17: someone closed this thread's reply pipe under it (a read on a merely
++         * dead server gives EOF or EPIPE, not EBADF). Name every fd so the next occurrence
++         * shows which one went and what state the thread's connection was in. */
++        ERR( "reply read failed: fds reply %d alert %d wait %d,%d request %d: %s; ending the thread\n",
++             data->reply_fd, data->alert_fd, data->wait_fd[0], data->wait_fd[1],
++             data->request_fd, strerror( errno ) );
+         server_protocol_perror("read");
+     }
+     /* the server closed the connection; time to die... */
++    ERR( "wineserver closed the connection (reply fd %d, request fd %d); ending the thread\n",
++         data->reply_fd, data->request_fd );
+     abort_thread(0);
+ }
+ 
+--- a/dlls/ntdll/unix/unix_private.h
++++ b/dlls/ntdll/unix/unix_private.h	2026-11-15 21:34:11
+@@ -331,6 +331,7 @@
+ extern void signal_free_thread( TEB *teb );
+ extern void signal_init_process(void);
+ extern BOOL syscall_log_enabled(void);
++extern void syscall_log_thread_exiting(void);
+ 
+ /* WINE_SYSCALL_LOG diagnostics (loader.c): signal, fault and virtual_mutex counters */
+ enum wine_diag_counter

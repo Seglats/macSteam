@@ -1,0 +1,138 @@
+From: MacFinals
+Subject: ntdll: dump each stuck condition once, and headline the interesting thread
+
+The macfinals-123 probe run showed three trigger problems, all in the scan:
+
+- Idle threads parked in ordinary >= 60 s waits (thread pools, prefix services) dump
+  again every 55 s rate window - the same threads, the same call, for as long as the
+  process lives. In a game session that is a dump a minute per process of pure noise.
+- A thread whose slot still holds NtTerminateThread (it exited long ago) can be the
+  trigger and the headline: "stuck-dump: thread 016c in NtTerminateThread" for a
+  thread that died at t=0.
+- The headline goes to whichever stuck slot the table scan meets first, so a
+  watchdog's Sleep(75 s) out-ranked the stuck NtUserMessageCall the dump exists for.
+
+Remember each reported (wtid, call) condition; a condition dumps once, and when it
+ends (the thread moved on) it is forgotten so a later stick dumps again. NtTerminateThread
+slots never trigger - the body already prints them as "exited". When several new
+conditions compete for the headline, prefer a call that is not a plain NtWaitFor*/NtDelay*
+one. The 55 s rate limit moves to a shared syscall_log_last_dump so the scan does not
+record conditions it could not dump yet.
+
+--- a/dlls/ntdll/unix/loader.c
++++ b/dlls/ntdll/unix/loader.c
+@@ -1046,36 +1046,82 @@
+ #define SYSCALL_LOG_STUCK_NS 60000000000ull
+ static UINT32 syscall_log_dump_wtid;
+ static char syscall_log_dump_name[36];
++static UINT64 syscall_log_last_dump;
+ 
+ /* Any thread whose current NT call has been running for >= 60 s: a stuck SendMessage, a wait
+  * with no timeout, a thread that won't finish dying. Run by the log thread, so no thread-side
+  * trigger is needed (the old one, STATUS_TIMEOUT after >= 59 s, fired on ordinary 60 s timed
+- * waits; crashes/C17). */
++ * waits; crashes/C17). Each stuck condition is dumped once — idle thread pools in >= 60 s
++ * waits would otherwise re-dump every rate window — a thread parked in NtTerminateThread is
++ * not a trigger (the body prints it as "exited"), and the headline prefers a call that is
++ * not a plain wait or sleep. */
+ static void syscall_log_stuck_check( void )
+ {
++    static struct { UINT32 wtid; UINT16 key; } reported[SYSCALL_LOG_TSLOTS];
++    static int reported_count;
++    struct { UINT32 wtid; UINT16 key; } stuck[SYSCALL_LOG_TSLOTS];
+     LONG used = min( __atomic_load_n( &syscall_log_tc_used, __ATOMIC_ACQUIRE ), SYSCALL_LOG_TSLOTS );
+     UINT64 now = syscall_log_now_ns();
++    char headline_name[36];
++    UINT32 headline_wtid = 0;
++    int have_headline = 0, headline_is_wait = 0, nstuck = 0, i;
+     LONG t;
+ 
++    if (syscall_log_last_dump && now - syscall_log_last_dump < 55000000000ull) return;
++
+     for (t = 0; t < used; t++)
+     {
+         struct syscall_log_tcalls *tc = &syscall_log_tc[t];
+         UINT16 key = __atomic_load_n( &tc->cur_key, __ATOMIC_ACQUIRE );
++        char name[32];
+         const char *what;
++        int is_wait, known = 0;
+ 
+         if (!tc->wtid || !key || !tc->cur_start) continue;
+         if (now - tc->cur_start < SYSCALL_LOG_STUCK_NS) continue;
+-        /* syscall_log_name only fills the buffer for unnamed calls; for named ones it
+-         * returns a pointer into the static table and leaves the buffer untouched, so
+-         * the return value is the name either way. */
+-        what = syscall_log_name( (key - 1) >> 12, (key - 1) & 0xfff,
+-                                 syscall_log_dump_name, sizeof(syscall_log_dump_name) );
+-        if (what != syscall_log_dump_name)
+-            snprintf( syscall_log_dump_name, sizeof(syscall_log_dump_name), "%s", what );
+-        syscall_log_dump_wtid = tc->wtid;
+-        __atomic_store_n( &syscall_log_dump_wanted, 1, __ATOMIC_RELEASE );
+-        break;
++        /* the name is the return value: syscall_log_name only fills the buffer for
++         * unnamed calls */
++        what = syscall_log_name( (key - 1) >> 12, (key - 1) & 0xfff, name, sizeof(name) );
++        if (!strcmp( what, "NtTerminateThread" )) continue;
++        stuck[nstuck].wtid = tc->wtid;
++        stuck[nstuck].key = key;
++        nstuck++;
++        for (i = 0; i < reported_count; i++)
++            if (reported[i].wtid == tc->wtid && reported[i].key == key) { known = 1; break; }
++        if (known) continue;
++        is_wait = !strncmp( what, "NtWaitFor", 9 ) || !strncmp( what, "NtDelay", 7 );
++        if (!have_headline || (headline_is_wait && !is_wait))
++        {
++            snprintf( headline_name, sizeof(headline_name), "%s", what );
++            headline_wtid = tc->wtid;
++            have_headline = 1;
++            headline_is_wait = is_wait;
++        }
++    }
++    /* a condition that ended is forgotten, so the same thread sticking again dumps again */
++    for (i = 0; i < reported_count; i++)
++    {
++        int j, still = 0;
++        for (j = 0; j < nstuck; j++)
++            if (stuck[j].wtid == reported[i].wtid && stuck[j].key == reported[i].key) { still = 1; break; }
++        if (!still)
++        {
++            reported[i] = reported[reported_count - 1];
++            reported_count--;
++            i--;  /* the entry moved here is untested */
++        }
+     }
++    if (!have_headline) return;  /* nothing new is stuck */
++    for (i = 0; i < nstuck && reported_count < SYSCALL_LOG_TSLOTS; i++)
++    {
++        int j, known = 0;
++        for (j = 0; j < reported_count; j++)
++            if (reported[j].wtid == stuck[i].wtid && reported[j].key == stuck[i].key) { known = 1; break; }
++        if (!known) reported[reported_count++] = stuck[i];
++    }
++    snprintf( syscall_log_dump_name, sizeof(syscall_log_dump_name), "%s", headline_name );
++    syscall_log_dump_wtid = headline_wtid;
++    __atomic_store_n( &syscall_log_dump_wanted, 1, __ATOMIC_RELEASE );
+ }
+ 
+ /* Say what every thread is in, so a lock owner (the "blocked by" thread id) or the thread a
+@@ -1084,7 +1130,6 @@
+  * one short "exited" line, and not at all when a live thread has taken over the id. */
+ static void syscall_log_stuck_dump( FILE *file )
+ {
+-    static UINT64 last_dump;
+     static UINT32 live[SYSCALL_LOG_TSLOTS];
+     UINT64 now = syscall_log_now_ns();
+     LONG used = min( __atomic_load_n( &syscall_log_tc_used, __ATOMIC_ACQUIRE ), SYSCALL_LOG_TSLOTS );
+@@ -1093,8 +1138,8 @@
+     int i, nlive = 0;
+     LONG t;
+ 
+-    if (last_dump && now - last_dump < 55000000000ull) return;
+-    last_dump = now;
++    if (syscall_log_last_dump && now - syscall_log_last_dump < 55000000000ull) return;
++    syscall_log_last_dump = now;
+     gettimeofday( &tv, NULL );
+     fprintf( file, "%lld.%03d stuck-dump: thread %04x in %s for over 60 s; every thread's NT call:\n",
+              (long long)tv.tv_sec, (int)(tv.tv_usec / 1000),
+-- 
+2.49.0

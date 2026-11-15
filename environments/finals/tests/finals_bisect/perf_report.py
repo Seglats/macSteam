@@ -24,6 +24,7 @@ STEAM_COMPAT = Path.home() / 'Library/Application Support/Steam/steamapps/compat
 PAIR = re.compile(r'([A-Za-z_][\w:.-]*)=(-?[\d.]+)')
 THREAD = re.compile(r'(\S+)#([0-9a-f]{4})=([\d.]+)\+([\d.]+)')
 HEAD = re.compile(r'^(\d+\.\d+) calls=(\d+) time_ms=([\d.]+) bsd=(\d+) mach=(\d+)')
+TCALL = re.compile(r'(\S+)#[0-9a-f]{4}>(\S+):(\d+):([\d.]+)')
 LONG = re.compile(r'^(\d+\.\d+) long (\S+) ms=([\d.]+) tid=(\w+)')
 VM = re.compile(r'n=(\d+) hold=([\d.]+) max=([\d.]+)@(\S+) wait=([\d.]+) max=([\d.]+)@(\S+)')
 FIXED = {'faults', 'pageins', 'csw'}
@@ -42,7 +43,7 @@ def parse(path):
             continue
         parts = [p.strip() for p in raw.split(' | ')]
         s = dict(t=float(hit[1]), calls=int(hit[2]), time_ms=float(hit[3]), bsd=int(hit[4]),
-                 mach=int(hit[5]), counts={}, ms={}, events={}, diag={}, vm=None, threads={}, run=0)
+                 mach=int(hit[5]), counts={}, ms={}, events={}, diag={}, vm=None, threads={}, run=0, tcalls=[])
         for part in parts[1:]:
             if part.startswith('ms:'):
                 s['ms'] = {k: float(v) for k, v in PAIR.findall(part)}
@@ -59,6 +60,9 @@ def parse(path):
                     s['threads'][name] = (u + float(user), k + float(system))
             elif part.startswith('rare:'):
                 pass
+            elif part.startswith('tcalls:'):
+                # macfinals-108 or later: the busiest threads' own top calls
+                s['tcalls'] = [(t, c, int(n), float(ms)) for t, c, n, ms in TCALL.findall(part)]
             elif not s['counts']:
                 s['counts'] = {k: int(float(v)) for k, v in PAIR.findall(part)}
         samples.append(s)
@@ -138,6 +142,23 @@ def report(path, bucket):
          f"{'user':>7} {'system':>7} {'sys share':>9}  name",
          [f'{u / span / 10:6.1f}% {k / span / 10:6.1f}% {k / max(u + k, 0.1) * 100:8.1f}%  {name}'
           for name, (u, k, _) in ordered])
+
+    # Which NT calls each busy thread makes itself (only intervals where it was among the 4
+    # busiest; workers with the same name are added together).
+    per = collections.defaultdict(lambda: [collections.Counter(), collections.Counter()])
+    for s in samples:
+        for thread, call, n, ms in s['tcalls']:
+            per[thread][0][call] += n
+            per[thread][1][call] += ms
+    if per:
+        print('\nNT calls each busy thread makes itself (per second of the span; lower bound)')
+        for name, _ in ordered[:6]:
+            if name not in per:
+                continue
+            n, ms = per[name]
+            print(f'  {name}:')
+            for call, c in n.most_common(6):
+                print(f'    {c / span:10,.0f}/s  {ms[call] / span:7.1f} ms/s  {ms[call] * 1e6 / c:8.0f} ns/call  {call}')
 
     if any(s['threads'] for s in samples):
         with_game = [s for s in samples if 'GameThread' in s['threads']]

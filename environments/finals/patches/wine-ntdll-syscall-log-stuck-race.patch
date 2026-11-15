@@ -1,0 +1,39 @@
+From: MacFinals
+Subject: ntdll: a call started after the scan's clock reads as a torn duration
+
+The 2026-11-15 game run (macfinals-125) produced a false dump headline
+("thread 03cc in NtSetEvent for over 60 s" - the thread was actually in
+NtDelayExecution, 0.0 s; the game does ~1700 NtSetEvent/s) and 18446744073.7 s
+body lines again. The scan and the dump read the clock once and then walk the
+slots; a thread that enters a call in between has cur_start > now, the unsigned
+subtraction wraps to ~2^64, and the result passes both the 60 s stuck filter and
+the dur >= 0 print guard.
+
+Treat cur_start > now as "just started": skip the slot in the scan, and fall back
+to the no-duration body line in the dump.
+
+--- a/dlls/ntdll/unix/loader.c
++++ b/dlls/ntdll/unix/loader.c
+@@ -1079,7 +1079,10 @@
+         int is_wait, known = 0;
+ 
+         if (!tc->wtid || !key || !tc->cur_start) continue;
+-        if (now - tc->cur_start < SYSCALL_LOG_STUCK_NS) continue;
++        /* cur_start > now: the thread entered this call after this scan read its clock;
++         * the unsigned subtraction would wrap to ~2^64 and pass the 60 s filter (a false
++         * "in NtSetEvent" headline seen in the 2026-11-15 game run) */
++        if (tc->cur_start > now || now - tc->cur_start < SYSCALL_LOG_STUCK_NS) continue;
+         /* the name is the return value: syscall_log_name only fills the buffer for
+          * unnamed calls */
+         what = syscall_log_name( (key - 1) >> 12, (key - 1) & 0xfff, name, sizeof(name) );
+@@ -1171,7 +1174,7 @@
+                 if (i == nlive) fprintf( file, "  %04x exited\n", tc->wtid );
+                 continue;
+             }
+-            dur = tc->cur_start ? (now - tc->cur_start) / 1e9 : -1;
++            dur = (tc->cur_start && tc->cur_start <= now) ? (now - tc->cur_start) / 1e9 : -1;
+             if (dur >= 0)
+                 fprintf( file, "  %04x (#%llx) in %s for %.1f s args=%lx,%lx,%lx,%lx\n",
+                          tc->wtid, (unsigned long long)tc->tid, what, dur,
+-- 
+2.49.0

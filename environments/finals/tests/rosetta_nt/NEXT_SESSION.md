@@ -1,6 +1,137 @@
-# MacFinals: where we are (2026-11-09, end of session)
+# MacFinals: where we are (2026-11-15, end of session)
 
 Start here after a context reset. Details live in the linked files.
+
+- **Goals after this, in order** (performance, then keyboard and controllers):
+  `environments/finals/NEXT_GOALS.md`.
+- **Crashes and hangs:** `environments/finals/crashes/README.md` lists every known one (origin,
+  status, reproducer), with a fix file per confirmed cause. Add new ones there.
+
+## Next session: finish the crash and hang fixes in progress
+
+State at the end of 2026-11-15: runtime **`macfinals-129`** is installed in the Steam tool
+(backups `-127`, `-125`, `-119`, `-117`, …; `-127` was the previous installed one). Nothing
+is committed. Reproducer suite (`teardown_check.py`, every mode) is at 0 failures on `-129`
+(and `-127`, `-125`, `-121`, `-117`, `-119`). In game, quitting and
+leaving a round are slow, and quitting sometimes never finishes: C05, C16 and the new
+[C17](../../crashes/C17-slow-leave-and-quit-messagecall-ebadf.md).
+
+Do in this order:
+
+1. **Make the lock-owner dump trustworthy** — *done and verified 2026-11-15 on `macfinals-125`
+   (installed):* `patches/wine-ntdll-syscall-log-stuck-scan.patch`,
+   `patches/wine-win32u-sendmessage-stuck-log.patch`,
+   `patches/wine-ntdll-syscall-log-stuck-name.patch` and
+   `patches/wine-ntdll-syscall-log-stuck-once.patch` (+ its `…-tagfix` build fix; all appended
+   to `WINE_PATCHES`) amend the `-119` stuck-dump:
+   - The trigger is the log thread scanning for any thread whose *current* NT call has run
+     ≥ 60 s — not the old "returned `STATUS_TIMEOUT` after ≥ 59 s", which fired on ordinary
+     60 s timed waits (three false dumps in the 18:02 run, C17).
+   - Each stuck *condition* (thread + call) dumps once; when it ends it is forgotten, so the
+     same thread sticking again dumps again. A thread parked in `NtTerminateThread` never
+     triggers (exited threads print as one `0274 exited` line in the body; a wtid taken over
+     by a live thread is not printed twice). The headline prefers a call that is not a plain
+     `NtWaitFor*`/`NtDelay*`, so a stuck `NtUserMessageCall` out-ranks idle pools and sleeps.
+   - Names come from `syscall_log_name`'s **return value** (its buffer only fills for unnamed
+     calls; the first build printed the untouched buffer — `in ?`, garbage bytes).
+   - `wait_message_reply` takes the send info: after 5 s one
+     `ERR "no reply after %u ms: still waiting for tid %04x (window %p, msg %x (%s))"`, then
+     INFINITE as before.
+   - Verified under `-125` (`/tmp/probe125`): stuck-send probe shows the ERR line at 10 s,
+     dump 1 headlined the owner's wait at 60 s, dump 2 (exactly one 55 s window later)
+     headlined **the sender** `0024 in NtUserMessageCall args=10078,d,40,…` with the
+     never-pumping owner beside it and a mid-run-exited poller as `0140 exited`; cs-timeout
+     probe headlined the INFINITE-waiting owner, quitters rendered `exited`; durations sane
+     (the 18446744073 s bug is gone); services dumped once per condition, no repeats.
+   - `teardown_check.py` all five modes green on `-125` (0 crashes, 0 abnormal exits, fast
+     path 54–58 ns).
+   - **First game run on `-125` (2026-11-15 16:25, 192 s, `game exited (0)`, zero
+     `no reply` lines):** the freeze did not happen (it is intermittent — one clean session
+     is a data point, not a fix; nothing in these patches changes hang behaviour). The
+     diagnostics worked in game: benign conditions dumped once each (idle
+     `NtUserGetMessage`/pool waits), `exited` and `not in an NT call` lines correct.
+   - **Bug found in the game run, fixed by
+     `patches/wine-ntdll-syscall-log-stuck-race.patch` (`-126`/`-127`):** a thread entering
+     a call between the scan's clock read and its slot read wrapped the duration to ~2^64 —
+     a *false* headline (`03cc in NtSetEvent`, a call the game does ~1,700/s) and
+     `18446744073.7 s` body lines. `cur_start > now` now means "just started": skip.
+   - Probes: `tests/windows_probe/cs_timeout_probe.c` (quitters + CS owner) and
+     `tests/windows_probe/stuck_send_probe.c` (ready-event handshake, 140 s watchdog).
+2. **Tell dead threads from hung ones — done and shipped 2026-11-15 as `macfinals-128`/`-129`
+   (installed):** `patches/wine-ntdll-syscall-log-exited-mark.patch` marks a thread's slot in
+   `pthread_exit_wrapper` (thread.c), the one funnel every death passes through (normal exit,
+   `NtTerminateThread`, a SIGQUIT kill, a fatal `wine client error` abort), so a thread that
+   dies inside a call prints `exited; never returned from <call>` instead of a duration that
+   grows forever, and never triggers a dump. Plus an ERR with all four fd numbers when a
+   reply read fails fatally (`reply read failed: fds reply %d alert %d wait %d,%d request
+   %d`). Why: re-reading the `-119` run against the Wine source showed the old dump could not
+   distinguish these — C17's `043c` read as "in `NtSetInformationThread` for 114 s" but had
+   exited there (the error hit at ~t+95, *mid-play*, 40 s before the quit); and the wineserver
+   provably replies `STATUS_ACCESS_DENIED` to pending sends on any thread death
+   (`kill_thread` → `cleanup_thread` → `destroy_thread_windows`/`free_msg_queue` →
+   `cleanup_results`), so C17's stuck `WM_GETTEXT` owner is alive and never pumping. Verified
+   under `-129` (`/tmp/probe129`): the stuck-send probe's sleeper, killed mid-wait at 65 s
+   (the `043c` shape), prints `0144 exited; never returned from NtWaitForSingleObject` in the
+   115 s dump and is never a trigger or headline; the normally-returned poller prints plain
+   `exited`. `teardown_check.py` all five modes green on `-129` (0 crashes, 0 abnormal exits,
+   54–58 ns). **Crab Champions canary skipped this round:** Rasmus's real Steam session was
+   running and the canary route launches a second (wine) Steam under the same account, which
+   would sign it out; this change touches no graphics or syscall-path code. Run it when
+   Steam is free if wanted (`RUNTIME=… APP=774801 tests/finals_bisect/launch_main.sh avx
+   msync`).
+3. **`tests/finals_bisect/ab_launches.py` fixes — written 2026-11-15, quick check next Steam
+   session:** the launch closes at the next `=== run` (helper) block, so the helper's
+   `hook=` line (`nt_off=-`) no longer overwrites the game launch's `nt_off`; launches without
+   a `game exited` line end at the last counter stamp of their own perf folder; the last
+   launch gets `wineserver crashed?` when the Wine log ends with wineserver's death line;
+   inner dump loop variable renamed.
+4. **C17: the stuck `SendMessage` and the lost wineserver connection.**
+   - Thread `0274` sent `WM_GETTEXT` (msg `0xd`) to window `0x20096` and waited 69 s+ after the
+     quit. Earlier in the same run that call took 2.1 s, 0.3 s and 1.1 s, so the window's owner
+     answers slowly even in play. Find the owner (the dump from step 1) and why it stops pumping
+     messages.
+   - Thread `043c`: `wine client error:43c: read: Bad file descriptor`, then 114 s+ in
+     `NtSetInformationThread(0x698, 3, …)`. Its wineserver socket was closed under it. Find who
+     closes that fd (a double `close` in Wine's unix code, or fd reuse), and why the thread didn't
+     die (Wine's `abort_thread` after a protocol error).
+5. **A/B in game, with the fixed dump:** fast path on (`STEAMDRIVER_PERF=1 %command%`) against
+   `MACFINALS_NT_OFF=syscall,reloc STEAMDRIVER_PERF=1 %command%`. Quit from inside a match, and
+   leave a round, each run. Wait at least 70 s at any freeze. Then
+   `python3 tests/finals_bisect/ab_launches.py --since "<date> <time>"`. Optionally the same on
+   `macfinals-112` to see whether the quit hangs are older than this week's work.
+6. **Open entries to update from that data:** C04 (GameThread spin after loading in), C05 (quit
+   hang), C16 (load hang with loader and winmm locks), C17. **C07** (nested-exception noise): the
+   quit-handler fix is in `-119`; confirm at game quits and write `crashes/fixes/C07-fix.md`. A
+   second variant with a garbage (non-NULL) frame address was seen once (C05) and isn't covered.
+
+## Newest (2026-11-14): the start-up Rosetta crash reproduced without the game
+
+- **Cause: a signal that lands while a thread is in the hook's syscall stub** (`ntfix_macfast`,
+  native ARM code on our own page). Rosetta finds no x86 location for that pc and aborts
+  (`rosetta error: no code fragment associated with the given arm pc`).
+- In the game it comes when a process is torn down at start-up: wineserver sends SIGQUIT to all of
+  its threads (the "nested exception ... 0xa8" lines). The H.264/AAC decoders load at that moment
+  in every launch, but they are not the cause.
+- Reproducer: `tests/finals_bisect/teardown_check.py` (`tests/windows_probe/teardown_probe.c`),
+  no Steam and no game, about a minute. On `macfinals-112`:
+
+  | Run | Rounds that crashed |
+  |---|---|
+  | Hook, exit while 16 threads are in syscalls | 20 / 20 |
+  | Same, `MACFINALS_NT_OFF=syscall` (stub still entered, bails at once) | 0 / 20 (1 Rosetta error) |
+  | No hook | 0 / 20 |
+  | Hook, suspensions only (`--mode suspendonly`, SIGUSR1), clean exit | 10 / 10 |
+
+- So suspension hits it too: crash reporters, the anti-cheat and Wine itself suspend threads, so
+  this can also crash the game later on, not only at start-up.
+- **Fixed in `macfinals-114`** (installed; `-113` and `-112` kept beside it): the payload code
+  runs inside libRosettaRuntime, where Rosetta defers signals; the fast path resumes through
+  Rosetta's own `runtime_exitljmp`, which delivers them; and syscall sites in the macOS shared
+  cache are no longer diverted. `-113` had all but the last step, and THE FINALS hung on quit once
+  (a SIGUSR1 lost for good); `teardown_check.py --mode waitexit` reproduces that and passes on
+  `-114`. Every reproducer mode is 0 failures, and the fast path costs 61 ns per call. Details:
+  `R25_SIGNAL_IN_STUB.md`. Not yet run in game.
+- Separate gap, not the crash: no H.264/AAC decoding. Moved to `../../NEXT_GOALS.md` ("Later").
 
 ## Newest (2026-11-13): microstutter, and Game Mode for every Wine program
 
@@ -284,45 +415,13 @@ stubs), `recvtos_probe.c` (TOS control message; Proton gives `IP_TOS 0x88`),
 `suspend_probe.c` (suspend/context of new threads), `qpc_probe.c` (QPC cost, RDTSC),
 `avx_state_probe.c` (YMM state through exceptions and thread contexts; needs AVX advertised).
 
-## Open problems
+## Open problems and next steps (2026-11-02, superseded)
 
-1. **Low FPS (CPU-bound).** `R17_PERFORMANCE.md`. First measurement (no MSync, so partly
-   unrepresentative): game thread 68% of a core, half in the kernel; 154k
-   NtQueryPerformanceCounter syscalls/s, but at 36 ns each that is under 1% (measured);
-   Rosetta's exception-server thread 22% of a core while Wine sees only ~280 faults/s, so most
-   exceptions are handled inside Rosetta. The NT hook forces `DISABLE_AOT=1` (cost unmeasured).
-2. **Main-menu buttons sometimes do not open menus.** Cause unknown. Only anomaly found: a
-   thread killed with "nested exception on signal stack" at `usr1_handler`'s first read of its
-   signal context (`ntdll.so+0x3b67c`), 3 of 12 runs, also before this session's changes.
-   `macfinals-31` logs details when it happens (`wine-nested-exception-diag.patch`).
-3. **Crash spawning into the tutorial with AVX** (every AVX run, never without): null read at
-   0x8. Cause found: Wine on macOS did not carry YMM state in signal contexts, so continuing
-   from an exception did not restore it. Fixed in `macfinals-33` (`R18_AVX_CONTEXT.md`); confirm
-   in game.
-4. Steam's crash reporter once hung while suspending the game's threads (dbghelp). Its trigger
-   is gone with the TOS fix; the hang itself is unexplained.
-5. First launch in a prefix shows Denuvo's "issue with starting" dialog; the second goes in.
-
-## Next steps, in order
-
-1. Done 2026-11-02: QPC costs 36 ns on MacFinals (37 with the hook), RDTSC usable. Not the
-   FPS problem; the user-mode QPC patch is dropped (`R17_PERFORMANCE.md`).
-2. Performance run with the app's settings (`PERF=1 … avx msync`) to get representative numbers.
-3. **`HOOK=0` does not work: the anti-cheat quits with "disallowed tool"** (2026-11-02, `macfinals-33`,
-   light logging, no heap channels). The NT fix is still required, so `DISABLE_AOT=1` stays.
-   Gameplay with the hook (`macfinals-33`, avx+msync): GameThread 309 ms user + 423 ms kernel per
-   second, Rosetta's exception server 71 + 294 ms, 426k Mach calls/s, Wine sees ~34 faults/s.
-   (`DISABLE_AOT` hardly matters for game code: Rosetta translates Windows PE code at run time
-   either way.) Crab Champions (`APP=774801`, ~20 s each): **no exception-server load with or
-   without the hook**, so the storm is specific to THE FINALS' process; the hook still costs
-   ~30-40% on Crab's spin loop (yield calls 758k/s with, 1,058k/s without). Next: per-second
-   counters in the hook (words handled, time spent) to measure its cost inside THE FINALS.
-   **Main cost found (2026-11-02):** GameThread issues ~32,000 direct `syscall` instructions a
-   second with rax=0xffffffff (+~1,500 real ones), ~16 us each under Rosetta (Proton 2 us),
-   ~0.5 s/s. Wine already answers like Windows. Only lever left: Rosetta's `syscall`
-   translation, outside the hook scope; waiting on Rasmus's decision. Details `R17_PERFORMANCE.md`.
-   Smaller, Wine-fixable: ~35k failed fixed-address maps/s in `try_map_free_area` on workers.
-4. Build an app bundle from the newest runtime once these settle; recheck Crab Champions.
+The performance items that stood here (low FPS, the syscall cost, `HOOK=0`, the app bundle) are in
+`../../NEXT_GOALS.md`. The crash items are in `../../crashes/`: main-menu buttons (C14), the
+crash reporter hang (C11), the first-launch Denuvo dialog (`NEXT_GOALS.md`, "Later"). Still to
+confirm in game: the AVX crash spawning into the tutorial (null read at 0x8; Wine didn't carry YMM
+state in signal contexts on macOS), fixed in `macfinals-33` (`R18_AVX_CONTEXT.md`).
 
 ## Boundaries that applied this session
 

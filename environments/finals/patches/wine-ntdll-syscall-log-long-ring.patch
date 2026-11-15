@@ -1,0 +1,59 @@
+--- a/dlls/ntdll/unix/loader.c
++++ b/dlls/ntdll/unix/loader.c
+@@ -1004,6 +1004,32 @@
+     return found;
+ }
+ #endif
++
++/* Long calls are noted in memory by the thread that made them and written by the log thread
++ * (2026-11-13): a thread stopped while it held the log file's lock (suspended, or in a signal)
++ * otherwise blocks every other thread that writes, and the game with them. */
++#define SYSCALL_LOG_LONG_RING 64
++static char syscall_log_long_ring[SYSCALL_LOG_LONG_RING][320];
++static LONG syscall_log_long_ready[SYSCALL_LOG_LONG_RING];
++static LONG syscall_log_long_head;
++
++static void syscall_log_long_drain( FILE *file )
++{
++    static LONG tail;
++    LONG head = __atomic_load_n( &syscall_log_long_head, __ATOMIC_ACQUIRE );
++
++    if (head - tail > SYSCALL_LOG_LONG_RING)
++    {
++        fprintf( file, "# %d long-call lines lost\n", (int)(head - tail - SYSCALL_LOG_LONG_RING) );
++        tail = head - SYSCALL_LOG_LONG_RING;
++    }
++    for (; tail != head; tail++)
++    {
++        unsigned int slot = (ULONG)tail % SYSCALL_LOG_LONG_RING;
++        if (__atomic_load_n( &syscall_log_long_ready[slot], __ATOMIC_ACQUIRE ) != tail + 1) break;  /* still being written */
++        fputs( syscall_log_long_ring[slot], file );
++    }
++}
+ 
+ static void *syscall_log_thread( void *arg )
+ {
+@@ -1032,6 +1058,7 @@
+ #endif
+ 
+         usleep( 100000 );
++        syscall_log_long_drain( syscall_log_file );
+         for (idx = 0; idx < SYSCALL_LOG_TABLES; idx++)
+             for (num = 0; num < 4096; num++)
+             {
+@@ -1239,8 +1266,13 @@
+               (unsigned int)HandleToULong( NtCurrentTeb()->ClientId.UniqueThread ), (unsigned long)retval,
+               (unsigned long)args[0], (unsigned long)args[1], (unsigned long)args[2],
+               (unsigned long)args[3], (unsigned long)args[4], (unsigned long)args[5] );
+-    fputs( line, syscall_log_file );
+-    fflush( syscall_log_file );
++    {
++        LONG n = __atomic_fetch_add( &syscall_log_long_head, 1, __ATOMIC_ACQ_REL );
++        unsigned int slot = (ULONG)n % SYSCALL_LOG_LONG_RING;
++
++        memcpy( syscall_log_long_ring[slot], line, sizeof(line) );
++        __atomic_store_n( &syscall_log_long_ready[slot], n + 1, __ATOMIC_RELEASE );
++    }
+ }
+ 
+ /* whether WINE_SYSCALL_LOG is set; starts the writer the first time */

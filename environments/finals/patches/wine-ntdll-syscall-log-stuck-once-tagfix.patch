@@ -1,0 +1,24 @@
+From: MacFinals
+Subject: ntdll: fix the stuck-once patch's build
+
+wine-ntdll-syscall-log-stuck-once.patch does not compile: reported[] and stuck[] use
+two anonymous struct declarations, and in C those are distinct types, so the
+assignment between them is an error. Give them one tag.
+
+--- a/dlls/ntdll/unix/loader.c
++++ b/dlls/ntdll/unix/loader.c
+@@ -1057,9 +1057,10 @@
+  * not a plain wait or sleep. */
+ static void syscall_log_stuck_check( void )
+ {
+-    static struct { UINT32 wtid; UINT16 key; } reported[SYSCALL_LOG_TSLOTS];
++    struct stuck_cond { UINT32 wtid; UINT16 key; };  /* one tag: the two arrays assign */
++    static struct stuck_cond reported[SYSCALL_LOG_TSLOTS];
+     static int reported_count;
+-    struct { UINT32 wtid; UINT16 key; } stuck[SYSCALL_LOG_TSLOTS];
++    struct stuck_cond stuck[SYSCALL_LOG_TSLOTS];
+     LONG used = min( __atomic_load_n( &syscall_log_tc_used, __ATOMIC_ACQUIRE ), SYSCALL_LOG_TSLOTS );
+     UINT64 now = syscall_log_now_ns();
+     char headline_name[36];
+-- 
+2.49.0

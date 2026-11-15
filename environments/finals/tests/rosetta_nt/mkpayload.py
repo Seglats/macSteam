@@ -58,6 +58,33 @@ if data[0][2] > 0x4000:
     raise SystemExit("__DATA grew beyond one 16K unit — extend the mapper first")
 span = data[0][1] + data[0][2] - text[0][1]  # whole image span
 
+# r25: the code range (only real instructions get rebased when hooklib moves the code
+# into libRosettaRuntime) and the end of the last __TEXT section (how much to copy)
+sects = []
+cur = None
+for line in out:
+    m = re.match(r"\s*sectname (\S+)", line)
+    if m:
+        cur = [m.group(1), None, None, None]
+        sects.append(cur)
+        continue
+    if cur is not None:
+        m = re.match(r"\s*segname (\S+)", line)
+        if m and cur[1] is None:
+            cur[1] = m.group(1)
+        m = re.match(r"\s*addr (0x[0-9a-f]+)", line)
+        if m:
+            cur[2] = int(m.group(1), 16)
+        m = re.match(r"\s*size (0x[0-9a-f]+)", line)
+        if m and cur[3] is None:
+            cur[3] = int(m.group(1), 16)
+code = [s for s in sects if s[0] == "__text" and s[1] == "__TEXT"]
+if len(code) != 1:
+    raise SystemExit("expected exactly one __TEXT,__text")
+code_start, code_end = code[0][2], code[0][2] + code[0][3]
+text_used = max(s[2] + s[3] for s in sects if s[1] == "__TEXT")
+text_used = (text_used + 0xfff) & ~0xfff
+
 syms = {}
 for line in subprocess.check_output(["nm", "-n", DYLIB], text=True).splitlines():
     cols = line.split()
@@ -80,6 +107,9 @@ with open(OUT, "w") as f:
         off = syms[name]
         f.write(f"#define P_{name.upper()}_OFF {off}u\n")
         f.write(f"#define P_{name.upper()}_W0 0x{words[off // 4]:08x}u\n")
+    f.write(f"#define P_CODE_START {code_start}u\n")
+    f.write(f"#define P_CODE_END {code_end}u\n")
+    f.write(f"#define P_TEXT_USED {text_used}u\n")
     f.write(f"#define PAYLOAD_TEXT_WORDS {len(words)}u\n")
     f.write("static const uint32_t payload_text[PAYLOAD_TEXT_WORDS] = {\n")
     for i in range(0, len(words), 8):

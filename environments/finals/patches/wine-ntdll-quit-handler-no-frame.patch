@@ -1,0 +1,19 @@
+--- a/dlls/ntdll/unix/signal_x86_64.c
++++ b/dlls/ntdll/unix/signal_x86_64.c
+@@ -2844,7 +2844,15 @@
+ {
+     ucontext_t *ucontext = init_handler( sigcontext );
+ 
+-    if (!is_inside_syscall( RSP_sig(ucontext) )) user_mode_abort_thread( 0, get_syscall_frame() );
++    /* A thread without a syscall frame (one Wine didn't start, e.g. a macOS framework's
++     * worker) has no user-mode state to unwind: user_mode_abort_thread would load
++     * frame->syscall_cfa from NULL on the signal stack ("nested exception ... 0xa8") and
++     * the thread would die through that fault. End it directly instead. */
++    if (!is_inside_syscall( RSP_sig(ucontext) ))
++    {
++        struct syscall_frame *frame = get_syscall_frame();
++        if (frame) user_mode_abort_thread( 0, frame );
++    }
+     abort_thread( 0 );
+ }
+ 

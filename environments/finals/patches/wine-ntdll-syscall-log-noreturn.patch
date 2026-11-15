@@ -1,0 +1,38 @@
+--- a/dlls/ntdll/unix/loader.c
++++ b/dlls/ntdll/unix/loader.c
+@@ -1261,7 +1261,23 @@
+     wine_diag_enabled = enabled;
+     return enabled;
+ }
++
++static BOOL syscall_log_noreturn( UINT idx, UINT num )
++{
++    static unsigned char known[SYSCALL_LOG_TABLES][4096];  /* 0 unknown, 1 returns, 2 does not */
++    unsigned char k;
+ 
++    if (idx >= SYSCALL_LOG_TABLES) return FALSE;
++    if (!(k = __atomic_load_n( &known[idx][num], __ATOMIC_RELAXED )))
++    {
++        const char *name = syscall_names[idx] ? syscall_names[idx][num] : NULL;
++        k = name && (!strcmp( name, "NtCallbackReturn" ) || !strcmp( name, "NtContinue" ) ||
++                     !strcmp( name, "NtContinueEx" ) || !strcmp( name, "NtRaiseException" )) ? 2 : 1;
++        __atomic_store_n( &known[idx][num], k, __ATOMIC_RELAXED );
++    }
++    return k == 2;
++}
++
+ void trace_syscall( UINT id, ULONG_PTR *args, ULONG len )
+ {
+     UINT idx = (id >> 12) & 3, num = id & 0xfff;
+@@ -1316,7 +1332,10 @@
+             for (i = 0; i < SYSCALL_LOG_ARGS; i++) syscall_log_args[syscall_log_depth][i] = i < count ? args[i] : 0;
+             syscall_log_start[syscall_log_depth] = syscall_log_now_ns();
+         }
+-        syscall_log_depth++;
++        /* Calls that never return the normal way (a callback's NtCallbackReturn, NtContinue)
++         * must not add a level, or a thread that pumps messages climbs past the depth limit
++         * and stops being counted and timed. */
++        if (!syscall_log_noreturn( idx, num )) syscall_log_depth++;
+         if (!TRACE_ON(syscall)) return;
+     }
+ 

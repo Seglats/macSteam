@@ -42,6 +42,33 @@ $F/tests/rosetta_nt/build_hook.sh
 python3 $F/scripts/add_nt_hook.py --workspace $W --base-version macfinals-N --version macfinals-N+1
 ```
 
+## Test every change
+
+**Standard (set 2026-11-15): test a change the moment it exists.** A bug found minutes after
+it is written costs minutes; the same bug found in a game session days later costs an evening
+of bisecting runtimes. Every Wine patch, hook change or runtime bump climbs this ladder before
+the next game session, and each rung catches what the previous one can't:
+
+1. **`git apply --check` the patch** against `$W/sources/wine/sources/wine` before building.
+   Hand-written or hand-fixed hunks fail here in a second, not 40 minutes into a build.
+2. **Run the probe that covers what changed** under the new runtime
+   ([`tests/windows_probe/`](tests/windows_probe/): `macfinals_probe`, `handle_probe`, and the
+   crash-specific ones like `cs_timeout_probe` and `stuck_send_probe`). Probes run in seconds,
+   with no Steam and no game, and are where crash diagnostics get proven before trusting them
+   in a session.
+3. **`python3 tests/finals_bisect/teardown_check.py` in every mode** (~a minute, no Steam, no
+   game). This is the C01–C03/C15 reproducer suite; it would have caught C08 (every launch
+   dying with "could not load ntdll.so") before `-104` shipped.
+4. **Crab Champions** (the DX12 canary) before THE FINALS — the runtime is proven sound without
+   the anti-cheat in the loop.
+5. **The game with `STEAMDRIVER_PERF=1`, then `tests/finals_bisect/ab_launches.py`** to confirm
+   which runtime and `nt_off` each launch actually ran. A "nothing changed" result has been an
+   old runtime still live more often than a real finding.
+
+When a new bug shows up at any rung, lock it in immediately: a probe or a `teardown_check`
+mode that reproduces it (that is how C01–C03 and C15 went from mysteries to fixed), and a row
+in [`crashes/README.md`](crashes/README.md).
+
 ## Differences from main
 
 - Its own `ntdll` fixes (image-key flag, exec-region registration for GPTK, AVX signal

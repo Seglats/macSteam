@@ -1,0 +1,181 @@
+From: MacFinals
+Subject: WINE_SYSCALL_LOG: stuck-dump by scanning, not by STATUS_TIMEOUT
+
+The stuck-dump's trigger was any NT call returning STATUS_TIMEOUT after >= 59 s. That is
+also an ordinary 60 s timed wait: the 2026-11-14 18:02 THE FINALS run dumped three times
+with no lock timeout anywhere (crashes/C17). Now the log thread scans the thread table
+itself and dumps when any thread's current NT call has been running for >= 60 s -- a stuck
+SendMessage, a wait with no timeout, a thread that won't finish dying. This is the same
+thing the old false triggers accidentally showed, minus the false positives.
+
+Also, from the same run: threads that already exited printed "in NtTerminateThread"
+(~150 lines) because a slot keeps the call it died in; they now print as one short
+"exited" line, and not at all when a live thread has taken over the Windows thread id.
+Torn cur_start/last_ret reads printed 18446744073 s; the writer now stores last_ret
+before last_key (release) and the printer guards against zero.
+
+---
+ dlls/ntdll/unix/loader.c | 103 ++++++++++++++++++++++++++++++++++++++++--------
+ 1 file changed, 84 insertions(+), 19 deletions(-)
+
+diff --git a/dlls/ntdll/unix/loader.c b/dlls/ntdll/unix/loader.c
+index 1111111..2222222 100644
+--- a/dlls/ntdll/unix/loader.c
++++ b/dlls/ntdll/unix/loader.c
+@@ -1044,40 +1044,104 @@ static void syscall_log_long_drain( FILE *file )
+ /* When a lock wait times out (an NT call returning STATUS_TIMEOUT after >= 59 s: the 60 s
+  * retry in RtlpWaitForCriticalSection), say what every thread is in, so the lock's owner can
+  * be found by its Windows thread id. */
++#define SYSCALL_LOG_STUCK_NS 60000000000ull
++static UINT32 syscall_log_dump_wtid;
++static char syscall_log_dump_name[36];
++
++/* Any thread whose current NT call has been running for >= 60 s: a stuck SendMessage, a wait
++ * with no timeout, a thread that won't finish dying. Run by the log thread, so no thread-side
++ * trigger is needed (the old one, STATUS_TIMEOUT after >= 59 s, fired on ordinary 60 s timed
++ * waits; crashes/C17). */
++static void syscall_log_stuck_check( void )
++{
++    LONG used = min( __atomic_load_n( &syscall_log_tc_used, __ATOMIC_ACQUIRE ), SYSCALL_LOG_TSLOTS );
++    UINT64 now = syscall_log_now_ns();
++    LONG t;
++
++    for (t = 0; t < used; t++)
++    {
++        struct syscall_log_tcalls *tc = &syscall_log_tc[t];
++        UINT16 key = __atomic_load_n( &tc->cur_key, __ATOMIC_ACQUIRE );
++
++        if (!tc->wtid || !key || !tc->cur_start) continue;
++        if (now - tc->cur_start < SYSCALL_LOG_STUCK_NS) continue;
++        syscall_log_name( (key - 1) >> 12, (key - 1) & 0xfff,
++                          syscall_log_dump_name, sizeof(syscall_log_dump_name) );
++        syscall_log_dump_wtid = tc->wtid;
++        __atomic_store_n( &syscall_log_dump_wanted, 1, __ATOMIC_RELEASE );
++        break;
++    }
++}
++
++/* Say what every thread is in, so a lock owner (the "blocked by" thread id) or the thread a
++ * stuck SendMessage waits for can be looked up by Windows thread id. Threads whose current
++ * call is NtTerminateThread are gone: their slots keep that call forever, so they print as
++ * one short "exited" line, and not at all when a live thread has taken over the id. */
+ static void syscall_log_stuck_dump( FILE *file )
+ {
+     static UINT64 last_dump;
++    static UINT32 live[SYSCALL_LOG_TSLOTS];
+     UINT64 now = syscall_log_now_ns();
+     LONG used = min( __atomic_load_n( &syscall_log_tc_used, __ATOMIC_ACQUIRE ), SYSCALL_LOG_TSLOTS );
+     char name[32];
+     struct timeval tv;
++    int i, nlive = 0;
+     LONG t;
+
+     if (last_dump && now - last_dump < 55000000000ull) return;
+     last_dump = now;
+     gettimeofday( &tv, NULL );
+-    fprintf( file, "%lld.%03d stuck-dump: a lock wait timed out; every thread's NT call:\n",
+-             (long long)tv.tv_sec, (int)(tv.tv_usec / 1000) );
++    fprintf( file, "%lld.%03d stuck-dump: thread %04x in %s for over 60 s; every thread's NT call:\n",
++             (long long)tv.tv_sec, (int)(tv.tv_usec / 1000),
++             syscall_log_dump_wtid, syscall_log_dump_name[0] ? syscall_log_dump_name : "?" );
+     for (t = 0; t < used; t++)
+     {
+         struct syscall_log_tcalls *tc = &syscall_log_tc[t];
+         UINT16 key = __atomic_load_n( &tc->cur_key, __ATOMIC_ACQUIRE );
+
+-        if (!tc->wtid) continue;
+-        if (key)
+-            fprintf( file, "  %04x (#%llx) in %s for %.1f s args=%lx,%lx,%lx,%lx\n",
+-                     tc->wtid, (unsigned long long)tc->tid,
+-                     syscall_log_name( (key - 1) >> 12, (key - 1) & 0xfff, name, sizeof(name) ),
+-                     (now - tc->cur_start) / 1e9, (unsigned long)tc->cur_args[0],
+-                     (unsigned long)tc->cur_args[1], (unsigned long)tc->cur_args[2],
+-                     (unsigned long)tc->cur_args[3] );
+-        else if (tc->last_key)
+-            fprintf( file, "  %04x (#%llx) not in an NT call; last %s returned %.1f s ago\n",
+-                     tc->wtid, (unsigned long long)tc->tid,
+-                     syscall_log_name( (tc->last_key - 1) >> 12, (tc->last_key - 1) & 0xfff, name, sizeof(name) ),
+-                     (now - tc->last_ret) / 1e9 );
++        if (!tc->wtid || !key) continue;
++        syscall_log_name( (key - 1) >> 12, (key - 1) & 0xfff, name, sizeof(name) );
++        if (strcmp( name, "NtTerminateThread" )) live[nlive++] = tc->wtid;
+     }
++    for (t = 0; t < used; t++)
++    {
++        struct syscall_log_tcalls *tc = &syscall_log_tc[t];
++        UINT16 key = __atomic_load_n( &tc->cur_key, __ATOMIC_ACQUIRE );
++        double dur;
++
++        if (!tc->wtid) continue;
++        if (key)
++        {
++            syscall_log_name( (key - 1) >> 12, (key - 1) & 0xfff, name, sizeof(name) );
++            if (!strcmp( name, "NtTerminateThread" ))
++            {
++                for (i = 0; i < nlive; i++) if (live[i] == tc->wtid) break;
++                if (i == nlive) fprintf( file, "  %04x exited\n", tc->wtid );
++                continue;
++            }
++            dur = tc->cur_start ? (now - tc->cur_start) / 1e9 : -1;
++            if (dur >= 0)
++                fprintf( file, "  %04x (#%llx) in %s for %.1f s args=%lx,%lx,%lx,%lx\n",
++                         tc->wtid, (unsigned long long)tc->tid, name, dur,
++                         (unsigned long)tc->cur_args[0], (unsigned long)tc->cur_args[1],
++                         (unsigned long)tc->cur_args[2], (unsigned long)tc->cur_args[3] );
++            else
++                fprintf( file, "  %04x (#%llx) in %s\n",
++                         tc->wtid, (unsigned long long)tc->tid, name );
++        }
++        else if (tc->last_key)
++        {
++            syscall_log_name( (tc->last_key - 1) >> 12, (tc->last_key - 1) & 0xfff, name, sizeof(name) );
++            dur = tc->last_ret ? (now - tc->last_ret) / 1e9 : -1;
++            if (dur >= 0 && dur < 1e7)
++                fprintf( file, "  %04x (#%llx) not in an NT call; last %s returned %.1f s ago\n",
++                         tc->wtid, (unsigned long long)tc->tid, name, dur );
++            else
++                fprintf( file, "  %04x (#%llx) not in an NT call; last %s returned moments ago\n",
++                         tc->wtid, (unsigned long long)tc->tid, name );
++        }
++    }
+     fflush( file );
+ }
+
+ static void *syscall_log_thread( void *arg )
+@@ -1107,9 +1171,10 @@ static void *syscall_log_thread( void *arg )
+ #endif
+
+         usleep( 100000 );
+         syscall_log_long_drain( syscall_log_file );
++        syscall_log_stuck_check();
+         if (__atomic_exchange_n( &syscall_log_dump_wanted, 0, __ATOMIC_ACQ_REL ))
+             syscall_log_stuck_dump( syscall_log_file );
+         for (idx = 0; idx < SYSCALL_LOG_TABLES; idx++)
+             for (num = 0; num < 4096; num++)
+             {
+@@ -1459,18 +1524,18 @@ void trace_sysret( UINT id, ULONG_PTR retval )
+             {
+                 int at = syscall_log_my_slot[syscall_log_depth];
+                 __atomic_store_n( &syscall_log_my->time[at], syscall_log_my->time[at] + elapsed, __ATOMIC_RELAXED );
+             }
+             if (elapsed > SYSCALL_LOG_LONG_NS)
+                 syscall_log_long( idx, num, elapsed, syscall_log_args[syscall_log_depth], retval );
+-            if (retval == STATUS_TIMEOUT && elapsed >= 59000000000ull)
+-                __atomic_store_n( &syscall_log_dump_wanted, 1, __ATOMIC_RELEASE );
+             if (syscall_log_my && syscall_log_my != (void *)1)
+             {
+                 UINT d = syscall_log_depth;
+-                syscall_log_my->last_key = syscall_log_my_key[d];
+-                syscall_log_my->last_ret = syscall_log_now_ns();
++                /* last_ret first, the release store on last_key last, so the dump never
++                 * pairs last_key with a zero last_ret (18446744073 s lines). */
++                syscall_log_my->last_ret = syscall_log_now_ns();
++                __atomic_store_n( &syscall_log_my->last_key, syscall_log_my_key[d], __ATOMIC_RELEASE );
+                 if (d)  /* back in the outer call (a callback returned) */
+                 {
+                     syscall_log_my->cur_start = syscall_log_start[d - 1];
+                     __atomic_store_n( &syscall_log_my->cur_key, syscall_log_my_key[d - 1], __ATOMIC_RELEASE );
+                 }
+--
+2.49.0
+

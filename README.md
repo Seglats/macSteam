@@ -25,7 +25,7 @@ in macOS Steam, through NotProton's own extension points. It replaces nothing of
   - fullscreen and display fixes.
 - **MacVolvo renderer**: MacVolvo's DXMT (Direct3D 11 to Metal), or Apple's D3DMetal from your own
   Game Porting Toolkit.
-- **Game profiles** that tune DXMT for particular games.
+- **Profiles**: Global DX11, Global DX12 and per-game profiles with renderer settings and key combo overrides ([docs/PROFILES.md](docs/PROFILES.md)).
 
 Details: [docs/NOTPROTON.md](docs/NOTPROTON.md).
 
@@ -41,7 +41,9 @@ app installs into macOS Steam and you select per game.
 | [`main`](environments/main/) | Counter-Strike 2, Deadlock, everything else | DXMT (Direct3D 11) |
 | [`finals`](environments/finals/) | **THE FINALS** | Apple D3DMetal (Direct3D 12) |
 
-**THE FINALS** runs through the compatibility tool "SteamDriver: THE FINALS". The tool runs
+**SteamDriver**, the compatibility tool, is the finals environment's Wine, offered for every game
+since 2026-11-24 (it was "SteamDriver: THE FINALS"; CS2 and Deadlock may not work on it yet, and
+"SteamDriver on CrossOver", the options on NotProton's CrossOver above, stays for them). It runs
 CrossOver 26.3 Wine built from source with these additions:
 - an in-process fix for Rosetta's slow handling of the game's direct system calls (~32,000 a
   second);
@@ -62,15 +64,26 @@ build bundles them.
 | Mac | Apple Silicon (M1 or newer) |
 | macOS | macOS Tahoe 26.5 or later |
 | Also | the macOS Steam app, [NotProton](https://github.com/NotProtonNot/NotProton) (install it and open it once), Rosetta |
-| For THE FINALS | Apple's [Game Porting Toolkit](https://developer.apple.com/games/game-porting-toolkit/) to build the environment (Apple doesn't allow it to be redistributed), about 90 GB for the game |
+| For THE FINALS and D3DMetal | your own copy of Apple's [Game Porting Toolkit 4](https://developer.apple.com/games/game-porting-toolkit/) (macSteam includes no D3DMetal), about 90 GB for THE FINALS |
 
 1. Build the app (below) and open it.
 2. **For every game:** choose **Add to Steam**. Then, in a game's Properties › Compatibility, keep
    NotProton's CrossOver, choose the MacVolvo driver and renderer under Developer, and turn on
    MacVolvo mouse.
-3. **For THE FINALS:** under **Game runtimes**, choose **Add to Steam** and let the app restart
-   Steam. In THE FINALS › Properties › Compatibility, turn on "Force the use of a specific Steam
-   Play compatibility tool" and choose **SteamDriver: THE FINALS**. Options go in the launch
+3. **Apple's Game Porting Toolkit** (for SteamDriver, and D3DMetal in NotProton games):
+   1. Download Game Porting Toolkit 4 from
+      [Apple](https://developer.apple.com/games/game-porting-toolkit/) (free Apple developer
+      account).
+   2. Open the Game Porting Toolkit, then open **Evaluation environment for Windows games** in it
+      (macOS shows Apple's license first).
+   3. In macSteam, under **Renderers**, choose **Show Folder** and copy the image's **redist**
+      folder into it (`~/Library/Application Support/SteamDriver/GPTK`).
+
+   macSteam checks the files (every module there, D3DMetal 4, Apple's signature) and shows a ✓
+   when they're ready. A file that isn't Apple's is never used.
+4. **SteamDriver:** choose **Add to Steam** (at the top, or under **Game runtimes**) and let the app
+   restart Steam. In a game's Properties › Compatibility, turn on "Force the use of a specific Steam
+   Play compatibility tool" and choose **SteamDriver**. Options go in the launch
    options, for example `STEAMDRIVER_MOUSE=hid %command%` for the High-precision mouse.
 
 Advanced › MacVolvo's own Steam still offers the original setup, for troubleshooting: Windows
@@ -127,7 +140,8 @@ SteamDriver builds on:
 
 THE FINALS' route uses NotProton's Steam bridge (GPL-3.0; Valve's lsteamclient and steam-helper
 from Proton) unchanged, from your NotProton install. Apple's D3DMetal comes from your own Game
-Porting Toolkit and is never redistributed.
+Porting Toolkit (`SteamDriver/GPTK`); the THE FINALS runtime only links to it
+(`environments/finals/scripts/unbundle_gptk.py`), and macSteam ships no D3DMetal (the main DXMT runtime from Recall still carries Apple's `libd3dshared.dylib`).
 
 This route was prompted by seeing
 [zzoko's compatibility setup run THE FINALS](https://www.youtube.com/watch?v=_2PVUeov3_A).

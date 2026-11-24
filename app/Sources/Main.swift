@@ -3,8 +3,15 @@ import SwiftUI
 import Darwin
 
 @MainActor final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
-    let model=AppModel()
+    let model:AppModel
     var window:NSWindow!
+    override init() {
+        // Before AppModel reads any setting or folder: what the app kept under its old name
+        // (MacVolvo) moves to macSteam's places once (Migration.swift).
+        Migration.run()
+        model=AppModel()
+        super.init()
+    }
     var lockFD:Int32 = -1
     func applicationDidFinishLaunching(_ notification:Notification) {
         // NSWorkspace normally routes repeat opens to this process. The file lock
@@ -20,9 +27,12 @@ import Darwin
         // after a privacy change) arrive as this event. AppKit drops it while a sheet is open,
         // so AppModel.quit handles it: it closes the sheet first.
         NSAppleEventManager.shared().setEventHandler(self,andSelector:#selector(quitEvent(_:withReplyEvent:)),forEventClass:AEEventClass(kCoreEventClass),andEventID:AEEventID(kAEQuitApplication))
-        window=NSWindow(contentRect:NSRect(x:0,y:0,width:600,height:800),styleMask:[.titled,.closable,.miniaturizable,.resizable],backing:.buffered,defer:false)
+        // Always dark, whatever the system theme (LauncherStyle: the blue Steam-like ground).
+        NSApp.appearance=NSAppearance(named:.darkAqua)
+        window=NSWindow(contentRect:NSRect(x:0,y:0,width:600,height:800),styleMask:[.titled,.closable,.miniaturizable,.resizable,.fullSizeContentView],backing:.buffered,defer:false)
         window.title=Brand.name;window.isReleasedWhenClosed=false
-        window.titlebarAppearsTransparent=true;window.minSize=NSSize(width:540,height:620)
+        // No title bar of its own: the content (and its blue ground) runs up under the window buttons.
+        window.titlebarAppearsTransparent=true;window.titleVisibility = .hidden;window.minSize=NSSize(width:540,height:620)
         window.contentView=NSHostingView(rootView:RootView(model:model));window.center();window.makeKeyAndOrderFront(nil)
         NSApp.mainMenu=menu();NSApp.activate(ignoringOtherApps:true)
     }
@@ -71,13 +81,13 @@ import Darwin
         if item.action == #selector(checkForUpdates) && !Brand.allowsUpdates { return false }
         // Still on the disk image: only moving to Applications, Help and About.
         if model.screen == .moveApp,let action=item.action,[#selector(launch),#selector(forceQuit),#selector(settings),#selector(checkForUpdates),#selector(uninstall)].contains(action) { return false }
-        // Opening or quitting MacVolvo's own Steam only in that troubleshooting mode.
+        // Opening or quitting macSteam's own Steam only in that troubleshooting mode.
         if item.action == #selector(launch) || item.action == #selector(forceQuit) { return model.windowsSteam && model.clientInstalled && !model.busy }
         if item.action == #selector(settings) && !model.windowsSteam { return false }
         if item.action == #selector(settings) || item.action == #selector(checkForUpdates) { return model.uninstall != .working }
         return true
     }
-    // Right-clicking the Dock icon in MacVolvo's own Steam: open it, or close a frozen game.
+    // Right-clicking the Dock icon in macSteam's own Steam: open it, or close a frozen game.
     func applicationDockMenu(_ sender:NSApplication)->NSMenu? {
         guard model.windowsSteam else { return nil }
         let menu=NSMenu()
@@ -131,7 +141,7 @@ import Darwin
     }
 }
 
-/// The window's content: MacVolvo for NotProton, or, for troubleshooting, MacVolvo's own Windows
+/// The window's content: macSteam for NotProton, or, for troubleshooting, macSteam's own Windows
 /// Steam (AppModel.windowsSteam). Moving to Applications comes first in either.
 struct RootView:View {
     @Bindable var model:AppModel

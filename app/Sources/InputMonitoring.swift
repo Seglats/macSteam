@@ -22,6 +22,9 @@ enum InputMonitoring {
     /// Shows macOS's prompt the first time; the player then turns the app on in System Settings.
     static func ask() { _ = IOHIDRequestAccess(kIOHIDRequestTypeListenEvent) }
     static let privacySettings=URL(string:"x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent")!
+    /// Device Control and Data Access (Accessibility before macOS 27): NotProton asks for it for
+    /// Steam, and it lets Steam, so a game Steam started, read the mouse directly too.
+    static let deviceControlSettings=URL(string:"x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!
     /// Whether a mouse High-precision would read is connected, by the window driver's rule
     /// (cocoa_app.m hid_is_trackpad): a HID device with a mouse collection that is neither built
     /// in nor named a trackpad. It reads the I/O Registry, which needs no permission. From Recall.

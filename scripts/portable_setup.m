@@ -25,13 +25,13 @@
 #pragma clang diagnostic pop
 
 #ifdef MACVOLVO_GPTK4
-#define MV_DATA_FOLDER @"MacVolvo GPTK4"
+#define MV_DATA_FOLDER @"SteamDriver GPTK4 Steam"  // app/Sources/Brand.swift dataFolderName; MacVolvo GPTK4 until 2026-11-24
 #define MV_OWNER_MARKER @".macvolvo-gptk4-owner"
 #define MV_OTHER_OWNER_MARKER @".macvolvo-owner"
 #define MV_OWNER_TEXT "macvolvo-gptk4-v01\n"
 #define MV_GAME_ID_PREFIX @"app.macvolvo.gptk4.game."
 #else
-#define MV_DATA_FOLDER @"MacVolvo"
+#define MV_DATA_FOLDER @"SteamDriver Steam"  // app/Sources/Brand.swift dataFolderName; MacVolvo until 2026-11-24
 #define MV_OWNER_MARKER @".macvolvo-owner"
 #define MV_OTHER_OWNER_MARKER @".macvolvo-gptk4-owner"
 #define MV_OWNER_TEXT "macvolvo-native-v01\n"

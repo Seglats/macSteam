@@ -1,0 +1,278 @@
+From: MacFinals
+Subject: [PATCH] winemac.drv: window/focus state + main-thread rendezvous diagnostics (C06)
+
+The 2026-11-21 capture (crashes/C06) wedged the GameThread in NtUserPeekMessage behind a
+Background Worker stuck in NtUserDestroyWindow - win32u's user lock held across the mac
+driver's synchronous Cocoa-main-thread rendezvous - with no way to see the focus state or the
+rendezvous. This adds, following the macdrv channel and its macdrv_err_on pattern:
+
+- macdrv_ui_on = TRACE_ON(macdrv): the new logging is OFF BY DEFAULT and enabled with
+  WINEDEBUG=+macdrv (via a LogTrace twin of LogError). Always-on ERR lines fire only at
+  pathological waits (OnMainThread/query > 10 s).
+- Window/focus state (slot 0): applicationDidBecomeActive/ResignActive and
+  windowDidBecomeKey/ResignKey track app active/inactive and the key window, each with ages;
+  every transition updates the diag note and traces when enabled.
+- OnMainThread (slot 1) and query: (slot 2) record the waiting tid and wait kind, cleared on
+  return; the wait duration traces when enabled and ERRs above 10 s.
+- OnMainThreadAsync blocks (slot 3) report which tid the main thread is executing a block
+  for, so a wedged rendezvous shows both sides.
+
+At the next wedge the stuck dump prints all of it: the focus state at the time, who was
+waiting for the main thread, and what the main thread was executing.
+---
+--- a/dlls/winemac.drv/cocoa_app.h
++++ b/dlls/winemac.drv/cocoa_app.h
+@@ -23,6 +23,9 @@
+ #include "macdrv_cocoa.h"
+ 
+ #define ERR(...) do { if (macdrv_err_on) LogError(__func__, __VA_ARGS__); } while (false)
++/* C06: off-by-default focus/rendezvous tracing (WINEDEBUG=+macdrv); ERR stays always-on */
++#define UI_LOG(...) do { if (macdrv_ui_on) LogTrace(__func__, __VA_ARGS__); } while (false)
++void LogTrace(const char* func, NSString* format, ...);
+ 
+ 
+ enum {
+--- a/dlls/winemac.drv/cocoa_app.m
++++ b/dlls/winemac.drv/cocoa_app.m
+@@ -1029,8 +1029,62 @@
+ static NSString* const WineExternalQuitNotificationWinePrefixKey = @"WinePrefix";
+ 
+ bool macdrv_err_on;
++bool macdrv_ui_on;
++
++/* C06: window/focus state for the stuck dump's "ui note 0" (via wine_diag_note).
++ * Updated on every transition; transitions also trace with WINEDEBUG=+macdrv. */
++static int      ui_app_active = -1;   /* -1 unknown, 0 inactive, 1 active */
++static uint64_t ui_app_since;
++static void*    ui_key_window;
++static uint64_t ui_key_since;
++
++uint64_t macdrv_ui_now_ns(void)
++{
++    return clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
++}
+ 
++static void ui_note_update(const char *why)
++{
++    char buf[160];
++    uint64_t now = macdrv_ui_now_ns();
++    int n;
+ 
++    n = snprintf(buf, sizeof(buf), "app %s",
++                 ui_app_active == 1 ? "active" : ui_app_active == 0 ? "inactive" : "unknown");
++    if (ui_app_active >= 0)
++        n += snprintf(buf + n, sizeof(buf) - n, " %.1f s", (now - ui_app_since) / 1e9);
++    n += snprintf(buf + n, sizeof(buf) - n, "; key win %p", ui_key_window);
++    if (ui_key_window)
++        snprintf(buf + n, sizeof(buf) - n, " %.1f s", (now - ui_key_since) / 1e9);
++    wine_diag_note(0, buf);
++    UI_LOG(@"%s -> %s", why, buf);
++}
++
++void macdrv_ui_note_app_active(int active)
++{
++    if (ui_app_active == active) return;
++    ui_app_active = active;
++    ui_app_since = macdrv_ui_now_ns();
++    ui_note_update(active ? "app became active" : "app resigned active");
++}
++
++void macdrv_ui_note_key_window(void *window)
++{
++    if (window)
++    {
++        if (ui_key_window == window) return;
++        ui_key_window = window;
++        ui_key_since = macdrv_ui_now_ns();
++        ui_note_update("window became key");
++    }
++    else if (ui_key_window)
++    {
++        ui_key_window = NULL;
++        ui_note_update("window resigned key");
++    }
++}
++
++
+ #if !defined(MAC_OS_VERSION_14_0) || MAC_OS_X_VERSION_MAX_ALLOWED < MAC_OS_VERSION_14_0
+ @interface NSApplication (CooperativeActivationSelectorsForOldSDKs)
+ 
+@@ -4695,6 +4749,7 @@
+      */
+     - (void)applicationDidBecomeActive:(NSNotification *)notification
+     {
++        macdrv_ui_note_app_active(1);
+         NSNumber* displayID;
+         NSDictionary* modesToRealize = [latentDisplayModes autorelease];
+ 
+@@ -4776,6 +4831,7 @@
+ 
+     - (void)applicationDidResignActive:(NSNotification *)notification
+     {
++        macdrv_ui_note_app_active(0);
+         macdrv_event* event;
+         WineEventQueue* queue;
+ 
+@@ -4971,12 +5027,20 @@
+ void OnMainThreadAsync(dispatch_block_t block)
+ {
+     WineApplicationController* controller = [WineApplicationController sharedController];
++    unsigned int block_wtid = syscall_log_current_wtid();
++    dispatch_block_t wrapped = ^{
++        char note[96];
+ 
+-    block = [block copy];
++        snprintf(note, sizeof(note), "main thread: executing block for tid %04x", block_wtid);
++        wine_diag_note(3, note);
++        block();
++        wine_diag_note(3, "");
++    };
++    wrapped = [wrapped copy];
+     dispatch_sync(controller->requestsManipQueue, ^{
+-        [controller->requests addObject:block];
++        [controller->requests addObject:wrapped];
+     });
+-    [block release];
++    [wrapped release];
+     CFRunLoopSourceSignal(controller->requestSource);
+     CFRunLoopWakeUp(CFRunLoopGetMain());
+ }
+@@ -4991,6 +5055,23 @@
+     va_list args;
+     va_start(args, format);
+     LogErrorv(func, format, args);
++    va_end(args);
++}
++
++/***********************************************************************
++ *              LogTrace
++ */
++void LogTrace(const char* func, NSString* format, ...)
++{
++    va_list args;
++
++    va_start(args, format);
++    @autoreleasepool
++    {
++        NSString* message = [[NSString alloc] initWithFormat:format arguments:args];
++        fprintf(stderr, "trace:%s:%s", func, [message UTF8String]);
++        [message release];
++    }
+     va_end(args);
+ }
+ 
+--- a/dlls/winemac.drv/cocoa_event.m
++++ b/dlls/winemac.drv/cocoa_event.m
+@@ -430,11 +430,27 @@
+         event->query_event.query = macdrv_retain_query(query);
+         query->done = FALSE;
+ 
+-        [self postEvent:event];
+-        macdrv_release_event(event);
+-        timedout = ![[WineApplicationController sharedController] waitUntilQueryDone:&query->done
+-                                                                             timeout:timeoutDate
+-                                                                       processEvents:(flags & WineQueryProcessEvents) != 0];
++        {
++            char qnote[96];
++            uint64_t qwait = queue_lock_now_ns();
++
++            snprintf(qnote, sizeof(qnote), "tid %04x waiting for main thread (query type %d)",
++                     syscall_log_current_wtid(), query->type);
++            wine_diag_note(2, qnote);
++            [self postEvent:event];
++            macdrv_release_event(event);
++            timedout = ![[WineApplicationController sharedController] waitUntilQueryDone:&query->done
++                                                                                 timeout:timeoutDate
++                                                                           processEvents:(flags & WineQueryProcessEvents) != 0];
++            wine_diag_note(2, "");
++            qwait = queue_lock_now_ns() - qwait;
++            if (qwait > 10000000000ull)
++                ERR(@"query type %d: tid %04x waited %.1f s for the Cocoa main thread\n",
++                    query->type, syscall_log_current_wtid(), qwait / 1e9);
++            else if (macdrv_ui_on)
++                LogTrace("query", @"type %d: tid %04x waited %.1f ms for the Cocoa main thread",
++                         query->type, syscall_log_current_wtid(), qwait / 1e6);
++        }
+         return !timedout && query->status;
+     }
+ 
+@@ -599,7 +615,13 @@
+     dispatch_semaphore_t semaphore = NULL;
+     __block BOOL finished;
+     unsigned long long start = macdrv_stat_clock();
++    char note[96];
++    uint64_t wait_start = queue_lock_now_ns();
+ 
++    snprintf(note, sizeof(note), "tid %04x waiting for main thread (OnMainThread)",
++             syscall_log_current_wtid());
++    wine_diag_note(1, note);
++
+     if (!queue)
+     {
+         semaphore = dispatch_semaphore_create(0);
+@@ -645,6 +667,18 @@
+         dispatch_release(semaphore);
+     }
+ 
++    wine_diag_note(1, "");
++    {
++        uint64_t wait_ns = queue_lock_now_ns() - wait_start;
++
++        if (wait_ns > 10000000000ull)
++            ERR(@"OnMainThread: tid %04x waited %.1f s for the Cocoa main thread\n",
++                syscall_log_current_wtid(), wait_ns / 1e9);
++        else if (macdrv_ui_on)
++            LogTrace("OnMainThread", @"tid %04x waited %.1f ms for the Cocoa main thread",
++                     syscall_log_current_wtid(), wait_ns / 1e6);
++    }
++
+     if (start)
+     {
+         unsigned long long wait = macdrv_stat_clock() - start;
+--- a/dlls/winemac.drv/cocoa_window.m
++++ b/dlls/winemac.drv/cocoa_window.m
+@@ -3442,6 +3442,7 @@
+ 
+     - (void)windowDidBecomeKey:(NSNotification *)notification
+     {
++        macdrv_ui_note_key_window(self);
+         WineApplicationController* controller = [WineApplicationController sharedController];
+         NSEvent* event = [controller lastFlagsChanged];
+         if (event)
+@@ -3582,6 +3583,7 @@
+     {
+         macdrv_event* event;
+ 
++        macdrv_ui_note_key_window(NULL);
+         if (causing_becomeKeyWindow) return;
+         if ([[WineApplicationController sharedController] temporarilyIgnoreResignEventsForDialog]) return;
+ 
+--- a/dlls/winemac.drv/macdrv_main.c
++++ b/dlls/winemac.drv/macdrv_main.c
+@@ -507,6 +507,7 @@
+     load_strings(params->strings);
+ 
+     macdrv_err_on = ERR_ON(macdrv);
++    macdrv_ui_on = TRACE_ON(macdrv);
+     if (macdrv_start_cocoa_app(NtGetTickCount()))
+     {
+         ERR("Failed to start Cocoa app main loop\n");
+--- a/dlls/winemac.drv/macdrv_cocoa.h
++++ b/dlls/winemac.drv/macdrv_cocoa.h
+@@ -130,6 +130,16 @@
+ 
+ /* main */
+ extern bool macdrv_err_on;
++/* C06: focus/rendezvous tracing, off by default - on with WINEDEBUG=+macdrv */
++extern bool macdrv_ui_on;
++/* C06: cross-module diagnostic notes, consumed by the syscall-log stuck dump (ntdll);
++ * slots: 0 window/focus state, 1 OnMainThread wait, 2 query wait, 3 main thread's block */
++extern void wine_diag_note(int slot, const char *text);
++extern unsigned int syscall_log_current_wtid(void);
++/* C06: window/focus state tracking (implemented in cocoa_app.m) */
++extern void macdrv_ui_note_app_active(int active);
++extern void macdrv_ui_note_key_window(void *window);
++extern uint64_t macdrv_ui_now_ns(void);
+ extern int topmost_float_inactive;
+ extern bool capture_displays_for_fullscreen;
+ /* CrossOver Hack 10912: Mac Edit menu */

@@ -47,7 +47,7 @@ struct LaunchResolutionPicker:View {
             }
         } label: {
             Text("\(resolution.label) · \(resolution.aspect)").monospacedDigit()
-        }.menuStyle(.borderedButton).controlSize(.small).disabled(disabled)
+        }.menuStyle(.borderedButton).hoverGrow().controlSize(.small).disabled(disabled)
             .accessibilityLabel("\(gameName) launch resolution, \(resolution.label), \(resolution.aspect)")
             .sheet(isPresented:$showCustom) {
                 VStack(alignment:.leading,spacing:16) {
@@ -65,10 +65,10 @@ struct LaunchResolutionPicker:View {
                     }
                     HStack {
                         Spacer()
-                        Button("Cancel") { showCustom=false }.keyboardShortcut(.cancelAction)
+                        Button("Cancel") { showCustom=false }.hoverGrow().keyboardShortcut(.cancelAction)
                         Button("Save") {
                             if let custom { choose(custom);showCustom=false }
-                        }.keyboardShortcut(.defaultAction).disabled(custom == nil || disabled)
+                        }.hoverGrow().keyboardShortcut(.defaultAction).disabled(custom == nil || disabled)
                     }
                 }.padding(24).frame(width:420).font(LauncherStyle.font(14))
             }
@@ -101,10 +101,10 @@ struct SettingsSheet:View {
                 // everyday settings; it opens its own confirmation.
                 Button(role:.destructive) { model.sheet = .uninstall } label: {
                     Label("Uninstall \(Brand.name)…",systemImage:"trash").font(LauncherStyle.font(13,.medium))
-                }.buttonStyle(.borderless).foregroundStyle(.red).disabled(model.uninstall == .working)
-                    .help("Move \(Brand.name), Steam and your games to the Trash")
+                }.buttonStyle(.borderless).hoverGrow().foregroundStyle(.red).disabled(model.uninstall == .working)
+                    .help("Remove \(Brand.name) and everything it set up; your Steam app and games stay")
                 Spacer()
-                Button("Done") { dismiss() }.buttonStyle(.bordered).buttonBorderShape(.capsule).controlSize(.large).keyboardShortcut(.cancelAction)
+                Button("Done") { dismiss() }.buttonStyle(.bordered).hoverGrow().buttonBorderShape(.capsule).controlSize(.large).keyboardShortcut(.cancelAction)
             }
         }.font(LauncherStyle.font(14)).padding(.horizontal,32).padding(.vertical,28).frame(width:540)
             .tint(.primary).background { LauncherBackground() }
@@ -149,7 +149,7 @@ struct SettingsSheet:View {
                                 shape.fill(LauncherStyle.surface(scheme)).overlay { shape.strokeBorder(.primary.opacity(0.05),lineWidth:1) }
                             }
                         }.contentShape(shape)
-                }.buttonStyle(.plain).accessibilityLabel(tab.title).accessibilityAddTraits(selected ? .isSelected : [])
+                }.buttonStyle(.plain).hoverGrow().accessibilityLabel(tab.title).accessibilityAddTraits(selected ? .isSelected : [])
             }
         }
     }
@@ -183,10 +183,10 @@ struct SettingsSheet:View {
                     }
                     Spacer(minLength:12)
                     if case .available=model.update {
-                        Button("Update…") { model.sheet = .update }.buttonStyle(.borderedProminent).buttonBorderShape(.capsule).tint(LauncherStyle.accent)
+                        Button("Update…") { model.sheet = .update }.buttonStyle(.borderedProminent).hoverGrow().buttonBorderShape(.capsule).tint(LauncherStyle.accent)
                             .foregroundStyle(LauncherStyle.ink)
                     } else {
-                        Button("Check Now") { model.checkForUpdates(manual:true,present:false) }.buttonStyle(.bordered).buttonBorderShape(.capsule)
+                        Button("Check Now") { model.checkForUpdates(manual:true,present:false) }.buttonStyle(.bordered).hoverGrow().buttonBorderShape(.capsule)
                             .disabled(model.update == .checking || model.update == .installing)
                     }
                 }
@@ -258,7 +258,7 @@ struct SettingsSheet:View {
                     if game != AppModel.Game.allCases.last { Divider().padding(.top,4) }
                 }
             }
-            Text(model.running == .game ? "Close your game to change its launch options." : "Changes save as you choose. Start the game through MacVolvo once to apply them to Steam Properties too.")
+            Text(model.running == .game ? "Close your game to change its launch options." : "Changes save as you choose. Start the game through macSteam once to apply them to Steam Properties too.")
                 .font(LauncherStyle.font(12)).foregroundStyle(.secondary).fixedSize(horizontal:false,vertical:true)
             Divider().padding(.vertical,2)
             SettingSwitch(title:"Remember a resolution for each display",detail:"Applies to the default size until you choose a resolution for a game.",
@@ -273,7 +273,7 @@ struct SettingsSheet:View {
                 Text("Main display · \(main.size) · \(main.aspect)").font(LauncherStyle.font(12)).foregroundStyle(.secondary).monospacedDigit()
             }
             Spacer(minLength:8)
-            Button("Displays…",action:Self.openDisplaySettings).buttonStyle(.bordered).buttonBorderShape(.capsule).help("Open System Settings › Displays")
+            Button("Displays…",action:Self.openDisplaySettings).buttonStyle(.bordered).hoverGrow().buttonBorderShape(.capsule).help("Open System Settings › Displays")
         }.padding(12).background(.primary.opacity(0.04),in:RoundedRectangle(cornerRadius:14,style:.continuous))
             .accessibilityElement(children:.combine)
     }
@@ -304,7 +304,7 @@ struct SettingsSheet:View {
                 .font(LauncherStyle.font(12,.medium)).fixedSize(horizontal:false,vertical:true)
             Spacer(minLength:8)
             if running == .client {
-                Button("Close Steam",action:model.closeSteam).buttonStyle(.bordered).buttonBorderShape(.capsule).disabled(model.busy)
+                Button("Close Steam",action:model.closeSteam).buttonStyle(.bordered).hoverGrow().buttonBorderShape(.capsule).disabled(model.busy)
             }
         }.padding(.top,6)
     }
@@ -324,7 +324,7 @@ struct SettingsSheet:View {
                     Button(microphoneAccess == .allowed ? "Turn Off…" : microphoneAccess == .denied ? "Turn On…" : "Allow…") {
                         guard microphoneAccess == .undecided else { NSWorkspace.shared.open(Microphone.privacySettings);return }
                         Task { await Microphone.ask();microphoneAccess=Microphone.access }
-                    }.buttonStyle(.bordered).buttonBorderShape(.capsule)
+                    }.buttonStyle(.bordered).hoverGrow().buttonBorderShape(.capsule)
                         .help(microphoneAccess == .undecided ? "Shows macOS’s microphone prompt" : "Opens Privacy & Security › Microphone in System Settings")
                 }
                 Divider().padding(.vertical,6)
@@ -370,11 +370,11 @@ struct SettingsSheet:View {
                 Text(detail).font(LauncherStyle.font(12)).foregroundStyle(.secondary).fixedSize(horizontal:false,vertical:true)
             }
             Spacer(minLength:12)
-            Button(button,action:perform).buttonStyle(.bordered).buttonBorderShape(.capsule)
+            Button(button,action:perform).buttonStyle(.bordered).hoverGrow().buttonBorderShape(.capsule)
                 .disabled(model.busy || !model.clientInstalled)
         }
     }
-    /// Rarely needed: a network that hands out its proxy automatically (MacVolvo connects
+    /// Rarely needed: a network that hands out its proxy automatically (macSteam connects
     /// directly, Recall issue #15). Steam and the games carry it from when they start.
     private var advanced:some View {
         let locked=model.running != nil || !model.canChangeAdvanced
@@ -428,7 +428,7 @@ struct HelpSheet:View {
         ("Why does the game stutter?","First-use shader compilation can cause stutters. Persistent CS2 combat spikes and severe FPS drops are still under investigation; repeated stutters are not necessarily shader compilation."),
         ("How do I play on an external monitor?","Games open on your main display, the one with the menu bar. In System Settings › Displays, select the monitor and set Use as to Main display. Choose each game’s resolution in Settings › Display, then start it through \(Brand.name) to sync Steam Properties. Sizes that exceed the main display are fitted for that launch."),
         ("Which resolution should I choose?","Your display’s own resolution gives the sharpest picture; a smaller one runs faster and is scaled up to fill the screen. Change it in the game’s Video settings, or in Settings › Display, which shows what each size looks like on your main display."),
-        ("Black screen with music on launch","Quit the game completely, then launch it again. This intermittent issue can occur from MacVolvo or Steam and is still being investigated."),
+        ("Black screen with music on launch","Quit the game completely, then launch it again. This intermittent issue can occur from macSteam or Steam and is still being investigated."),
         ("The game opens at the wrong size","Quit the game, choose Settings › Display › Reset Display Settings, then play again. The game opens at 1080p; your graphics and FPS settings stay as they are."),
         ("I can’t find the game window","Select the game or Steam in the Dock. If it’s still hidden, check your other desktops."),
         ("Steam shows a blank window","Close Steam, then open it again from \(Brand.name) rather than from the Dock: \(Brand.name) opens it with the display settings its window needs."),
@@ -436,7 +436,7 @@ struct HelpSheet:View {
         ("Steam can’t connect on a work or school network","Some of these networks set up their proxy automatically. Close Steam, turn on Settings › Advanced › Detect network proxy automatically, then open Steam again from \(Brand.name)."),
         ("My team can’t hear me","Open Settings › Audio. If the microphone is off, choose Turn On…, switch on \(Brand.name) in System Settings, then open \(Brand.name) again. Then check the voice settings in the game’s Audio options."),
         ("Which Macs can play?","Macs with Apple silicon on macOS 26.5 or later, with Rosetta. 16 GB of memory is recommended, and a new installation needs about 70 GB per game of storage."),
-        ("How do I uninstall?","Choose Settings › Uninstall \(Brand.name). \(Brand.name), Steam and your games move to the Trash; your Steam account isn’t affected."),
+        ("How do I uninstall?","Choose Uninstall \(Brand.name) at the bottom of the window. It removes \(Brand.name) and everything it set up (its options in Steam, game tools, their prefixes and its own Steam if you used it). Your Steam app, its games, NotProton and your Steam account stay."),
         ("Found a bug?","Choose Report a Problem to open an issue on GitHub, and attach a support report (below): it lists your setup, never account details."),
     ]
     var body:some View {
@@ -463,7 +463,7 @@ struct HelpSheet:View {
                                     Image(systemName:reportExpanded ? "chevron.up" : "chevron.down")
                                         .font(.system(size:12,weight:.semibold)).foregroundStyle(.secondary)
                                 }.padding(20).frame(maxWidth:.infinity).contentShape(Rectangle())
-                            }.buttonStyle(.plain).accessibilityValue(reportExpanded ? "Expanded" : "Collapsed")
+                            }.buttonStyle(.plain).hoverGrow().accessibilityValue(reportExpanded ? "Expanded" : "Collapsed")
                                 .accessibilityHint("Show or hide the report preview")
                             if reportExpanded {
                             VStack(alignment:.leading,spacing:16) {
@@ -472,9 +472,9 @@ struct HelpSheet:View {
                                 Text(model.report).font(LauncherStyle.font(12)).textSelection(.enabled)
                                     .frame(maxWidth:.infinity,alignment:.leading).accessibilityLabel("Support report preview")
                                 HStack {
-                                    Button("Refresh",action:model.makeReport).buttonStyle(.borderless)
+                                    Button("Refresh",action:model.makeReport).buttonStyle(.borderless).hoverGrow()
                                     Spacer()
-                                    Button("Save Report…",action:model.saveReport).buttonStyle(.bordered).buttonBorderShape(.capsule)
+                                    Button("Save Report…",action:model.saveReport).buttonStyle(.bordered).hoverGrow().buttonBorderShape(.capsule)
                                 }
                             }.padding(.horizontal,20).padding(.bottom,20)
                             }
@@ -486,9 +486,9 @@ struct HelpSheet:View {
             HStack {
                 Link(destination:Brand.issues) {
                     Label("Report a Problem",systemImage:"exclamationmark.bubble").font(LauncherStyle.font(13,.medium))
-                }.buttonStyle(.borderless).help("Open a new issue on GitHub in your browser")
+                }.buttonStyle(.borderless).hoverGrow().help("Open a new issue on GitHub in your browser")
                 Spacer()
-                Button("Done") { dismiss() }.buttonStyle(.bordered).buttonBorderShape(.capsule).controlSize(.large).keyboardShortcut(.defaultAction)
+                Button("Done") { dismiss() }.buttonStyle(.bordered).hoverGrow().buttonBorderShape(.capsule).controlSize(.large).keyboardShortcut(.defaultAction)
             }
         }.font(LauncherStyle.font(14)).padding(32).frame(width:540,height:660)
             .tint(.primary).background { LauncherBackground() }
@@ -505,7 +505,7 @@ struct HelpSheet:View {
                     Image(systemName:"chevron.down").font(.system(size:11,weight:.semibold)).foregroundStyle(.secondary)
                         .rotationEffect(.degrees(open ? 180 : 0)).accessibilityHidden(true)
                 }.padding(.horizontal,20).padding(.vertical,14).frame(maxWidth:.infinity,alignment:.leading).contentShape(Rectangle())
-            }.buttonStyle(.plain).accessibilityValue(open ? "Expanded" : "Collapsed")
+            }.buttonStyle(.plain).hoverGrow().accessibilityValue(open ? "Expanded" : "Collapsed")
             if open {
                 Text(questions[index].answer).font(LauncherStyle.font(13)).lineSpacing(3).foregroundStyle(.secondary)
                     .fixedSize(horizontal:false,vertical:true).textSelection(.enabled)
@@ -527,7 +527,7 @@ struct AboutSheet:View {
             HStack(alignment:.center,spacing:18) {
                 AppArtwork(size:76)
                 VStack(alignment:.leading,spacing:4) {
-                    Text(Brand.name).font(LauncherStyle.font(30,.bold)).tracking(-0.8).accessibilityAddTraits(.isHeader)
+                    Wordmark(height:44).frame(width:116,height:34)   // the name, as the main window shows it
                     Text(Brand.tagline).font(LauncherStyle.font(14)).foregroundStyle(.secondary)
                     Text(version).font(LauncherStyle.font(11)).foregroundStyle(.secondary)
                 }
@@ -536,7 +536,7 @@ struct AboutSheet:View {
                 RepositoryLink(compact:true)
                 VStack(alignment:.leading,spacing:3) {
                     Text("Open source. Contributions welcome.").foregroundStyle(.secondary)
-                    Button("Licenses") { licenses=true }.buttonStyle(.plain).underline()
+                    Button("Licenses") { licenses=true }.buttonStyle(.plain).hoverGrow().underline()
                         .foregroundStyle(.secondary).help("Show \(Brand.name)’s license and notices")
                 }.font(LauncherStyle.font(12))
             }
@@ -553,7 +553,7 @@ struct AboutSheet:View {
             HStack(alignment:.bottom,spacing:20) {
                 Text(Brand.trademarks).font(LauncherStyle.font(10.5)).lineSpacing(1).foregroundStyle(.secondary).fixedSize(horizontal:false,vertical:true)
                 Spacer(minLength:0)
-                Button("Done") { dismiss() }.buttonStyle(.bordered).buttonBorderShape(.capsule)
+                Button("Done") { dismiss() }.buttonStyle(.bordered).hoverGrow().buttonBorderShape(.capsule)
                     .controlSize(.large).keyboardShortcut(.defaultAction)
             }
         }.padding(28).frame(width:520,alignment:.top).tint(.primary)
@@ -584,11 +584,11 @@ struct LicensesSheet:View {
             HStack(spacing:16) {
                 if let thirdParty {
                     Button("Third-Party Licenses") { NSWorkspace.shared.activateFileViewerSelecting([thirdParty]) }
-                        .buttonStyle(.bordered).buttonBorderShape(.capsule).controlSize(.large)
+                        .buttonStyle(.bordered).hoverGrow().buttonBorderShape(.capsule).controlSize(.large)
                         .help("Show the bundled third-party license files in Finder")
                 }
                 Spacer()
-                Button("Done") { dismiss() }.buttonStyle(.bordered).buttonBorderShape(.capsule)
+                Button("Done") { dismiss() }.buttonStyle(.bordered).hoverGrow().buttonBorderShape(.capsule)
                     .controlSize(.large).keyboardShortcut(.defaultAction)
             }
         }.font(LauncherStyle.font(14)).padding(32).frame(width:660)
@@ -598,41 +598,58 @@ struct LicensesSheet:View {
 struct UninstallSheet:View {
     @Bindable var model:AppModel
     @Environment(\.dismiss) private var dismiss
+    /// Off: the Wine prefixes the game tools made go too (they hold local game settings).
+    @State private var keepPrefixes=false
     var body:some View {
+        // macSteam's own Steam (troubleshooting) exists only if it was ever set up here; it is the
+        // only Steam, and the only games, Uninstall removes. The Steam app and its games stay.
+        let ownSteam=FileManager.default.fileExists(atPath:model.root.path)
         VStack(spacing:24) {
             switch model.uninstall {
             case .idle, .failed:
-                SheetHero(symbol:"trash",title:"Uninstall \(Brand.name)?",subtitle:"This removes your games, Steam and \(Brand.name) from your Mac.")
+                SheetHero(symbol:"trash",title:"Uninstall \(Brand.name)?",subtitle:"This removes \(Brand.name) and everything it set up on your Mac.")
                 LauncherPanel {
                     VStack(alignment:.leading,spacing:14) {
-                        Text("What will be moved to the Trash").font(LauncherStyle.font(14,.semibold))
+                        Text("What will be removed").font(LauncherStyle.font(14,.semibold))
                         VStack(alignment:.leading,spacing:8) {
-                            row("Games", "Counter-Strike 2, Deadlock and their settings")
-                            row("Steam", "The Steam app set up by this app")
-                            row(Brand.name, "This app and its setup files")
+                            row("Steam options", "\(Brand.name)’s driver, renderer and mouse options in your games’ Compatibility settings, and the runner copies NotProton built with them")
+                            row("SteamDriver tool", "The \u{201C}SteamDriver\u{201D} compatibility tool with its runtime, and its logs in your games’ Steam folders")
+                            row("Game settings", keepPrefixes ? "Kept: the games you played with a game tool keep their local settings" :
+                                "The local settings of each game you played with a game tool (its Windows environment). Online progress and cloud saves aren’t affected")
+                            row("Changed settings", "Deadlock’s renderer goes back to Vulkan where \(Brand.name) switched it to DirectX 11")
+                            if ownSteam {
+                                row("Own Steam", "The Windows Steam \(Brand.name) set up for troubleshooting, with its games and their settings")
+                            }
+                            row(Brand.name, "This app, its settings, key combo overrides and macOS permissions; shortcuts a game took over go back to macOS")
                         }
                         Divider()
-                        Text("Your Steam account and any other copy of Steam on this Mac are not touched. Everything goes to the Trash, so you can put it back from Finder. Storage is freed once you empty the Trash.")
+                        VStack(alignment:.leading,spacing:3) {
+                            Toggle("Keep game settings",isOn:$keepPrefixes).toggleStyle(.checkbox).font(LauncherStyle.font(13))
+                            Text("Recommended if you plan on reinstalling \(Brand.name): your games start with the settings you left them with.")
+                                .font(LauncherStyle.font(12)).foregroundStyle(.secondary).fixedSize(horizontal:false,vertical:true).padding(.leading,20)
+                        }
+                        Text("Your Steam app and the games in it, NotProton and your Steam account stay: \(Brand.name) didn’t install them. Most files go to the Trash, so you can put them back from Finder; storage is freed once you empty it.")
                             .font(LauncherStyle.font(13)).lineSpacing(3).foregroundStyle(.secondary).fixedSize(horizontal:false,vertical:true)
                     }
                 }
                 if case .failed(let message)=model.uninstall { LauncherNotice(text:message) }
-                else { LauncherNotice(text:"Steam is closed for you if it’s open. Your game itself must be quit first. Nothing is removed until you choose Uninstall.") }
+                else { LauncherNotice(text:(ownSteam ? "\(Brand.name)’s own Steam is closed for you if it’s open. " : "")+"Quit any game running through \(Brand.name)’s options first. Nothing is removed until you choose Uninstall.") }
                 HStack(spacing:16) {
-                    Button("Cancel") { model.uninstall = .idle;dismiss() }.buttonStyle(.bordered).buttonBorderShape(.capsule)
+                    Button("Cancel") { model.uninstall = .idle;dismiss() }.buttonStyle(.bordered).hoverGrow().buttonBorderShape(.capsule)
                         .controlSize(.large).keyboardShortcut(.cancelAction)
                     Spacer()
                     // Deliberately not the default action: Return never uninstalls.
-                    Button(role:.destructive) { model.uninstallEverything() } label: { Text("Uninstall").font(LauncherStyle.font(15,.semibold)).padding(.horizontal,8) }
-                        .buttonStyle(.borderedProminent).buttonBorderShape(.capsule).controlSize(.large).tint(.red)
+                    Button(role:.destructive) { model.uninstallEverything(keepPrefixes:keepPrefixes) } label: { Text("Uninstall").font(LauncherStyle.font(15,.semibold)).padding(.horizontal,8) }
+                        .buttonStyle(.borderedProminent).hoverGrow().buttonBorderShape(.capsule).controlSize(.large).tint(.red)
                 }
             case .working:
-                SheetHero(symbol:"trash",title:"Uninstalling",subtitle:model.stage == "Closing Steam" ? "Closing Steam first." : "Moving your games, Steam and this app to the Trash.")
+                SheetHero(symbol:"trash",title:"Uninstalling",subtitle:model.stage == "Closing Steam" ? "Closing \(Brand.name)’s own Steam first." :
+                    ownSteam ? "Removing \(Brand.name), what it set up and its own Steam. Your Steam app and its games stay." : "Removing \(Brand.name) and what it set up. Your Steam app and its games stay.")
                 ProgressView().controlSize(.small).accessibilityLabel("Uninstalling")
             case .done(let appRemoved):
-                SheetHero(symbol:"checkmark",title:"Uninstalled",subtitle:appRemoved ? "Your games, Steam and this app are in the Trash." : "Your games and Steam are in the Trash.")
+                SheetHero(symbol:"checkmark",title:"Uninstalled",subtitle:"\(Brand.name) and what it set up are removed. Your Steam app and its games weren’t touched.")
                 LauncherNotice(text:appRemoved ? "Empty the Trash to free the storage. Quit to finish." : "\(Brand.name) couldn’t move itself to the Trash. Quit, then drag \(Brand.name) from Applications to the Trash and empty it.")
-                Button("Quit") { model.quit() }.buttonStyle(.bordered).buttonBorderShape(.capsule)
+                Button("Quit") { model.quit() }.buttonStyle(.bordered).hoverGrow().buttonBorderShape(.capsule)
                     .controlSize(.large).keyboardShortcut(.defaultAction)
             }
         }.font(LauncherStyle.font(14)).padding(32).frame(width:520)
@@ -673,7 +690,7 @@ struct UpdateSheet:View {
                 Text("Your games, settings and Steam sign-in are kept. The app reopens when it’s done.")
                     .font(LauncherStyle.font(12)).foregroundStyle(.secondary).multilineTextAlignment(.center)
                 HStack(spacing:16) {
-                    Button("Later") { dismiss() }.buttonStyle(.bordered).buttonBorderShape(.capsule).controlSize(.large).keyboardShortcut(.cancelAction)
+                    Button("Later") { dismiss() }.buttonStyle(.bordered).hoverGrow().buttonBorderShape(.capsule).controlSize(.large).keyboardShortcut(.cancelAction)
                     Link("Release Notes",destination:item.page).font(LauncherStyle.font(13))
                     Spacer()
                     LauncherPrimaryAction(title:"Update Now",action:model.installUpdate).keyboardShortcut(.defaultAction).disabled(model.busy)
@@ -681,24 +698,24 @@ struct UpdateSheet:View {
             case .downloading(let fraction):
                 SheetHero(symbol:"arrow.down.circle",title:"Downloading the update",subtitle:"\(Int(fraction*100))% · The app reopens when it’s done.")
                 ProgressView(value:fraction).frame(maxWidth:360).accessibilityLabel("Download progress")
-                Button("Cancel",action:model.cancelUpdateDownload).buttonStyle(.bordered).buttonBorderShape(.capsule).controlSize(.large)
+                Button("Cancel",action:model.cancelUpdateDownload).buttonStyle(.bordered).hoverGrow().buttonBorderShape(.capsule).controlSize(.large)
             case .installing:
                 SheetHero(symbol:"arrow.down.circle",title:"Installing the update",subtitle:"The app will reopen in a moment.")
                 ProgressView().controlSize(.small).accessibilityLabel("Installing")
             case .upToDate:
                 SheetHero(symbol:"checkmark",title:"You’re up to date",subtitle:"\(Brand.name) \(UpdateCheck.installed) is the latest version.")
-                Button("Done") { dismiss() }.buttonStyle(.bordered).buttonBorderShape(.capsule).controlSize(.large).keyboardShortcut(.defaultAction)
+                Button("Done") { dismiss() }.buttonStyle(.bordered).hoverGrow().buttonBorderShape(.capsule).controlSize(.large).keyboardShortcut(.defaultAction)
             case .failed(let message):
                 SheetHero(symbol:"exclamationmark",title:"Couldn’t check for updates",subtitle:message)
                 HStack(spacing:16) {
-                    Button("Done") { dismiss() }.buttonStyle(.bordered).buttonBorderShape(.capsule).controlSize(.large).keyboardShortcut(.cancelAction)
+                    Button("Done") { dismiss() }.buttonStyle(.bordered).hoverGrow().buttonBorderShape(.capsule).controlSize(.large).keyboardShortcut(.cancelAction)
                     Spacer()
                     LauncherPrimaryAction(title:"Try Again") { model.checkForUpdates(manual:true) }.keyboardShortcut(.defaultAction)
                 }
             case .checking, .idle:
                 SheetHero(symbol:"arrow.triangle.2.circlepath",title:"Checking for updates",subtitle:"Asking GitHub for the latest version.")
                 ProgressView().controlSize(.small).accessibilityLabel("Checking for updates")
-                Button("Cancel") { dismiss() }.buttonStyle(.bordered).buttonBorderShape(.capsule).controlSize(.large).keyboardShortcut(.cancelAction)
+                Button("Cancel") { dismiss() }.buttonStyle(.bordered).hoverGrow().buttonBorderShape(.capsule).controlSize(.large).keyboardShortcut(.cancelAction)
             }
         }.font(LauncherStyle.font(14)).padding(32).frame(width:520)
             .tint(.primary).background { LauncherBackground() }
@@ -725,7 +742,7 @@ struct WhatsNewSheet:View {
                 }
             }
             HStack(spacing:16) {
-                Link("Release Notes",destination:Brand.releases).font(LauncherStyle.font(13))
+                Link("Release Notes",destination:Brand.releases).font(LauncherStyle.font(13)).hoverGrow()
                 Spacer()
                 LauncherPrimaryAction(title:"Continue") { dismiss() }.keyboardShortcut(.defaultAction)
             }

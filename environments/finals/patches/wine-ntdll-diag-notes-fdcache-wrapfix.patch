@@ -1,0 +1,75 @@
+From: MacFinals
+Subject: [PATCH] ntdll: cross-module diag notes in the stuck dump + fd-cache holder wrap fix
+
+C06 (crashes/C06): the 2026-11-21 macfinals-133 capture wedged the GameThread in
+NtUserPeekMessage with the winemac queue lock quiet - the block sits in the synchronous
+Cocoa-main-thread rendezvous (OnMainThread / query:) reached from user-lock-holding win32u
+calls (a Background Worker was stuck in NtUserDestroyWindow), and the dumps could say
+nothing about window focus or that rendezvous. Rasmus also asked: log whether the window is
+highlighted/main, off by default.
+
+This adds four cross-module diagnostic note slots (winemac.drv writes via wine_diag_note,
+exported with the CW-24067 visibility mechanism like syscall_log_current_wtid):
+  slot 0 window/focus state, slot 1 OnMainThread wait, slot 2 query wait,
+  slot 3 what the Cocoa main thread is executing.
+The stuck dump prints every set note with its age ("ui note N: ... (noted X s ago)"), so the
+next wedge says what state the window was in and who was waiting for the main thread.
+
+Also fixes the fd-cache holder line's duration wrap seen live on 2026-11-21
+("held by tid 0164 for 18446744073.7 s"): the dump's clock read can predate a just-raced
+acquisition's since timestamp; that case now prints "(just acquired)".
+---
+--- a/dlls/ntdll/unix/loader.c
++++ b/dlls/ntdll/unix/loader.c
+@@ -919,7 +919,25 @@
+     return ts.tv_sec * 1000000000ull + ts.tv_nsec;
+ #endif
+ }
++/* C06: cross-module diagnostic notes - winemac.drv writes, the stuck dump reads.
++ * slot 0: window/focus state, slot 1: OnMainThread wait, slot 2: query wait,
++ * slot 3: what the Cocoa main thread is executing. Empty text clears a slot. */
++static struct { char text[160]; UINT64 ts; } wine_diag_notes[4];
+ 
++__attribute__((visibility("default")))
++void wine_diag_note( int slot, const char *text )
++{
++    if (slot < 0 || slot >= 4) return;
++    if (!text || !*text)
++    {
++        wine_diag_notes[slot].text[0] = 0;
++        return;
++    }
++    snprintf( wine_diag_notes[slot].text, sizeof(wine_diag_notes[slot].text), "%s", text );
++    __atomic_store_n( &wine_diag_notes[slot].ts, syscall_log_now_ns(), __ATOMIC_RELEASE );
++}
++
++
+ UINT64 wine_diag_now_ns(void)
+ {
+     return syscall_log_now_ns();
+@@ -1160,11 +1178,24 @@
+          * is the mechanism behind the quit hang, so name it up front (0 = free) */
+         UINT64 held_since;
+         UINT32 holder = fd_cache_section_holder( &held_since );
+-        if (holder)
++        if (holder && now >= held_since)
+             fprintf( file, "  fd cache section: held by tid %04x for %.1f s; every NtClose and fd-cache fill queues behind it\n",
+                      holder, (now - held_since) / 1000000000.0 );
++        else if (holder)
++            fprintf( file, "  fd cache section: held by tid %04x (just acquired)\n", holder );
+         else
+             fprintf( file, "  fd cache section: free\n" );
++    }
++    {   /* C06: cross-module notes from winemac.drv - window/focus state and the state of the
++         * synchronous Cocoa-main-thread rendezvous (OnMainThread / query) */
++        int slot;
++        for (slot = 0; slot < 4; slot++)
++        {
++            UINT64 ts = __atomic_load_n( &wine_diag_notes[slot].ts, __ATOMIC_ACQUIRE );
++            if (ts && now >= ts && wine_diag_notes[slot].text[0])
++                fprintf( file, "  ui note %d: %s (noted %.1f s ago)\n",
++                         slot, wine_diag_notes[slot].text, (now - ts) / 1000000000.0 );
++        }
+     }
+     for (t = 0; t < used; t++)
+     {

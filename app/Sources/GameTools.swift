@@ -1,7 +1,8 @@
 import Foundation
 
-/// Steam Play compatibility tools for games that need a Wine of their own (environments/<game> in
-/// the source tree; the first is THE FINALS, environments/finals/compat-tool). Each is bundled in
+/// Steam Play compatibility tools with a Wine of their own (environments/<name> in the source tree).
+/// The one today is the global SteamDriver tool (notproton-steamdriver), built from THE FINALS'
+/// environment (environments/finals/compat-tool), for every game. Each is bundled in
 /// Resources/GameTools/<id>/: the tool's files (run, compatibilitytool.vdf, toolmanifest.vdf), its
 /// Wine runtime (runtime.tar.gz) and tool.json. Install lays them into Steam's
 /// compatibilitytools.d/<id>, where the macOS Steam app (Steam Play switched on by NotProton) offers
@@ -10,7 +11,7 @@ import Foundation
 /// runtime comes with the app.
 ///
 /// The installed folder carries a marker (.steamdriver-tool.json, also naming the runtime), so a
-/// folder MacVolvo didn't make is never replaced or removed. Steam's prefix for the game
+/// folder macSteam didn't make is never replaced or removed. Steam's prefix for the game
 /// (steamapps/compatdata/<app id>) belongs to Steam and stays.
 enum GameTools {
     struct Tool:Identifiable,Equatable,Sendable {
@@ -25,6 +26,12 @@ enum GameTools {
 
     private static let fm=FileManager.default
     static let marker=".steamdriver-tool.json"
+    /// Tools earlier versions installed under another id: THE FINALS' own tool until it became the
+    /// global SteamDriver tool (2026-11-24). Installing a tool removes these (marker only).
+    static let legacyIDs=["notproton-steamdriver-finals"]
+    static var legacyInstalled:Bool {
+        legacyIDs.contains { fm.fileExists(atPath:NotProton.steamTools.appendingPathComponent($0+"/"+marker).path) }
+    }
     private static let toolFiles=["run","compatibilitytool.vdf","toolmanifest.vdf"]
 
     /// The tools this app carries (Resources/GameTools/*/tool.json).
@@ -41,11 +48,17 @@ enum GameTools {
         }.sorted { $0.game < $1.game }
     }
     static func folder(_ tool:Tool)->URL { NotProton.steamTools.appendingPathComponent(tool.id) }
-    /// The runtime an installed tool has, from its marker; nil when there is none.
+    /// The runtime an installed tool has; nil when it carries no marker (not macSteam's). The
+    /// version comes from the runtime's own runtime.json, so a runtime swapped in by hand (while
+    /// testing a build) shows as what it is; the marker's record is the fallback.
     static func installedRuntime(_ tool:Tool)->String? {
-        guard let data=try? Data(contentsOf:folder(tool).appendingPathComponent(marker)),
-              let json=try? JSONSerialization.jsonObject(with:data) as? [String:Any] else { return nil }
-        return json["runtime"] as? String
+        func read(_ url:URL,_ key:String)->String? {
+            guard let data=try? Data(contentsOf:url),
+                  let json=try? JSONSerialization.jsonObject(with:data) as? [String:Any] else { return nil }
+            return json[key] as? String
+        }
+        guard let recorded=read(folder(tool).appendingPathComponent(marker),"runtime") else { return nil }
+        return read(folder(tool).appendingPathComponent("runtime/runtime.json"),"version") ?? recorded
     }
     static func state(_ tool:Tool)->State {
         let dest=folder(tool)
@@ -81,13 +94,17 @@ enum GameTools {
             if fm.fileExists(atPath:dest.path) { try fm.moveItem(at:dest,to:old) }
             try fm.moveItem(at:staging,to:dest)
             try? fm.removeItem(at:old)
+            for id in legacyIDs where id != tool.id {
+                let folder=NotProton.steamTools.appendingPathComponent(id)
+                if fm.fileExists(atPath:folder.appendingPathComponent(marker).path) { try? fm.removeItem(at:folder) }
+            }
         } catch {
             try? fm.removeItem(at:staging)
             if !fm.fileExists(atPath:dest.path),fm.fileExists(atPath:old.path) { try? fm.moveItem(at:old,to:dest) }
             throw error
         }
     }
-    /// Removes the tool, only when it carries MacVolvo's marker. The game's prefix stays (Steam's).
+    /// Removes the tool, only when it carries macSteam's marker. The game's prefix stays (Steam's).
     static func remove(_ tool:Tool) throws {
         switch state(tool) {
         case .notInstalled: return

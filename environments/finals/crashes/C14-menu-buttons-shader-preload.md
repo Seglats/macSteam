@@ -17,6 +17,13 @@ Clicking main-menu buttons sometimes does nothing. Once shader preloading has fi
 Probably the GameThread or the UI waiting behind pipeline creation while shaders compile
 (`macfinals_dx12` warn logs pipelines taking ≥ 50 ms). Not investigated yet.
 
+## Data points
+
+- **2026-11-24 06:46 (`macfinals-137`, no `STEAMDRIVER_PERF`):** buttons stopped responding at
+  about minute 4–5 and recovered by themselves; the game process was at **536 % CPU** at the
+  time (shader preload is the likely load). No `no reply`/lock errors in that stretch; the one
+  `no reply` (`WM_GETTEXT` to `015c`) was earlier, during start-up loading. No dumps (perf off).
+
 ## Next steps
 
 A run with `WINEDEBUG=warn+macfinals_dx12` and `STEAMDRIVER_PERF=1`, clicking while preloading,

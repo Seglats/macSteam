@@ -52,3 +52,9 @@ inside matches. Compare C06 (GameThread at 0 % on `-106`, before today's hook ch
    work is ruled out.
 2. Then find what the GameThread blocks on at shutdown: its last NT calls in the counters, and the
    Wine log with a light channel set (never heap/relay/snoop).
+
+Update 2026-11-15: C17 was captured live (`macfinals-129`) and the family mechanism is now
+known — one thread wedges forever inside the `fd_cache_mutex` section (prime suspect: an
+untimed `recvmsg` in `wine_server_receive_fd`), and the loader/`threadpool.cs` holders here are
+threads blocked in `NtClose`/`NtUserThreadDetach` behind that mutex. See
+[C17](C17-slow-leave-and-quit-messagecall-ebadf.md) "What we think".

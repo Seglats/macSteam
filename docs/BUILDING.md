@@ -1,6 +1,6 @@
 # Building from source
 
-Players don't need any of this. [Download the app](https://github.com/haeli05/MacVolvo/releases)
+Players don't need any of this. [Download the app](https://github.com/seglats/macsteam/releases)
 instead. This page is for developers who want to rebuild the runtime or the app.
 
 The release runtime is built from pinned upstream sources by the portable build

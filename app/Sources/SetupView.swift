@@ -31,11 +31,11 @@ struct SetupView: View {
                     HStack(spacing:12) {
                         if model.windowsSteam {
                             FooterTile(title:"NotProton",symbol:"arrow.uturn.backward") { model.useWindowsSteam(false) }.disabled(model.busy)
-                                .help("Back to MacVolvo for NotProton and the macOS Steam app")
+                                .help("Back to macSteam for NotProton and the macOS Steam app")
                         }
                         FooterTile(title:"Settings",symbol:"gearshape") { model.sheet = .settings }.disabled(model.screen == .moveApp)
-                        FooterTile(title:"Help & FAQ",symbol:"questionmark.circle") { model.makeReport();model.sheet = .help }
                         FooterTile(title:"About",symbol:"info.circle") { model.sheet = .about }
+                        FooterTile(title:"Help & FAQ",symbol:"questionmark.circle") { model.makeReport();model.sheet = .help }
                     }.frame(maxWidth:LauncherStyle.contentWidth).padding(.bottom,24)
                 }.padding(.horizontal,36).frame(maxWidth:.infinity).frame(minHeight:geometry.size.height)
             }.scrollIndicators(.hidden)
@@ -52,6 +52,8 @@ struct SetupView: View {
             case .update: UpdateSheet(model:model).interactiveDismissDisabled(model.update == .installing)
                 .onDisappear { model.updateSheetClosed() }
             case .whatsNew: WhatsNewSheet()
+            case .keyOverrides: KeyOverridesSheet(model:model)
+            case .profileSettings: ProfileSettingsSheet(model:model)
             }
         }
         .task { model.startup() }
@@ -211,26 +213,26 @@ struct SetupView: View {
             } else {
                 LauncherPrimaryAction(title:"Move to Applications",action:model.moveToApplications).keyboardShortcut(.defaultAction).disabled(model.busy)
             }
-            Button("Quit") { model.quit() }.buttonStyle(.borderless).disabled(model.busy)
+            Button("Quit") { model.quit() }.buttonStyle(.borderless).hoverGrow().disabled(model.busy)
         case .readyToInstall:
             LauncherPrimaryAction(title:model.clientInstalled ? "Finish Setup" : "Install Steam",action:model.setup).keyboardShortcut(.defaultAction).disabled(model.busy)
         case .checking: EmptyView()
         case .preparing:
-            if model.canCancel { Button("Pause Setup",action:model.cancel).buttonStyle(.bordered).buttonBorderShape(.capsule).controlSize(.large).keyboardShortcut(.cancelAction) }
+            if model.canCancel { Button("Pause Setup",action:model.cancel).buttonStyle(.bordered).hoverGrow().buttonBorderShape(.capsule).controlSize(.large).keyboardShortcut(.cancelAction) }
         case .launching:
             LauncherCancelAction(title:"Cancel",action:model.cancelLaunch).keyboardShortcut(.cancelAction).disabled(!model.canCancel)
         case .installer:
             LauncherPrimaryAction(title:"Continue",action:model.finishInstaller).keyboardShortcut(.defaultAction).disabled(model.busy)
         case .ready, .running:
-            // MacVolvo's own Steam, for troubleshooting: games start from Steam's Library.
+            // macSteam's own Steam, for troubleshooting: games start from Steam's Library.
             ClientAction(title:"Open Steam",action:model.launch).keyboardShortcut(.defaultAction).disabled(model.busy)
         case .driveMissing:
             LauncherPrimaryAction(title:"Try Again",action:model.recheck).keyboardShortcut(.defaultAction).disabled(model.busy)
-            Button("Set Up on This Mac Instead",action:model.useThisMac).buttonStyle(.borderless).disabled(model.busy)
+            Button("Set Up on This Mac Instead",action:model.useThisMac).buttonStyle(.borderless).hoverGrow().disabled(model.busy)
         case .failure:
             if model.failure.code == "rosetta_required" {
                 LauncherPrimaryAction(title:"Install Rosetta",action:model.installRosetta).keyboardShortcut(.defaultAction).disabled(model.busy)
-                Button("Check Again",action:retry).buttonStyle(.borderless).disabled(model.busy)
+                Button("Check Again",action:retry).buttonStyle(.borderless).hoverGrow().disabled(model.busy)
             } else {
                 LauncherPrimaryAction(title:model.failure.code == "cancelled" ? "Resume Setup" : "Try Again",action:retry).keyboardShortcut(.defaultAction).disabled(model.busy)
             }
@@ -260,17 +262,17 @@ struct VersionStatus: View {
                 Text("·")
                 Button { model.sheet = .update } label: {
                     Label { Text("Update to \(item.version)").fontWeight(.semibold) } icon: { Image(systemName:"arrow.down.circle.fill").foregroundStyle(LauncherStyle.accent) }
-                }.buttonStyle(.borderless).foregroundStyle(.primary).help("See what’s new and install the update")
+                }.buttonStyle(.borderless).hoverGrow().foregroundStyle(.primary).help("See what’s new and install the update")
             case .downloading, .installing:
                 Text("·")
-                Button("Updating…") { model.sheet = .update }.buttonStyle(.borderless)
+                Button("Updating…") { model.sheet = .update }.buttonStyle(.borderless).hoverGrow()
             case .upToDate:
                 Text("·");Text("Up to date")
             default: EmptyView()
             }
             if Brand.allowsUpdates {
                 Text("·")
-                Button("What’s New") { model.sheet = .whatsNew }.buttonStyle(.borderless)
+                Button("What’s New") { model.sheet = .whatsNew }.buttonStyle(.borderless).hoverGrow()
             }
         }.font(LauncherStyle.font(12)).foregroundStyle(.secondary)
     }
@@ -296,7 +298,7 @@ struct FirstMatchTip: View {
             } icon: { Image(systemName:"sparkles") }
             Spacer(minLength:0)
             Button(action:dismiss) { Image(systemName:"xmark").font(.system(size:11,weight:.bold)).frame(width:22,height:22).contentShape(Rectangle()) }
-                .buttonStyle(.borderless).foregroundStyle(.secondary).help("Dismiss this tip").accessibilityLabel("Dismiss tip")
+                .buttonStyle(.borderless).hoverGrow().foregroundStyle(.secondary).help("Dismiss this tip").accessibilityLabel("Dismiss tip")
         }.font(LauncherStyle.font(13)).foregroundStyle(.secondary)
             .padding(16).frame(maxWidth:.infinity,alignment:.leading)
             .background(LauncherStyle.accent.opacity(0.09),in:RoundedRectangle(cornerRadius:10,style:.continuous))
@@ -312,7 +314,7 @@ struct FooterTile: View {
                 Image(systemName:symbol).font(.system(size:18,weight:.medium)).accessibilityHidden(true)
                 Text(title).font(LauncherStyle.font(12,.semibold))
             }.frame(maxWidth:.infinity,minHeight:58)
-        }.buttonStyle(FooterTileStyle())
+        }.buttonStyle(FooterTileStyle()).hoverGrow()
     }
 }
 private struct FooterTileStyle: ButtonStyle {

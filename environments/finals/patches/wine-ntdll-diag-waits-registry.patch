@@ -1,0 +1,188 @@
+From: MacFinals
+Subject: [PATCH] ntdll: per-wait registry and tear-free state lines for the C06 stuck dump
+
+Review of wine-ntdll-diag-notes-fdcache-wrapfix.patch (macfinals-135) found that its design
+could not show the case it was built for:
+
+- Waits used one shared slot per kind. OnMainThread runs on many threads at once, so the
+  slot held whichever waiter wrote last, and any other thread's short wait cleared it on
+  return - a thread blocked forever lost its record within milliseconds.
+- State lines carried ages computed when they were written (always ~0 for the field that
+  had just changed), and the dump could print a half-written line.
+
+Now:
+- wine_diag_wait_begin(what, waiter, target, hwnd) / wine_diag_wait_end(token): a 32-entry
+  registry, one entry per outstanding wait, claimed with a CAS and published with a release
+  store; the dump prints every live entry with its real duration
+  ("ui wait: tid 032c waiting for the Cocoa main thread (OnMainThread) for 41.3 s"),
+  and counts entries lost to a full table.
+- State lines (wine_diag_note) are guarded by a sequence counter and carry no ages; the
+  dump adds how long each has held ("ui state: app inactive (...) (for 183.0 s)").
+  Slots: 0 app active, 1 key window, 2 game window visibility, 3 displays/screen saver/lock.
+- Waiter names: a Wine tid, "Cocoa main thread" (0xffffffff) or "unlogged thread" (0 or
+  0xfffffffe, winemac's marker for a thread outside the syscall log).
+---
+--- a/dlls/ntdll/unix/loader.c
++++ b/dlls/ntdll/unix/loader.c
+@@ -919,22 +919,131 @@
+     return ts.tv_sec * 1000000000ull + ts.tv_nsec;
+ #endif
+ }
+-/* C06: cross-module diagnostic notes - winemac.drv writes, the stuck dump reads.
+- * slot 0: window/focus state, slot 1: OnMainThread wait, slot 2: query wait,
+- * slot 3: what the Cocoa main thread is executing. Empty text clears a slot. */
+-static struct { char text[160]; UINT64 ts; } wine_diag_notes[4];
++/* C06: cross-module diagnostic state - winemac.drv writes, the stuck dump reads.
++ *
++ * Notes are state lines with a single writer (the Cocoa main thread): slot 0 app active
++ * state, slot 1 key window, slot 2 window visibility, slot 3 display sleep. The timestamp is
++ * the moment of the last change, so the dump's "for X s" is how long that state has held. A
++ * sequence counter keeps the dump from printing a half-written line. Empty text clears.
++ *
++ * Waits are a registry with one entry per outstanding wait, so concurrent waiters never erase
++ * each other's record: a thread blocked forever keeps its entry while others come and go
++ * (the first version used one shared slot per wait kind, which any later short wait cleared). */
++#define WINE_DIAG_NOTES      4
++#define WINE_DIAG_WAITS      32
++#define WINE_DIAG_MAIN_THREAD 0xffffffffu
++static struct { char text[160]; UINT64 ts; LONG seq; } wine_diag_notes[WINE_DIAG_NOTES];
++static struct
++{
++    UINT64      since;   /* 0 free, 1 being filled, else start time (ns) */
++    const char *what;    /* static string in the caller's module */
++    UINT32      waiter;  /* wtid, WINE_DIAG_MAIN_THREAD, or 0 (thread not in the syscall log) */
++    UINT32      target;  /* wtid waited on or served, or 0 */
++    UINT64      hwnd;    /* window involved, or 0 */
++} wine_diag_waits[WINE_DIAG_WAITS];
++static LONG wine_diag_waits_lost;
+ 
+ __attribute__((visibility("default")))
+ void wine_diag_note( int slot, const char *text )
+ {
+-    if (slot < 0 || slot >= 4) return;
+-    if (!text || !*text)
++    if (slot < 0 || slot >= WINE_DIAG_NOTES) return;
++    __atomic_add_fetch( &wine_diag_notes[slot].seq, 1, __ATOMIC_ACQ_REL );  /* odd: writing */
++    if (text && *text)
+     {
+-        wine_diag_notes[slot].text[0] = 0;
+-        return;
++        snprintf( wine_diag_notes[slot].text, sizeof(wine_diag_notes[slot].text), "%s", text );
++        wine_diag_notes[slot].ts = syscall_log_now_ns();
+     }
+-    snprintf( wine_diag_notes[slot].text, sizeof(wine_diag_notes[slot].text), "%s", text );
+-    __atomic_store_n( &wine_diag_notes[slot].ts, syscall_log_now_ns(), __ATOMIC_RELEASE );
++    else wine_diag_notes[slot].text[0] = 0;
++    __atomic_add_fetch( &wine_diag_notes[slot].seq, 1, __ATOMIC_ACQ_REL );  /* even: stable */
++}
++
++/* returns a token for wine_diag_wait_end, or -1 when the table is full (counted) */
++__attribute__((visibility("default")))
++int wine_diag_wait_begin( const char *what, UINT32 waiter, UINT32 target, UINT64 hwnd )
++{
++    int i;
++
++    for (i = 0; i < WINE_DIAG_WAITS; i++)
++    {
++        UINT64 expected = 0, now;
++
++        if (!__atomic_compare_exchange_n( &wine_diag_waits[i].since, &expected, 1, FALSE,
++                                          __ATOMIC_ACQ_REL, __ATOMIC_RELAXED ))
++            continue;
++        wine_diag_waits[i].what   = what;
++        wine_diag_waits[i].waiter = waiter;
++        wine_diag_waits[i].target = target;
++        wine_diag_waits[i].hwnd   = hwnd;
++        now = syscall_log_now_ns();
++        __atomic_store_n( &wine_diag_waits[i].since, now > 1 ? now : 2, __ATOMIC_RELEASE );
++        return i;
++    }
++    __atomic_add_fetch( &wine_diag_waits_lost, 1, __ATOMIC_RELAXED );
++    return -1;
++}
++
++__attribute__((visibility("default")))
++void wine_diag_wait_end( int token )
++{
++    if (token < 0 || token >= WINE_DIAG_WAITS) return;
++    __atomic_store_n( &wine_diag_waits[token].since, 0, __ATOMIC_RELEASE );
++}
++
++static const char *wine_diag_who( UINT32 tid, char *buf, size_t size )
++{
++    if (tid == WINE_DIAG_MAIN_THREAD) return "Cocoa main thread";
++    if (!tid || tid == 0xfffffffeu) return "unlogged thread";  /* winemac's MACDRV_DIAG_UNLOGGED */
++    snprintf( buf, size, "tid %04x", tid );
++    return buf;
++}
++
++/* the stuck dump's view of the notes and waits; runs on the syscall-log thread */
++static void wine_diag_dump( FILE *file, UINT64 now )
++{
++    char text[160], who[32], tgt[32], hwnd[32];
++    int i, tries;
++    LONG lost;
++
++    for (i = 0; i < WINE_DIAG_NOTES; i++)
++    {
++        for (tries = 0; tries < 8; tries++)
++        {
++            LONG seq = __atomic_load_n( &wine_diag_notes[i].seq, __ATOMIC_ACQUIRE );
++            UINT64 ts;
++
++            if (seq & 1) continue;
++            memcpy( text, wine_diag_notes[i].text, sizeof(text) );
++            text[sizeof(text) - 1] = 0;
++            ts = wine_diag_notes[i].ts;
++            __atomic_thread_fence( __ATOMIC_ACQUIRE );
++            if (__atomic_load_n( &wine_diag_notes[i].seq, __ATOMIC_RELAXED ) != seq) continue;
++            if (text[0] && ts && now >= ts)
++                fprintf( file, "  ui state: %s (for %.1f s)\n", text, (now - ts) / 1000000000.0 );
++            break;
++        }
++    }
++    for (i = 0; i < WINE_DIAG_WAITS; i++)
++    {
++        UINT64 since = __atomic_load_n( &wine_diag_waits[i].since, __ATOMIC_ACQUIRE ), hw;
++        const char *what;
++        UINT32 waiter, target;
++
++        if (since <= 1) continue;
++        what = wine_diag_waits[i].what;
++        waiter = wine_diag_waits[i].waiter;
++        target = wine_diag_waits[i].target;
++        hw = wine_diag_waits[i].hwnd;
++        __atomic_thread_fence( __ATOMIC_ACQUIRE );
++        if (__atomic_load_n( &wine_diag_waits[i].since, __ATOMIC_RELAXED ) != since) continue;  /* recycled */
++        tgt[0] = hwnd[0] = 0;
++        if (target) snprintf( tgt, sizeof(tgt), "; %s", wine_diag_who( target, who, sizeof(who) ) );
++        if (hw) snprintf( hwnd, sizeof(hwnd), "; hwnd %#llx", (unsigned long long)hw );
++        fprintf( file, "  ui wait: %s %s%s%s for %.1f s\n",
++                 wine_diag_who( waiter, who, sizeof(who) ), what ? what : "?", tgt, hwnd,
++                 now >= since ? (now - since) / 1000000000.0 : 0.0 );
++    }
++    if ((lost = __atomic_load_n( &wine_diag_waits_lost, __ATOMIC_RELAXED )))
++        fprintf( file, "  ui wait: %d wait records lost (table full)\n", (int)lost );
+ }
+ 
+ 
+@@ -1186,17 +1295,8 @@
+         else
+             fprintf( file, "  fd cache section: free\n" );
+     }
+-    {   /* C06: cross-module notes from winemac.drv - window/focus state and the state of the
+-         * synchronous Cocoa-main-thread rendezvous (OnMainThread / query) */
+-        int slot;
+-        for (slot = 0; slot < 4; slot++)
+-        {
+-            UINT64 ts = __atomic_load_n( &wine_diag_notes[slot].ts, __ATOMIC_ACQUIRE );
+-            if (ts && now >= ts && wine_diag_notes[slot].text[0])
+-                fprintf( file, "  ui note %d: %s (noted %.1f s ago)\n",
+-                         slot, wine_diag_notes[slot].text, (now - ts) / 1000000000.0 );
+-        }
+-    }
++    /* C06: window/focus state and every outstanding Cocoa-main-thread rendezvous */
++    wine_diag_dump( file, now );
+     for (t = 0; t < used; t++)
+     {
+         struct syscall_log_tcalls *tc = &syscall_log_tc[t];

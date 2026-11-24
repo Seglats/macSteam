@@ -1,0 +1,57 @@
+From: MacFinals
+Subject: [PATCH] winemac.drv: leave the menu bar/Dock options alone while inactive (C18 fix)
+
+Rasmus (2026-11-24): after Cmd-Tab away from THE FINALS the game took the mouse and keyboard
+back; it stopped only after switching to an app with a window on the game's screen. Captured
+on macfinals-139 (+macfinals_ui and the macOS system log, session 07:11): after each of six
+switches to LibreWolf (on another display) the game went
+  SETFRONT LibreWolf -> game PRESENTATIONMODE AllHidden->Normal (+80 ms)
+  -> WindowServer SetMenuBars: game made the front process (+20 ms) -> AllHidden again.
+No click and no driver activation request was involved. The Steam Helper switch (window on
+the game's screen) made the same call without the steal; a later switch with the options
+already Normal made none and did not steal.
+
+The cause is updateCoveringPresentation (REC-45 borderless-game menu bar hiding, from
+wine-winemac-activation.patch): on deactivation it counted no covering window and called
+setPresentationOptions from the background to show the menu bar again. macOS applies an
+app's presentation options only while it is frontmost - the Dock switched its UI mode back
+to normal on its own at the SETFRONT, 90 ms before our call - so that call bought nothing
+and made WindowServer re-front the app. Now the options are not touched while the app is
+inactive; applicationDidBecomeActive: (updateFullscreenWindows) brings them up to date.
+WINEDEBUG=+macfinals_ui traces each change.
+---
+--- a/dlls/winemac.drv/cocoa_app.m
++++ b/dlls/winemac.drv/cocoa_app.m
+@@ -2398,7 +2398,17 @@
+             keep = value && *value == '1';
+         }
+         if (keep) return;
+-        if ([NSApp isActive])
++        /* C18: macOS applies an app's presentation options only while it is frontmost (the
++           Dock drops back to normal by itself when another app comes forward).  Changing
++           them from the background made WindowServer bring this app to the front again
++           (SetMenuBars) whenever the new app had no window on the game's screen: the game
++           took the mouse and keyboard back 20-30 ms after each Cmd-Tab (2026-11-24).  So
++           they are left as they are while inactive and brought up to date on activation. */
++        if (![NSApp isActive])
++        {
++            if (hidden) UI_LOG(@"menu bar/Dock options left hidden while inactive (C18)\n");
++            return;
++        }
+         {
+             for (NSNumber* windowNumber in [NSWindow windowNumbersWithOptions:0])
+             {
+@@ -2418,11 +2428,13 @@
+             hidden = TRUE;
+             options &= ~(NSApplicationPresentationAutoHideDock | NSApplicationPresentationAutoHideMenuBar);
+             [NSApp setPresentationOptions:options | ours];
++            UI_LOG(@"menu bar/Dock hidden over a covering window\n");
+         }
+         else if (!covering && hidden)
+         {
+             hidden = FALSE;
+             [NSApp setPresentationOptions:options & ~ours];
++            UI_LOG(@"menu bar/Dock shown again (no covering window)\n");
+         }
+     }
+ 

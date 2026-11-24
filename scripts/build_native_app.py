@@ -6,6 +6,7 @@ cache, or installed prefix is copied. Uses the tracked owner artwork by default;
 The bundle is named Recall; its identifier and data folder keep their original values.
 """
 import argparse,tarfile
+import sys
 import hashlib
 import json
 from pathlib import Path
@@ -19,7 +20,7 @@ from derive_runtime import archive_minimum, check_archive, format_macos, parse_m
 ROOT=Path(__file__).resolve().parents[1]
 # The bundle and executable name players see; Brand.swift holds the in-app
 # copy. Its own identifier and data folder keep it apart from Recall, which it is built on.
-APP_NAME='MacVolvo'
+APP_NAME='macSteam'  # MacVolvo until 2026-11-24; the engine keeps SteamDriver's name (app/Sources/Brand.swift)
 APP_BUILD='9'
 # The games' voice chat runs under this app's microphone permission (Microphone.swift); the
 # hardened runtime gives an app signed without the entitlement silence, with no prompt.
@@ -34,7 +35,7 @@ def sha(p):return hashlib.sha256(p.read_bytes()).hexdigest()
 # so it also fits NotProton's runner of that build, named as NotProton names the runner folder.
 NOTPROTON_DRIVER='lib/wine/x86_64-unix/winemac.so'
 NOTPROTON_BUILDS=('26.3.0.39832',)
-# MacVolvo's DXMT (Recall's, paired with this Mac driver's canvas) for the "MacVolvo DXMT" variant:
+# SteamDriver's DXMT (Recall's, paired with this Mac driver's canvas) for the "SteamDriver DXMT" variant:
 # (runtime file, place under the runner's lib/). CrossOver keeps a copy of winemetal.dll in
 # lib/wine as well, and its PE half has to match winemetal.so, so that copy is replaced too.
 NOTPROTON_DXMT=[
@@ -51,9 +52,9 @@ NOTPROTON_DXMT=[
 NOTPROTON_PROFILE='config/dxmt.conf'
 
 def notproton_profiles(profile):
-    """The runtime's DXMT renderer profile (written for Overwatch.exe) as one file per game, for
-    the per-game profiles in NotProton (app/Sources/NotProton.swift). The fullscreen canvas size
-    lines go: MacVolvo's own launcher fills them in from its resolution setting, NotProton's Steam
+    """The runtime's DXMT renderer profile (written for Overwatch.exe) as one file per game, plus
+    dx11.conf for every other game, for the profiles in NotProton (app/Sources/Profiles.swift). The fullscreen canvas size
+    lines go: SteamDriver's own launcher fills them in from its resolution setting, NotProton's Steam
     has none, so DXMT keeps the game's own size. CS2 takes 4 shader compiler threads, as
     portable_steam.h gamesProfile gives it."""
     start=profile.index('[Overwatch.exe]')
@@ -63,14 +64,18 @@ def notproton_profiles(profile):
     out={}
     for name,exe in (('cs2.conf','cs2.exe'),('deadlock.conf','deadlock.exe')):
         game=[l for l in lines if not (exe=='cs2.exe' and l.startswith('# Eight normal-priority workers'))]
-        game=[('# Four for CS2, as MacVolvo\'s launcher gives it.\nd3d11.shaderCompilerThreads = 4' if exe=='cs2.exe' and l.split('=')[0].strip()=='d3d11.shaderCompilerThreads' else l) for l in game]
-        out[name]=f'# MacVolvo renderer profile for {exe} (MacVolvo DXMT), from MacVolvo\'s runtime.\n[{exe}]'+'\n'.join(game).rstrip()+'\n'
+        game=[('# Four for CS2, as SteamDriver\'s launcher gives it.\nd3d11.shaderCompilerThreads = 4' if exe=='cs2.exe' and l.split('=')[0].strip()=='d3d11.shaderCompilerThreads' else l) for l in game]
+        out[name]=f'# SteamDriver renderer profile for {exe} (SteamDriver DXMT), from SteamDriver\'s runtime.\n[{exe}]'+'\n'.join(game).rstrip()+'\n'
+    # Global DX11 and game profiles without settings of their own (app/Sources/Profiles.swift):
+    # the same settings outside any [exe] section, which DXMT applies to every program.
+    out['dx11.conf']='# SteamDriver DX11 profile (SteamDriver DXMT), from SteamDriver\'s runtime. No [exe] section: for every program.'+'\n'.join(lines).rstrip()+'\n'
     return out
 
 # Games with a Wine of their own (environments/<name>): each ships as a Steam Play compatibility
 # tool the app installs into Steam's compatibilitytools.d (app/Sources/GameTools.swift). The
 # runtime archive comes from that environment's own build (--game-tool NAME=ARCHIVE).
-GAME_TOOLS={'finals':{'id':'notproton-steamdriver-finals','game':'THE FINALS','display':'SteamDriver: THE FINALS',
+# 'finals' is the environment it's built from; since 2026-11-24 it is the global SteamDriver tool.
+GAME_TOOLS={'finals':{'id':'notproton-steamdriver','game':'SteamDriver','display':'SteamDriver',
                       'source':ROOT/'environments/finals/compat-tool','required':('bin/wine','lib/macfinals-nt-hook.dylib')}}
 def bundle_game_tool(resources,name,archive):
     tool=GAME_TOOLS[name]
@@ -91,8 +96,8 @@ def bundle_game_tool(resources,name,archive):
 def build(output,workspace,runtime_archive,icon=None,identity=None,variant='dxmt',game_tools=()):
     if variant not in ('dxmt','gptk4'):raise ValueError('Unknown app variant')
     evaluation=variant=='gptk4'
-    app_name='MacVolvo GPTK4' if evaluation else APP_NAME
-    bundle_id='app.macvolvo.gptk4' if evaluation else 'app.macvolvo.launcher'
+    app_name='macSteam GPTK4' if evaluation else APP_NAME
+    bundle_id='app.steamdriver.gptk4' if evaluation else 'app.steamdriver.launcher'
     release=json.loads((ROOT/'app/Resources/release.json').read_text())
     if evaluation:
         runtime_manifest=check_archive(runtime_archive)
@@ -120,11 +125,11 @@ def build(output,workspace,runtime_archive,icon=None,identity=None,variant='dxmt
     rosetta=helpers/'Rosetta Check.app/Contents';(rosetta/'MacOS').mkdir(parents=True)
     source=output.parent/'rosetta-check.c';source.write_text('int main(void) { return 0; }\n')
     run('/usr/bin/clang','-ffile-prefix-map='+str(ROOT)+'=/ow2-source','-arch','x86_64','-mmacosx-version-min='+MINIMUM_MACOS,source,'-o',rosetta/'MacOS/RosettaCheck')
-    (rosetta/'Info.plist').write_bytes(plistlib.dumps({'CFBundleIdentifier':bundle_id+'.rosetta-check' if evaluation else 'app.macvolvo.rosetta-check','CFBundleExecutable':'RosettaCheck','CFBundleName':'Rosetta Check','CFBundlePackageType':'APPL','LSUIElement':True,'LSMinimumSystemVersion':MINIMUM_MACOS}))
+    (rosetta/'Info.plist').write_bytes(plistlib.dumps({'CFBundleIdentifier':bundle_id+'.rosetta-check' if evaluation else 'app.steamdriver.rosetta-check','CFBundleExecutable':'RosettaCheck','CFBundleName':'Rosetta Check','CFBundlePackageType':'APPL','LSUIElement':True,'LSMinimumSystemVersion':MINIMUM_MACOS}))
     run('/bin/cp','-c',runtime_archive,resources/release['runtimeArchive'])
     (resources/'release.json').write_text(json.dumps(release,separators=(',',':'))+'\n')
     shutil.copy2(ROOT/'docs/candidate-parity-contract.json',resources/'candidate-parity-contract.json')
-    # NotProton (app/Sources/NotProton.swift): MacVolvo's Mac driver for NotProton's CrossOver runner,
+    # NotProton (app/Sources/NotProton.swift): SteamDriver's Mac driver for NotProton's CrossOver runner,
     # one folder per CrossOver build it was compiled for, taken from the runtime it ships.
     if not evaluation:
         notproton=resources/'NotProton';notproton.mkdir()
@@ -133,7 +138,7 @@ def build(output,workspace,runtime_archive,icon=None,identity=None,variant='dxmt
             for build in NOTPROTON_BUILDS:
                 (notproton/build).mkdir()
                 shutil.copy2(Path(folder)/NOTPROTON_DRIVER,notproton/build/'winemac.so')
-                # The "MacVolvo DXMT" variant's tree, laid over the runner's lib/: CrossOver keeps
+                # The "SteamDriver DXMT" variant's tree, laid over the runner's lib/: CrossOver keeps
                 # DXMT in lib/dxmt/<arch>, and a copy of winemetal.dll in lib/wine.
                 for source,target in NOTPROTON_DXMT:
                     (notproton/build/'dxmt'/target).parent.mkdir(parents=True,exist_ok=True)
@@ -174,7 +179,15 @@ if __name__=='__main__':
     p=argparse.ArgumentParser(description=__doc__);p.add_argument('--output',type=Path,required=True);p.add_argument('--workspace',type=Path,default=ROOT/'runtime');p.add_argument('--runtime-archive',type=Path,default=ROOT/'runtime/downloads/runtime.tar.gz');p.add_argument('--icon',type=Path);p.add_argument('--identity')
     p.add_argument('--variant',choices=('dxmt','gptk4'),default='dxmt')
     p.add_argument('--game-tool',action='append',default=[],metavar='NAME=ARCHIVE',help='bundle a game environment\'s compatibility tool with that runtime archive (names: '+', '.join(GAME_TOOLS)+')')
+    p.add_argument('--skip-uninstall-tests',action='store_true',help='build without first checking that Uninstall removes everything (tests/test_uninstall_cleanup.py)')
     a=p.parse_args()
+    # Before anything is built: setting everything up and uninstalling it again must leave a
+    # home folder as Steam left it (the round trip in tests/test_uninstall_cleanup.py), and the
+    # NotProton options and the rename migration must hold (tests/test_notproton_options.py).
+    if not a.skip_uninstall_tests:
+        print('Checking that Uninstall removes everything the app and its game tools set up…',flush=True)
+        if subprocess.run([sys.executable,'-m','unittest','tests.test_uninstall_cleanup','tests.test_notproton_options'],cwd=ROOT).returncode!=0:
+            sys.exit('Uninstall/setup tests failed: nothing was built (see above; --skip-uninstall-tests builds anyway).')
     tools=[]
     for item in a.game_tool:
         name,_,archive=item.partition('=')

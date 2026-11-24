@@ -1,0 +1,268 @@
+From: MacFinals
+Subject: [PATCH] winemac.drv: bound and name the WineEventQueue lock (C04)
+
+C04 (crashes/C04): the 2026-11-15 macfinals-131 capture finally caught the freeze live. The
+GameThread entered NtUserPeekMessage and never returned; 60 s later Unreal's hang watchdog
+crashed the process ("Hang detected on GameThread"). The fd-cache section was free (not C17),
+the wineserver healthy, and every other thread - RenderThread, RHI, task pools - was parked in
+normal waits. The crashed thread's stack leaf was NtUserPeekMessage's syscall stub, i.e. the
+thread was blocked in unix code under that call: NtUserPeekMessage drains driver events via
+check_for_driver_events -> macdrv_ProcessEvents -> getEventMatchingMask, whose only unbounded
+wait is [eventsLock lock] - the NSLock shared with the Cocoa main thread's postEventObject,
+busiest exactly during the alt-tab deactivation event flood. The user had just alt-tabbed.
+
+This makes the queue lock bounded, holder-named and owner-death-safe:
+
+- eventsLock (NSLock) is replaced with os_unfair_lock, which the kernel releases when the
+  owning thread dies; a holder dying inside the critical section no longer wedges every
+  message pump in the process forever.
+- Every hold records the Wine tid (syscall_log_current_wtid from ntdll, matching the syscall
+  log's thread ids) and its acquisition time. A hold longer than 5 s is named in an ERR when
+  it ends, and acquiring a lock whose previous holder never released it (the dead-holder
+  signature, since all unlock paths clear the holder first) is called out in an ERR.
+- getEventMatchingMask, which runs on Windows message-pump threads, acquires the lock with a
+  100 ms bound instead of waiting forever: on timeout it names the holder in an ERR and skips
+  that drain round (cost: one round of driver-event latency, instead of a frozen game). The
+  signaling pipe is now cleared only once the lock is held, so a skipped round leaves the
+  signal in place for the next caller.
+
+So the next occurrence is both survivable and self-describing: the ERR names the holder tid,
+and "previous holder never released it" versus "held by tid XXXX for N s" distinguishes a dead
+holder from a stuck one.
+---
+--- a/dlls/winemac.drv/cocoa_event.h
++++ b/dlls/winemac.drv/cocoa_event.h
+@@ -19,6 +19,8 @@
+  */
+ 
+ #import <AppKit/AppKit.h>
++#include <os/lock.h>
++#include <stdint.h>
+ #include "macdrv_cocoa.h"
+ 
+ 
+@@ -40,7 +42,12 @@
+ @interface WineEventQueue : NSObject
+ {
+     NSMutableArray* events;
+-    NSLock*         eventsLock;
++    /* C04: bounded, holder-named, owner-death-safe queue lock.  Message-pump
++       threads drain driver events under it, so it must never be waited on
++       without a bound, and a hold must name its holder when it goes long. */
++    os_unfair_lock  events_lock;
++    volatile uint32_t events_lock_holder;
++    volatile uint64_t events_lock_since;
+ 
+     int             fds[2]; /* Pipe signaling when there are events queued. */
+     int             kq; /* kqueue for waiting in OnMainThread(). */
+--- a/dlls/winemac.drv/cocoa_event.m
++++ b/dlls/winemac.drv/cocoa_event.m
+@@ -22,6 +22,9 @@
+ #include <sys/event.h>
+ #include <sys/time.h>
+ #include <libkern/OSAtomic.h>
++#include <os/lock.h>
++#include <stdint.h>
++#include <unistd.h>
+ 
+ #include "macdrv_cocoa.h"
+ #import "cocoa_event.h"
+@@ -41,7 +44,24 @@
+ static NSString* const WineHotKeyCarbonRefKey   = @"hotKeyRef";
+ static const OSType WineHotKeySignature = 'Wine';
+ 
++/* From ntdll: the Wine thread id, so lock diagnostics match the syscall log. */
++extern unsigned int syscall_log_current_wtid(void);
+ 
++/* Monotonic nanoseconds for lock hold-time diagnostics. */
++static uint64_t queue_lock_now_ns(void)
++{
++    return clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
++}
++
++
++@interface WineEventQueue ()
++    /* C04: the queue lock is bounded, holder-named and owner-death-safe. */
++    - (void) lockTracked;
++    - (void) unlockTracked;
++    - (BOOL) lockBounded:(uint64_t)timeout_ns holder:(uint32_t*)holder;
++@end
++
++
+ @implementation NSEvent (WineExtensions)
+ 
+     static BOOL wine_commandKeyDown(NSUInteger flags)
+@@ -119,9 +139,9 @@
+ 
+             event_handler = handler;
+             events = [[NSMutableArray alloc] init];
+-            eventsLock = [[NSLock alloc] init];
++            events_lock = OS_UNFAIR_LOCK_INIT;
+ 
+-            if (!events || !eventsLock)
++            if (!events)
+             {
+                 [self release];
+                 return nil;
+@@ -171,7 +191,6 @@
+         [hotKeysByMacID release];
+         [hotKeysByWinID release];
+         [events release];
+-        [eventsLock release];
+ 
+         if (kq != -1) close(kq);
+         if (fds[0] != -1) close(fds[0]);
+@@ -192,6 +211,57 @@
+ 
+         if (rc < 0 && errno != EAGAIN)
+             ERR(@"%@: got error writing to event queue signaling pipe: %s\n", self, strerror(errno));
++    }
++
++    /* C04: every hold of the queue lock is recorded with the Wine tid, a hold
++       longer than 5 s is named when it ends, and acquiring a lock whose
++       previous holder never released it (a thread died inside the critical
++       section; os_unfair_lock releases on owner death) is called out. */
++    - (void) lockTracked
++    {
++        uint32_t previous;
++
++        os_unfair_lock_lock(&events_lock);
++        if ((previous = events_lock_holder))
++            ERR(@"%@: event queue lock acquired but previous holder tid %04x never released it (died holding it?); it was held for %.1f s\n",
++                self, previous, (double)(queue_lock_now_ns() - events_lock_since) / 1e9);
++        events_lock_since = queue_lock_now_ns();
++        events_lock_holder = syscall_log_current_wtid();
++    }
++
++    - (void) unlockTracked
++    {
++        uint64_t now = queue_lock_now_ns();
++
++        if (events_lock_holder && now - events_lock_since > 5000000000ull)
++            ERR(@"%@: event queue lock held by tid %04x for %.1f s\n",
++                self, events_lock_holder, (double)(now - events_lock_since) / 1e9);
++        events_lock_holder = 0;
++        os_unfair_lock_unlock(&events_lock);
++    }
++
++    /* For callers that sit under a Windows message pump: never block longer
++       than timeout_ns; *holder names the current holder on failure. */
++    - (BOOL) lockBounded:(uint64_t)timeout_ns holder:(uint32_t*)holder
++    {
++        uint64_t deadline = queue_lock_now_ns() + timeout_ns;
++        uint32_t previous;
++
++        while (!os_unfair_lock_trylock(&events_lock))
++        {
++            if (queue_lock_now_ns() >= deadline)
++            {
++                *holder = events_lock_holder;
++                return NO;
++            }
++            usleep(500);
++        }
++        if ((previous = events_lock_holder))
++            ERR(@"%@: event queue lock acquired but previous holder tid %04x never released it (died holding it?); it was held for %.1f s\n",
++                self, previous, (double)(queue_lock_now_ns() - events_lock_since) / 1e9);
++        events_lock_since = queue_lock_now_ns();
++        events_lock_holder = syscall_log_current_wtid();
++        return YES;
+     }
+ 
+     - (void) postEventObject:(MacDrvEvent*)event
+@@ -199,7 +269,7 @@
+         NSIndexSet* indexes;
+         MacDrvEvent* lastEvent;
+ 
+-        [eventsLock lock];
++        [self lockTracked];
+ 
+         indexes = [events indexesOfObjectsPassingTest:^BOOL(id obj, NSUInteger idx, BOOL *stop){
+             return ((MacDrvEvent*)obj)->event->deliver <= 0;
+@@ -237,7 +307,7 @@
+         else
+             [events addObject:event];
+ 
+-        [eventsLock unlock];
++        [self unlockTracked];
+ 
+         [self signalEventAvailable];
+     }
+@@ -268,6 +338,19 @@
+         int rc;
+         NSUInteger index;
+         MacDrvEvent* ret = nil;
++        uint32_t holder;
++
++        /* This runs on Windows message-pump threads (NtUserPeekMessage drains
++           driver events through it), so the lock is only ever waited on with a
++           bound: a stuck or dead holder must not freeze every pump in the
++           process (C04).  The signaling pipe is cleared only once the lock is
++           held, so a skipped round leaves the signal in place. */
++        if (![self lockBounded:100 * 1000000ull holder:&holder])
++        {
++            ERR(@"%@: event queue lock unavailable for 100 ms, held by tid %04x; skipping driver event drain\n",
++                self, holder);
++            return nil;
++        }
+ 
+         /* Clear the pipe which signals there are pending events. */
+         do
+@@ -280,11 +363,10 @@
+                 ERR(@"%@: event queue signaling pipe unexpectedly closed\n", self);
+             else
+                 ERR(@"%@: got error reading from event queue signaling pipe: %s\n", self, strerror(errno));
++            [self unlockTracked];
+             return nil;
+         }
+ 
+-        [eventsLock lock];
+-
+         index = 0;
+         while (index < [events count])
+         {
+@@ -305,7 +387,7 @@
+                 index++;
+         }
+ 
+-        [eventsLock unlock];
++        [self unlockTracked];
+         return ret;
+     }
+ 
+@@ -315,7 +397,7 @@
+     {
+         NSIndexSet* indexes;
+ 
+-        [eventsLock lock];
++        [self lockTracked];
+ 
+         indexes = [events indexesOfObjectsPassingTest:^BOOL(id obj, NSUInteger idx, BOOL *stop){
+             MacDrvEvent* event = obj;
+@@ -324,7 +406,7 @@
+ 
+         [events removeObjectsAtIndexes:indexes];
+ 
+-        [eventsLock unlock];
++        [self unlockTracked];
+     }
+     }
+ 
+@@ -367,7 +449,7 @@
+ 
+         pos = cgpoint_win_from_mac(pos);
+ 
+-        [eventsLock lock];
++        [self lockTracked];
+ 
+         for (event in events)
+         {
+@@ -387,7 +469,7 @@
+             }
+         }
+ 
+-        [eventsLock unlock];
++        [self unlockTracked];
+     }
+ 
+     - (BOOL) postHotKeyEvent:(UInt32)hotKeyNumber time:(double)time

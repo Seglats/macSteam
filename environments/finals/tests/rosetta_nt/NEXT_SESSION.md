@@ -1,4 +1,4 @@
-# MacFinals: where we are (2026-11-15, end of session)
+# MacFinals: where we are (2026-11-17, end of session)
 
 Start here after a context reset. Details live in the linked files.
 
@@ -7,14 +7,42 @@ Start here after a context reset. Details live in the linked files.
 - **Crashes and hangs:** `environments/finals/crashes/README.md` lists every known one (origin,
   status, reproducer), with a fix file per confirmed cause. Add new ones there.
 
-## Next session: finish the crash and hang fixes in progress
+## Next session: read the new diagnostics off the next live occurrence
 
-State at the end of 2026-11-15: runtime **`macfinals-129`** is installed in the Steam tool
-(backups `-127`, `-125`, `-119`, `-117`, …; `-127` was the previous installed one). Nothing
-is committed. Reproducer suite (`teardown_check.py`, every mode) is at 0 failures on `-129`
-(and `-127`, `-125`, `-121`, `-117`, `-119`). In game, quitting and
-leaving a round are slow, and quitting sometimes never finishes: C05, C16 and the new
-[C17](../../crashes/C17-slow-leave-and-quit-messagecall-ebadf.md).
+State as of 2026-11-24: runtime **`macfinals-143`** (C18 fix confirmed in game on `-141`; game
+shortcuts, below) is installed in the Steam tool with the new `run` script (`run.before-shortcuts`
+kept; backups `-141`, `-139` only: older runtimes, workspace artifacts below `-139` and the `MacFinals-build*` workspaces were deleted 2026-11-24 to free space; manifest verified, 0 problems). Next: test
+`STEAMDRIVER_SHORTCUTS='ctrl+space'` in game. Nothing is committed. Reproducer suite
+(`teardown_check.py`, every mode) is at 0 failures on `-129` … `-143` (56 ns).
+
+**`macfinals-144` (2026-11-24) = `-143` without Apple's files** (`scripts/unbundle_gptk.py`):
+Apple's redist became links into `lib/apple-gptk`, which the tool's run script points at the
+player's own `SteamDriver/GPTK` (checked: modules, Apple's signature; alert and exit if not).
+Probe-checked: `d3d12_factory_probe.exe` creates a device through the layer and Apple's d3d12 on
+it. macSteam dev24 bundles it. Not yet run in game: install GPTK in macSteam, then Update the
+tool to 144, then play.
+
+**Next game session — all of our logging, none of Wine's per-call logging** (Rasmus, 2026-11-24),
+as the Steam launch options:
+
+```
+STEAMDRIVER_PERF=1 WINEDEBUG=err+fixme,+macfinals_hook,+macfinals_dx12,+macfinals_ui %command%
+```
+
+`STEAMDRIVER_PERF=1` = counters + stuck dumps (C06/C17, with `ui state`/`ui wait`);
+`+macfinals_hook` = hook counters every 2.4 s; `+macfinals_dx12` = every shader rewrite and
+pipeline, warn ≥ 50 ms (C14); `+macfinals_ui` = focus, frontmost app, activation cause,
+mouselook/clip/cursor, main-thread waits (C06, C18). Left out on purpose: `+macfinals_scan`
+(a heavy arena scan at process exit, which would muddy the quit-hang data). Reproduce C18 (Cmd-Tab
+away, let it steal once) and click buttons during shader preload (C14); note the times. Two live captures are fully diagnosed: **C17** (quit
+hang, 2026-11-15 22:11 — one thread wedged in the `fd_cache_mutex` section, holder-naming
+installed as `-131`; a live ~42 s hold inside one `NtClose` was seen 2026-11-21) and **C06**
+(GameThread freeze → UE hang-watchdog crash, 2026-11-15 and 2026-11-21 — win32u's user lock
+held across the mac driver's synchronous Cocoa-main-thread rendezvous, seen as a Background
+Worker wedged in `NtUserDestroyWindow`; the queue-lock mitigation of `-133` was insufficient).
+`-135` added the diagnostics that name the rendezvous and the focus state, and `-137` fixes
+what a review found wrong with them and with `-133` (item 5); **C06's file says exactly which
+lines to read at the next occurrence.**
 
 Do in this order:
 
@@ -85,21 +113,138 @@ Do in this order:
    a `game exited` line end at the last counter stamp of their own perf folder; the last
    launch gets `wineserver crashed?` when the Wine log ends with wineserver's death line;
    inner dump loop variable renamed.
-4. **C17: the stuck `SendMessage` and the lost wineserver connection.**
-   - Thread `0274` sent `WM_GETTEXT` (msg `0xd`) to window `0x20096` and waited 69 s+ after the
-     quit. Earlier in the same run that call took 2.1 s, 0.3 s and 1.1 s, so the window's owner
-     answers slowly even in play. Find the owner (the dump from step 1) and why it stops pumping
-     messages.
-   - Thread `043c`: `wine client error:43c: read: Bad file descriptor`, then 114 s+ in
-     `NtSetInformationThread(0x698, 3, …)`. Its wineserver socket was closed under it. Find who
-     closes that fd (a double `close` in Wine's unix code, or fd reuse), and why the thread didn't
-     die (Wine's `abort_thread` after a protocol error).
-5. **A/B in game, with the fixed dump:** fast path on (`STEAMDRIVER_PERF=1 %command%`) against
+4. **C17: the quit hang was captured live on `macfinals-129` (22:11 session) and the mechanism is
+   found — details and evidence in
+   [C17](../../crashes/C17-slow-leave-and-quit-messagecall-ebadf.md).** Freeze at 22:14:36: one
+   thread wedges forever inside the `fd_cache_mutex` section (prime suspect `0520` stuck in
+   `NtReadFile` → `wine_server_receive_fd`'s untimed `recvmsg` on the shared `fd_socket`); every
+   other stuck call — 17× `NtClose`, the `NtUserThreadDetach` holding `loader_section`, the
+   `threadpool.cs` holder, and the never-pumping `WM_GETTEXT` owner (parked in a cache fill
+   before its wait) — queues behind that one mutex. Both wineserver threads proven healthy
+   (sampled read-only; the msync pump's parked PC resolved to its receive call by disassembly);
+   no thread died mid-call (0 `never returned` lines), so the holder is alive.
+   - **Holder-naming diagnostics shipped and installed (`macfinals-130`/`-131`,
+     2026-11-15):** `patches/wine-ntdll-fdcache-holder-name.patch` — the stuck dump prints
+     `fd cache section: held by tid %04x for %.1f s` (or `free`) first, and
+     `pthread_exit_wrapper` releases the section if the dying thread holds it (closes the
+     dead-holder class). Probe-verified on `-131`: exited-marking and sender headline intact,
+     the new line in every dump. **Next live hang: read that line — it names the wedge.**
+   - Fix once the holder is confirmed live: bound the `receive_fd` wait (fail the call
+     instead of hanging the process).
+   - Root cause still open: what desyncs the fd channel — the `043c` "Bad file descriptor"
+     family (who closes or mis-consumes Wine's comms fds mid-play).
+5. **C06: the alt-tab GameThread freeze was captured live and mitigated — installed as
+   `macfinals-133` (2026-11-17), details in
+   [C06](../../crashes/C06-gamethread-stop-in-play.md).** The 23:03 session froze right after an
+   alt-tab: GameThread entered `NtUserPeekMessage` and never returned (fd cache free — *not*
+   C17; every other thread parked in normal waits; zero GPTK frames); 60 s later UE's hang
+   watchdog crashed the game into its crash reporter. The only unbounded wait under that call
+   is the winemac `WineEventQueue` lock (`eventsLock`, an NSLock shared with the Cocoa main
+   thread's event posting — busiest exactly during deactivation, and not owner-death-safe in a
+   game that loses threads mid-play). `patches/wine-macdrv-event-queue-lock.patch` makes the
+   lock `os_unfair_lock` (death-safe), holder-named (ERRs print the Wine tid via
+   `syscall_log_current_wtid`, exported by
+   `patches/wine-ntdll-syscall-log-wtid-export.patch`), and bounded to 100 ms on the pump path
+   (a skipped drain costs one round of input latency instead of the game). **Next occurrence:
+   read the `event queue lock …` ERR lines — `held by tid XXXX for N s` names a stuck holder,
+   `previous holder … never released it` names a dead one (cross-reference with the syscall
+   log's `exited; never returned` lines).** Note: C04's spin variant (PeekMessage *returning*
+   2 M times/s) is a different mechanism and is not covered. Probe-verified on `-133`
+   (stuck-send probe: owner headline → sender headline → `exited; never returned` all intact,
+   zero queue-lock ERR false positives); `teardown_check.py` all five modes green (0 crashes,
+   0 abnormal exits). Note on the numbers: medians read 133–151 ns that morning against
+   `-131`'s 55–59 ns on 2026-11-15 — a same-conditions control on installed `-131` read 143 ns,
+   so the spread is machine state (idle morning), not the patches. Installed with manifest
+   verification (4915 files, 0 mismatches). **Crab Champions canary still skipped** (Rasmus's
+   Steam client was running; same reason as before) — run it when Steam is free if wanted.
+   - **The `-133` mitigation did not stop the 2026-11-21 recurrence** (see the capture above):
+     the real rendezvous is the synchronous Cocoa-main-thread wait under win32u's user lock.
+     **`macfinals-135`** adds the diagnostics Rasmus asked for, all OFF BY DEFAULT except the
+     pathological-wait ERRs (`patches/wine-ntdll-diag-notes-fdcache-wrapfix.patch`,
+     `patches/wine-macdrv-focus-rendezvous-log.patch`):
+     - Every stuck dump now prints `ui note` lines: slot 0 window/focus state (app
+       active/inactive with age, key window with age), slot 1/2 who is waiting for the Cocoa
+       main thread (`OnMainThread` / `query type N`) and since when, slot 3 which tid's block
+       the main thread is executing. That answers "was the window highlighted/main?" and names
+       both sides of a wedged rendezvous.
+     - Off-by-default tracing (Rasmus's requirement): add **`WINEDEBUG=err+fixme,+macdrv`** to
+       the launch options to get every focus transition and every main-thread wait (ms) in the
+       Wine log; without it, only waits > 10 s ERR on their own.
+     - The fd-cache holder duration wrap is fixed ("just acquired" instead of 18446744073.7 s).
+     Probe-verified on `-135` (all prior dump behaviour intact, zero false ERRs); teardown
+     5/5 green at 56–60 ns; installed with manifest verification.
+   - **Review of the logging, 2026-11-22 → `macfinals-137` (installed)**,
+     `patches/wine-ntdll-diag-waits-registry.patch` + `patches/wine-macdrv-diag-review-fixes.patch`:
+     - **`-133`'s lock swap was harmful:** `os_unfair_lock` is *not* released when its owner
+       dies (tested: `trylock` busy forever, blocking lock aborts the process, exit 132), so a
+       dead holder would have crashed the game on the main thread's posting path. Back to
+       upstream's NSLock (tested: hangs, `tryLock`/`lockBeforeDate:` time out cleanly); bounded
+       drain and holder record kept; the unreachable dead-holder ERR removed.
+     - **`-135`'s wait slots could not show a stuck waiter:** one shared slot per kind, cleared
+       by any other thread's short wait. Replaced by a per-wait registry (stress-tested: stuck
+       entry in 50/50 dumps under 8 churning threads, 0 torn lines).
+     - **`query:` was logged backwards:** it is the Cocoa main thread waiting on a window's Wine
+       thread; now logged that way with the owner tid, query name and hwnd.
+     - Main-thread and unlogged holders/waiters were "tid 0000" (and long main-thread holds
+       unreported) → named; state lines carry real ages; app state read from AppKit; key-window
+       resign only clears its own window; trace lines had no newline; only waits > 20 ms trace;
+       skip ERR rate-limited.
+     - Added for the AFK case: game-window visibility (occlusion) and display sleep / screen
+       saver / screen lock state lines.
+     - Own channel: **`WINEDEBUG=err+fixme,+macfinals_ui`** (was `+macdrv`, which also enables
+       every macdrv trace); listed in `environments/finals/CLAUDE.md`'s channel table.
+     Probe on `-137` with the channel on: one trace per line, baseline state lines, dumps print
+     `ui state: … (for 114.8 s)`, sender headline and exited-marking intact. Teardown 5/5 green
+     at 54–57 ns; installed with manifest verification (4915 files, 0 problems).
+   - **Game shortcuts (2026-11-24, `macfinals-143`):** Rasmus wants keys like Ctrl+Space to reach
+     the game, Moonlight-style, without Accessibility, and nothing changed until the user lists
+     a combo. `STEAMDRIVER_SHORTCUTS='ctrl+space'` (run script) → `WINEMAC_GAME_SHORTCUTS`;
+     `patches/wine-macdrv-game-shortcuts.patch` switches each matching WindowServer symbolic
+     hotkey off while the app is active (`CGSSetSymbolicHotKeyEnabled` via dlsym; no
+     permission) and back on at resign/exit. That switch is session-wide and **outlives the
+     process** (tested), so ids are recorded in `<compatdata>/shortcuts-taken/<pid>` first and
+     the run script restores records of dead processes after the game (and at start) through
+     `osascript -l JavaScript` (same call). Moonlight's all-or-nothing
+     `CGSSetGlobalHotKeyOperatingMode` dies with the process but can't keep exceptions, hence
+     per-hotkey. Live test with notepad: take on activate, hand back on Finder, take again,
+     kill → left off + record → run-script restore brought them back. Not covered: other apps'
+     Carbon global hotkeys, Force Quit/Lock Screen; an Accessibility event-tap mode could be
+     added later as an option. **App UI (2026-11-24):** main window › "Key combo overrides" ›
+     Key Combos… opens `app/Sources/KeyOverridesSheet.swift`: a searchable dropdown of profiles,
+     All games + one per Steam game launched through the tool (the run script records
+     `key-overrides/games/<app id>`: name from `appmanifest_<id>.acf`, tool, last launch; app id
+     = the compatdata folder name; the game's list is `app-<app id>.txt`), combos as key caps with what macOS uses them for (read from WindowServer's table),
+     a + that records the next combo (system shortcuts reach the app while recording via
+     `CGSSetGlobalHotKeyOperatingMode`, process-scoped), scrolling past 240 pt. Stored as
+     `~/Library/Application Support/SteamDriver/key-overrides/{global,app-<app id>}.txt` (was `MacVolvo NotProton`);
+     the run script merges Global + the game's file + `STEAMDRIVER_SHORTCUTS`. App build
+     `runtime/build/dev18/macSteam.app` (`build_native_app.py` first runs the setup→uninstall round trip, `tests/test_uninstall_cleanup.py`, and stops on any leftover; Uninstall button in the footer; removes by default also game prefixes the tools made and restores Deadlock's renderer; also removes game tools, their compatdata files, NotProton runner copies, old-name leftovers and permissions: `app/Sources/Uninstaller.swift`, `tests/test_uninstall_cleanup.py`) (ad hoc; rainbow "mac" wordmark in its own colours; always dark with a Steam-like blue gradient, `LauncherStyle`). Naming since 2026-11-24: the app is macSteam; folders, the Steam tool, rows and `STEAMDRIVER_*` stay SteamDriver (`app/Sources/Brand.swift`, `Migration.swift`).
+   - **C18 cause found (capture 2026-11-24 07:11 on `-139` + macOS system log):** our REC-45
+     menu bar/Dock hiding (`updateCoveringPresentation`) called `setPresentationOptions` from
+     the background on deactivation; WindowServer answered with `SetMenuBars` and re-fronted the
+     game 20–30 ms later (6×, no click, no driver request). The click/mouselook chain below was
+     wrong. Fix `patches/wine-macdrv-c18-presentation-inactive.patch` → `macfinals-141`: options
+     untouched while inactive. Same code in main's `wine-winemac-activation.patch` (CS2/Deadlock).
+   - **C18 (new, 2026-11-24): after Cmd-Tab away the game takes the mouse and keyboard back**
+     — see [C18](../../crashes/C18-alt-tab-input-steal.md). Suspected chain (read in the driver,
+     not yet captured): mouselook releases the pointer over the game window; the game window
+     stays on top of its screen (seen live); the next click there re-activates the game *and*
+     is delivered into it (`acceptsFirstMouse` YES), so UE re-captures. Rasmus chose **logging
+     first, fix after a capture**: `patches/wine-macdrv-input-steal-log.patch` (`macfinals-139`,
+     installed) adds, on `+macfinals_ui`, wall-clock timestamps and pid on every trace, the
+     frontmost app's name (also in the dump's state line), the activation cause ("activated by
+     a click on hwnd …, also delivered into the game" / a driver request with call stack),
+     mouselook/clip/cursor transitions, and a 0.5 s-after-deactivation check of whether the game
+     window is uncovered and the pointer over it. Behaviour unchanged. Probe on `-139`: traces
+     timestamped, dumps name the frontmost app, prior dump behaviour intact (the first probe
+     run failed only because macOS had cleaned the probe exe out of `/tmp`; it now lives in the
+     session scratchpad). Teardown 5/5 green at 55–57 ns; installed, manifest 4915/0.
+6. **A/B in game, with the fixed dump:** fast path on (`STEAMDRIVER_PERF=1 %command%`) against
    `MACFINALS_NT_OFF=syscall,reloc STEAMDRIVER_PERF=1 %command%`. Quit from inside a match, and
    leave a round, each run. Wait at least 70 s at any freeze. Then
    `python3 tests/finals_bisect/ab_launches.py --since "<date> <time>"`. Optionally the same on
    `macfinals-112` to see whether the quit hangs are older than this week's work.
-6. **Open entries to update from that data:** C04 (GameThread spin after loading in), C05 (quit
+7. **Open entries to update from that data:** C04 (GameThread spin after loading in), C05 (quit
    hang), C16 (load hang with loader and winmm locks), C17. **C07** (nested-exception noise): the
    quit-handler fix is in `-119`; confirm at game quits and write `crashes/fixes/C07-fix.md`. A
    second variant with a garbage (non-NULL) frame address was seen once (C05) and isn't covered.

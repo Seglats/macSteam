@@ -1,22 +1,27 @@
 import Foundation
 
-/// MacVolvo with NotProton (https://github.com/NotProtonNot/NotProton), which turns on Steam Play
-/// in the macOS Steam app and runs Windows games in a copy of CrossOver ("runner"). MacVolvo
+/// macSteam with NotProton (https://github.com/NotProtonNot/NotProton), which turns on Steam Play
+/// in the macOS Steam app and runs Windows games in a copy of CrossOver ("runner"). macSteam
 /// replaces nothing of it: no tool, no runner, no CrossOver. It adds options to each game's
 /// Compatibility page in Steam, through NotProton's own extension points (its conf-format.md):
 ///
-/// - runner variants (notproton/variants/macvolvo.conf), laid over NotProton's runner in a copy
-///   NotProton builds on first use. "MacVolvo driver": MacVolvo's Mac driver (winemac.so: raw mouse
+/// - runner variants (notproton/variants/steamdriver.conf; macvolvo.conf before the rename), laid over NotProton's runner in a copy
+///   NotProton builds on first use. "SteamDriver driver": macSteam's Mac driver (winemac.so: raw mouse
 ///   input, High-precision, fullscreen and display fixes), compiled from the same CrossOver sources
 ///   as the runner, one per build (Resources/NotProton/<build>/winemac.so), naming its build so
-///   NotProton never applies it to another. "MacVolvo renderer": MacVolvo DXMT, or Apple's D3DMetal
+///   NotProton never applies it to another. "SteamDriver renderer": SteamDriver DXMT, or Apple's D3DMetal
 ///   from the player's own Game Porting Toolkit (NotProtonExtras.swift);
-/// - plugin rows (notproton/plugins/macvolvo.conf): "MacVolvo mouse", with High-precision,
-///   Classic timing and Mouse updates under it, and the game profiles chosen in MacVolvo. Each sets
-///   variables for that game only, and only for the CrossOver tools the driver is built for.
+/// - plugin rows (notproton/plugins/steamdriver.conf): "SteamDriver mouse", with High-precision,
+///   Classic timing and Mouse updates under it, and the DX11 profiles made in macSteam
+///   (Profiles.swift; a game's own only shows in that game). Each sets variables for the game it's
+///   switched on in, and only for the CrossOver tools the driver is built for.
 ///
-/// Both files say MacVolvo wrote them; NotProton never writes to those folders. Remove deletes
-/// only what carries MacVolvo's marker.
+/// Steam reads the plugin rows live (NotProton 1.2.7) but the variants only when it starts, so only
+/// a change to the variants asks for a restart. A plugin file the player removed in NotProton's
+/// plugin page stays removed until they put the rows back here (rowsRemoved).
+///
+/// Both files say macSteam wrote them; NotProton never writes to those folders. Remove deletes
+/// only what carries macSteam's marker.
 enum NotProton {
     static let projectURL=URL(string:"https://github.com/NotProtonNot/NotProton")!
     private static let fm=FileManager.default
@@ -25,14 +30,19 @@ enum NotProton {
     private static var library:URL { home.appendingPathComponent("Library/Application Support") }
     static var support:URL { library.appendingPathComponent("notproton") }
     static var steamTools:URL { library.appendingPathComponent("Steam/compatibilitytools.d") }
-    /// MacVolvo's own folder for this, apart from the worker's data folder.
-    static var ours:URL { library.appendingPathComponent("MacVolvo NotProton") }
-    private static var variantsFile:URL { support.appendingPathComponent("variants/macvolvo.conf") }
-    private static var pluginsFile:URL { support.appendingPathComponent("plugins/macvolvo.conf") }
-    private static let owner="Written by MacVolvo.app, which also removes it."
+    /// macSteam's own folder for this, apart from the worker's data folder.
+    static var ours:URL { library.appendingPathComponent("SteamDriver") }
+    private static var variantsFile:URL { support.appendingPathComponent("variants/steamdriver.conf") }
+    private static var pluginsFile:URL { support.appendingPathComponent("plugins/steamdriver.conf") }
+    /// The files' names before the rename; Migration.swift moves them to the names above.
+    static var legacyFiles:[(old:URL,new:URL)] {
+        [(support.appendingPathComponent("variants/macvolvo.conf"),variantsFile),
+         (support.appendingPathComponent("plugins/macvolvo.conf"),pluginsFile)]
+    }
+    private static let owner="Written by macSteam.app, which also removes it."
     /// The variant groups, each a dropdown in the Compatibility page; choices from both combine.
-    static let driverGroup="MacVolvo driver"
-    static let rendererGroup="MacVolvo renderer"
+    static let driverGroup="SteamDriver driver"
+    static let rendererGroup="SteamDriver renderer"
 
     /// One of NotProton's Steam tools, from its registry (notproton/tools: name, build, flavor,
     /// display name, tab-separated).
@@ -42,7 +52,7 @@ enum NotProton {
     }
     enum Status:Equatable {
         case notInstalled
-        /// NotProton's runners are builds MacVolvo has no driver for.
+        /// NotProton's runners are builds macSteam has no driver for.
         case unsupported(builds:[String])
         case available([Tool])
         case added([Tool])
@@ -89,13 +99,13 @@ enum NotProton {
     // MARK: The two files
     private static func driver(_ tool:Tool)->URL { ours.appendingPathComponent(tool.build+"/winemac.so") }
     static func variantsText(_ tools:[Tool])->String {
-        var text="# \(owner)\n# MacVolvo's driver and renderers over NotProton's CrossOver runner, chosen in a game's\n"
+        var text="# \(owner)\n# SteamDriver's driver and renderers over NotProton's CrossOver runner, chosen in a game's\n"
             + "# Properties › Compatibility (Developer): \(driverGroup) and \(rendererGroup).\n"
         for tool in tools {
             text += """
 
             [\(tool.variant)]
-            label = MacVolvo driver
+            label = SteamDriver driver
             variant = \(driverGroup)
             src = \(driver(tool).deletingLastPathComponent().path)
             dst = lib/wine/x86_64-unix
@@ -116,17 +126,18 @@ enum NotProton {
         let requires=tools.map { "requires = \(driver($0).path)" }.joined(separator:"\n")
         return """
         # \(owner)
-        # MacVolvo's mouse and game profiles in a game's Properties › Compatibility (Developer).
-        # The mouse needs the \(driverGroup) variant; a profile needs MacVolvo DXMT.
+        # macSteam's mouse and profiles in a game's Properties › Compatibility (Developer).
+        # The mouse needs the \(driverGroup) variant; a profile needs SteamDriver DXMT.
+        # Steam reads this file live. Removing it in NotProton's plugin page keeps it removed.
 
         [NOTPROTON_MACVOLVO_MOUSE]
-        label = MacVolvo mouse
-        description = Raw mouse input from MacVolvo’s driver, each click after the movement before it. Choose MacVolvo driver as a runner variant too.
+        label = SteamDriver mouse
+        description = Raw mouse input from macSteam’s driver, each click after the movement before it. Choose SteamDriver driver as a runner variant too.
         \(requires)
         \(toolLines)
         env = WINEMAC_MOUSELOOK=\(mouselook)
         env = WINEMAC_INPUT_VARIANT=precise
-        env = WINEMAC_RAW_STATUS=$HOME/Library/Application Support/MacVolvo NotProton/hid-status.json
+        env = WINEMAC_RAW_STATUS=$HOME/Library/Application Support/SteamDriver/hid-status.json
 
         [NOTPROTON_MACVOLVO_HIGH_PRECISION]
         label = High-precision
@@ -138,7 +149,7 @@ enum NotProton {
 
         [NOTPROTON_MACVOLVO_CLASSIC]
         label = Classic timing
-        description = The older mouse timing. Try it if MacVolvo mouse feels different to you.
+        description = The older mouse timing. Try it if SteamDriver mouse feels different to you.
         depends = NOTPROTON_MACVOLVO_MOUSE
         \(toolLines)
         env = WINEMAC_INPUT_VARIANT=classic
@@ -160,44 +171,81 @@ enum NotProton {
     }
 
     // MARK: Add, update, remove
-    /// Adds (or brings up to date) MacVolvo's driver, variant and rows for every supported runner.
-    static func add(resources:URL) throws {
+    /// What a write changed: nothing; only the driver or DXMT files (NotProton rebuilds its runner
+    /// copy from them at the next launch); rows too (Steam shows them at once); or the variants
+    /// (Steam shows them after a restart).
+    enum Change:Equatable { case none, files, rows, restart }
+    /// The player removed macSteam's plugin file (NotProton's plugin page moves it to the Trash)
+    /// while its variants stayed: the rows stay out until restoreRows.
+    static var rowsRemoved:Bool { owns(variantsFile) && !fm.fileExists(atPath:pluginsFile.path) }
+    /// Adds (or brings up to date) macSteam's driver, variant and rows for every supported runner.
+    /// Rows the player removed stay removed unless restoreRows.
+    @discardableResult static func add(resources:URL,restoreRows:Bool=false) throws -> Change {
         let tools=supported(resources)
-        guard !tools.isEmpty else { throw failure("NotProton has no CrossOver build this version of MacVolvo has a driver for.") }
-        // Refuse before writing anything when a file in MacVolvo's place isn't MacVolvo's.
+        guard !tools.isEmpty else { throw failure("NotProton has no CrossOver build this version of macSteam has a driver for.") }
+        // Refuse before writing anything when a file in macSteam's place isn't macSteam's.
         for file in [variantsFile,pluginsFile] where fm.fileExists(atPath:file.path) && !owns(file) {
-            throw failure("\(file.path) wasn't written by MacVolvo, so nothing was changed.")
+            throw failure("\(file.path) wasn't written by macSteam, so nothing was changed.")
         }
+        let rows=restoreRows || !rowsRemoved
+        var files=false
         for tool in tools {
-            try fm.createDirectory(at:driver(tool).deletingLastPathComponent(),withIntermediateDirectories:true)
-            try replace(driver(tool)) { try fm.copyItem(at:resources.appendingPathComponent("NotProton/\(tool.build)/winemac.so"),to:$0) }
-            try replace(dxmtTree(tool)) { try fm.copyItem(at:bundledDXMT(resources,tool),to:$0) }
+            let bundled=resources.appendingPathComponent("NotProton/\(tool.build)/winemac.so")
+            if !fm.contentsEqual(atPath:driver(tool).path,andPath:bundled.path) {
+                try fm.createDirectory(at:driver(tool).deletingLastPathComponent(),withIntermediateDirectories:true)
+                try replace(driver(tool)) { try fm.copyItem(at:bundled,to:$0) };files=true
+            }
+            if !fm.contentsEqual(atPath:dxmtTree(tool).path,andPath:bundledDXMT(resources,tool).path) {
+                try replace(dxmtTree(tool)) { try fm.copyItem(at:bundledDXMT(resources,tool),to:$0) };files=true
+            }
         }
         for file in [variantsFile,pluginsFile] { try fm.createDirectory(at:file.deletingLastPathComponent(),withIntermediateDirectories:true) }
-        try write(variantsText(tools),to:variantsFile)
-        try write(pluginsText(tools),to:pluginsFile)
+        let variants=variantsText(tools)
+        let restart=(try? String(contentsOf:variantsFile,encoding:.utf8)) != variants
+        if restart { try write(variants,to:variantsFile) }
+        let rowsChanged=rows && (try? String(contentsOf:pluginsFile,encoding:.utf8)) != pluginsText(tools)
+        if rowsChanged { try write(pluginsText(tools),to:pluginsFile) }
         removeEarlierTool()
+        return restart ? .restart : rowsChanged ? .rows : files ? .files : .none
     }
-    /// Removes only what carries MacVolvo's marker: the two files and MacVolvo's folder.
+    /// After a profile change: rewrites only the rows, which Steam reads live. Nothing when
+    /// macSteam isn't added or the player removed the rows.
+    @discardableResult static func writeRows(resources:URL) throws -> Change {
+        let tools=supported(resources)
+        guard owns(variantsFile) || owns(pluginsFile),!rowsRemoved,!tools.isEmpty else { return .none }
+        guard !fm.fileExists(atPath:pluginsFile.path) || owns(pluginsFile) else {
+            throw failure("\(pluginsFile.path) wasn't written by macSteam, so nothing was changed.")
+        }
+        let text=pluginsText(tools)
+        guard (try? String(contentsOf:pluginsFile,encoding:.utf8)) != text else { return .none }
+        try fm.createDirectory(at:pluginsFile.deletingLastPathComponent(),withIntermediateDirectories:true)
+        try write(text,to:pluginsFile)
+        return .rows
+    }
+    /// Removes only what carries macSteam's marker: the two files and macSteam's folder.
     static func remove() throws {
         for file in [variantsFile,pluginsFile] where owns(file) { try fm.removeItem(at:file) }
+        // add() makes these folders when NotProton hasn't yet; once empty they go too.
+        for folder in [variantsFile,pluginsFile].map({ $0.deletingLastPathComponent() })
+        where ((try? fm.contentsOfDirectory(atPath:folder.path)) ?? ["?"]).allSatisfy({ $0 == ".DS_Store" }) {
+            try? fm.removeItem(at:folder)
+        }
         removeEarlierTool()
         if fm.fileExists(atPath:ours.path) { try fm.removeItem(at:ours) }
     }
-    /// After an update of MacVolvo: puts its current driver and rows in place, if added.
-    /// Brings what's in Steam up to this copy of MacVolvo, in place. True when it changed anything,
-    /// which Steam only sees after a restart.
-    @discardableResult static func refresh(resources:URL)->Bool {
+    /// Brings what's in Steam up to this copy of macSteam, in place, if added; rows the player
+    /// removed stay removed.
+    @discardableResult static func refresh(resources:URL)->Change {
         // Deadlock can save Vulkan again from its Video settings; its profile keeps it on DirectX 11.
-        if installedProfiles.contains(.deadlock) { keepDeadlockOnDirectX11() }
-        guard case .added=status(resources),!isCurrent(resources:resources) else { return false }
-        return (try? add(resources:resources)) != nil
+        if Profiles.exists(Profiles.gameID(Profiles.deadlockAppID)) { keepDeadlockOnDirectX11() }
+        guard case .added=status(resources),!isCurrent(resources:resources) else { return .none }
+        return (try? add(resources:resources)) ?? .none
     }
-    /// Whether what's in place is what this copy of MacVolvo brings.
+    /// Whether what's in place is what this copy of macSteam brings.
     static func isCurrent(resources:URL)->Bool {
         let tools=supported(resources)
         return !tools.isEmpty && (try? String(contentsOf:variantsFile,encoding:.utf8)) == variantsText(tools)
-            && (try? String(contentsOf:pluginsFile,encoding:.utf8)) == pluginsText(tools)
+            && (rowsRemoved || (try? String(contentsOf:pluginsFile,encoding:.utf8)) == pluginsText(tools))
             && tools.allSatisfy { fm.contentsEqual(atPath:driver($0).path,andPath:resources.appendingPathComponent("NotProton/\($0.build)/winemac.so").path)
                 && fm.contentsEqual(atPath:dxmtTree($0).path,andPath:bundledDXMT(resources,$0).path) }
     }
@@ -211,7 +259,7 @@ enum NotProton {
     }
 
     // MARK: The mouse report
-    /// What MacVolvo's driver said about the High-precision mouse in the latest game that used it
+    /// What macSteam's driver said about the High-precision mouse in the latest game that used it
     /// (WINEMAC_RAW_STATUS; cocoa_app.m hid_write_status). macOS gives Input Monitoring to the app
     /// that started the game, Steam here, and only the game can ask.
     struct MouseStatus:Decodable, Equatable {
@@ -230,8 +278,14 @@ enum NotProton {
     }
 
     // MARK: Files
+    /// The marker before the rename (Brand.swift); files with it are macSteam's too.
+    private static let legacyOwners=["Written by MacVolvo.app, which also removes it.",
+                                     "Written by SteamDriver.app, which also removes it."]
+    /// Whether macSteam (under any of its names) wrote the file (Uninstaller).
+    static func ownsFile(_ file:URL)->Bool { owns(file) }
     private static func owns(_ file:URL)->Bool {
-        (try? String(contentsOf:file,encoding:.utf8))?.hasPrefix("# "+owner) == true
+        guard let text=try? String(contentsOf:file,encoding:.utf8) else { return false }
+        return ([owner]+legacyOwners).contains { text.hasPrefix("# "+$0) }
     }
     private static func write(_ text:String, to url:URL) throws {
         try replace(url) { try Data(text.utf8).write(to:$0) }
@@ -245,6 +299,6 @@ enum NotProton {
         } catch { try? fm.removeItem(at:temp);throw error }
     }
     static func failure(_ message:String)->NSError {
-        NSError(domain:"MacVolvo.NotProton",code:1,userInfo:[NSLocalizedDescriptionKey:message])
+        NSError(domain:"macSteam.NotProton",code:1,userInfo:[NSLocalizedDescriptionKey:message])
     }
 }

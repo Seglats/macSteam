@@ -250,6 +250,45 @@ WINE_PATCHES = [
     # the dump says "exited; never returned from <call>" instead of a forever-growing duration
     # (C17 043c); plus an ERR with all four fd numbers when a reply read fails fatally.
     'wine-ntdll-syscall-log-exited-mark.patch',
+    # WINE_SYSCALL_LOG: name the fd_cache_mutex holder in the stuck dump (the C17 quit hang is
+    # one thread wedged inside that section; every NtClose and fd-cache fill queues behind it),
+    # and pthread_exit_wrapper releases the section if the dying thread holds it.
+    'wine-ntdll-fdcache-holder-name.patch',
+    # C04: bound and name the winemac WineEventQueue lock.  NtUserPeekMessage drains driver
+    # events under it on message-pump threads; a stuck or dead holder froze the GameThread
+    # until Unreal's hang watchdog crashed the game (2026-11-15, alt-tab).  os_unfair_lock
+    # (owner-death-safe), holder wtid + hold time in ERRs, 100 ms bounded acquire in the drain.
+    'wine-macdrv-event-queue-lock.patch',
+    # Export syscall_log_current_wtid from ntdll.so (visibility("default"), the CW Hack 24067
+    # mechanism) so the winemac driver can name lock holders with the syscall log's tids.
+    'wine-ntdll-syscall-log-wtid-export.patch',
+    # C06: cross-module diag notes (winemac -> stuck dump): window/focus state, OnMainThread/
+    # query rendezvous, main-thread block execution; plus the fd-cache holder duration wrap fix.
+    'wine-ntdll-diag-notes-fdcache-wrapfix.patch',
+    # C06: window/focus state tracking + main-thread rendezvous diagnostics in the mac driver,
+    # off by default (WINEDEBUG=+macdrv via macdrv_ui_on); ERR only above 10 s waits.
+    'wine-macdrv-focus-rendezvous-log.patch',
+    # Review fixes for the two above and -133 (2026-11-22): a per-wait registry replaces the
+    # shared wait slots (a later short wait erased a stuck waiter's record) and state lines
+    # are tear-free with real ages.
+    'wine-ntdll-diag-waits-registry.patch',
+    # Review fixes: the queue lock is upstream's NSLock again (os_unfair_lock aborts the
+    # process when its owner died - tested); query waits logged in the right direction (main
+    # thread waits on the window's thread); main-thread/unlogged holders named; visibility,
+    # display sleep, screen saver, screen lock; own channel WINEDEBUG=+macfinals_ui.
+    'wine-macdrv-diag-review-fixes.patch',
+    # C18: log why the game takes the mouse and keyboard back after Cmd-Tab (frontmost app,
+    # activation cause incl. the click delivered with the activation, mouselook/clip/cursor,
+    # whether the game window is still uncovered after deactivation). Logging only.
+    'wine-macdrv-input-steal-log.patch',
+    # C18 fix: the REC-45 menu bar/Dock hiding showed them again from the background on
+    # deactivation; WindowServer answered that with SetMenuBars and made the game frontmost
+    # again (the input steal). Presentation options are now left alone while inactive.
+    'wine-macdrv-c18-presentation-inactive.patch',
+    # Game shortcuts: macOS system shortcuts the user lists (WINEMAC_GAME_SHORTCUTS, the run
+    # script's STEAMDRIVER_SHORTCUTS) are switched off in WindowServer while the game is in
+    # front, so the keys reach the game; recorded per process so the run script can restore.
+    'wine-macdrv-game-shortcuts.patch',
 ]
 
 

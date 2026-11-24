@@ -1,0 +1,230 @@
+From: MacFinals
+Subject: [PATCH] winemac.drv: chosen macOS system shortcuts go to the game while it is in front
+
+Rasmus (2026-11-24): keys like Ctrl+Space should reach the game, Moonlight-style, without
+Accessibility, and nothing should change until the user lists what the game takes over.
+
+WINEMAC_GAME_SHORTCUTS="ctrl+space,cmd+shift+tab" (the run script's STEAMDRIVER_SHORTCUTS)
+names key combinations. WindowServer checks its system shortcuts before an app sees a key,
+so when the app becomes active every enabled WindowServer shortcut (symbolic hotkey) with a
+listed combination is switched off (CGSSetSymbolicHotKeyEnabled, resolved with dlsym; no
+permission needed, tested 2026-11-24) and switched back on when the app resigns or exits.
+Unset or empty: nothing is touched.
+
+That switch is session-wide and outlives the process (tested: an id switched off by a
+process that exits stays off). So the ids are written to WINEMAC_GAME_SHORTCUTS_RECORD/<pid>
+before anything is switched off - nothing is switched off if that fails - and the Steam
+tool's run script switches recorded ids back on after the game ends, however it ended
+(osascript's JavaScript bridge, same call). Only ids that were enabled are switched off, and
+only those are switched back on. System Settings and the shortcut preferences are never
+written. Not covered: other apps' own global hotkeys (Carbon RegisterEventHotKey), and what
+macOS never gives up (Force Quit, Lock Screen).
+
+WINEDEBUG=+macfinals_ui traces which macOS shortcut each combination switched off, combos no
+enabled shortcut uses ("the game already gets it"), and each hand-back. Unknown combinations
+and a missing record folder are errors.
+---
+--- a/dlls/winemac.drv/cocoa_app.m
++++ b/dlls/winemac.drv/cocoa_app.m
+@@ -1103,6 +1103,177 @@
+     }
+     else
+         ui_state(0, "app active (frontmost)");
++}
++
++/*
++ * Game shortcuts (WINEMAC_GAME_SHORTCUTS="ctrl+space,cmd+shift+tab"): the macOS system
++ * shortcuts listed there go to the game instead of macOS while this app is frontmost.
++ * Nothing is changed unless the user lists a combo.  WindowServer checks its system
++ * shortcuts before an app sees a key, so each listed one is switched off in WindowServer
++ * (CGSSetSymbolicHotKeyEnabled, SkyLight; no permission needed) when the app becomes active
++ * and back on when it resigns or exits.  That switch is session-wide and outlives the
++ * process (tested 2026-11-24), so before switching anything off the ids are written to
++ * WINEMAC_GAME_SHORTCUTS_RECORD/<pid>; the Steam tool's run script switches recorded ids
++ * back on after the game ends however it ended.  System Settings and the shortcut
++ * preferences are never written.  Other apps' own global hotkeys are not covered.
++ */
++typedef CGError (*gs_set_enabled_fn)(int, bool);
++typedef bool (*gs_is_enabled_fn)(int);
++typedef CGError (*gs_get_value_fn)(int, uint16_t*, uint16_t*, uint32_t*);
++
++#define GS_MAX 64
++#define GS_MODS 0x1e0000 /* shift 0x20000, control 0x40000, option 0x80000, command 0x100000 */
++
++static struct { uint16_t keycode; uint32_t mods; char name[32]; } gs_wanted[GS_MAX];
++static int gs_wanted_count = -1;
++static int gs_off[GS_MAX];
++static int gs_off_count;
++static gs_set_enabled_fn gs_set_enabled;
++static gs_is_enabled_fn gs_is_enabled;
++static gs_get_value_fn gs_get_value;
++
++static int gs_keycode(const char *key)
++{
++    static const struct { const char *name; int code; } keys[] = {
++        {"a",0},{"s",1},{"d",2},{"f",3},{"h",4},{"g",5},{"z",6},{"x",7},{"c",8},{"v",9},{"b",11},
++        {"q",12},{"w",13},{"e",14},{"r",15},{"y",16},{"t",17},{"1",18},{"2",19},{"3",20},{"4",21},
++        {"6",22},{"5",23},{"=",24},{"9",25},{"7",26},{"-",27},{"8",28},{"0",29},{"]",30},{"o",31},
++        {"u",32},{"[",33},{"i",34},{"p",35},{"return",36},{"enter",36},{"l",37},{"j",38},{"'",39},
++        {"k",40},{";",41},{"\\",42},{",",43},{"/",44},{"n",45},{"m",46},{".",47},{"tab",48},
++        {"space",49},{"`",50},{"grave",50},{"delete",51},{"backspace",51},{"esc",53},{"escape",53},
++        {"f1",122},{"f2",120},{"f3",99},{"f4",118},{"f5",96},{"f6",97},{"f7",98},{"f8",100},
++        {"f9",101},{"f10",109},{"f11",103},{"f12",111},{"f13",105},{"f14",107},{"f15",113},
++        {"f16",106},{"f17",64},{"f18",79},{"f19",80},{"f20",90},{"home",115},{"end",119},
++        {"pageup",116},{"pagedown",121},{"left",123},{"right",124},{"down",125},{"up",126},
++    };
++    for (unsigned int i = 0; i < sizeof(keys) / sizeof(keys[0]); i++)
++        if (!strcasecmp(key, keys[i].name)) return keys[i].code;
++    return -1;
++}
++
++static void gs_parse(void)
++{
++    const char *list = getenv("WINEMAC_GAME_SHORTCUTS");
++    char buf[1024], *combo, *save = NULL;
++
++    gs_wanted_count = 0;
++    if (!list || !*list) return;
++    gs_set_enabled = (gs_set_enabled_fn)dlsym(RTLD_DEFAULT, "CGSSetSymbolicHotKeyEnabled");
++    gs_is_enabled = (gs_is_enabled_fn)dlsym(RTLD_DEFAULT, "CGSIsSymbolicHotKeyEnabled");
++    gs_get_value = (gs_get_value_fn)dlsym(RTLD_DEFAULT, "CGSGetSymbolicHotKeyValue");
++    if (!gs_set_enabled || !gs_is_enabled || !gs_get_value)
++    {
++        ERR(@"game shortcuts: this macOS lacks the WindowServer shortcut calls; %s ignored\n", list);
++        return;
++    }
++    snprintf(buf, sizeof(buf), "%s", list);
++    for (combo = strtok_r(buf, ",; ", &save); combo && gs_wanted_count < GS_MAX; combo = strtok_r(NULL, ",; ", &save))
++    {
++        char part[64], *p, *save2 = NULL, *key = NULL;
++        uint32_t mods = 0;
++        int code;
++
++        snprintf(part, sizeof(part), "%s", combo);
++        for (p = strtok_r(part, "+", &save2); p; p = strtok_r(NULL, "+", &save2))
++        {
++            if (!strcasecmp(p, "shift")) mods |= 0x20000;
++            else if (!strcasecmp(p, "ctrl") || !strcasecmp(p, "control")) mods |= 0x40000;
++            else if (!strcasecmp(p, "alt") || !strcasecmp(p, "opt") || !strcasecmp(p, "option")) mods |= 0x80000;
++            else if (!strcasecmp(p, "cmd") || !strcasecmp(p, "command")) mods |= 0x100000;
++            else key = p;
++        }
++        if (!key || (code = gs_keycode(key)) < 0)
++        {
++            ERR(@"game shortcuts: %s is not a key combination this knows; skipped\n", combo);
++            continue;
++        }
++        gs_wanted[gs_wanted_count].keycode = code;
++        gs_wanted[gs_wanted_count].mods = mods;
++        snprintf(gs_wanted[gs_wanted_count].name, sizeof(gs_wanted[0].name), "%s", combo);
++        gs_wanted_count++;
++    }
++}
++
++static void gs_record_path(char *path, size_t size)
++{
++    const char *dir = getenv("WINEMAC_GAME_SHORTCUTS_RECORD");
++    if (dir && *dir) snprintf(path, size, "%s/%d", dir, (int)getpid());
++    else path[0] = 0;
++}
++
++static void gs_restore(void)
++{
++    char path[1024];
++    int i;
++
++    if (!gs_off_count) return;
++    for (i = 0; i < gs_off_count; i++) gs_set_enabled(gs_off[i], true);
++    UI_LOG(@"game shortcuts: %d macOS shortcut(s) handed back to macOS\n", gs_off_count);
++    gs_off_count = 0;
++    gs_record_path(path, sizeof(path));
++    if (path[0]) unlink(path);
++}
++
++static void gs_take(void)
++{
++    char path[1024];
++    int ids[GS_MAX], count = 0, id, w;
++    BOOL found[GS_MAX] = {0};
++
++    if (gs_wanted_count < 0) gs_parse();
++    if (!gs_wanted_count || gs_off_count) return;
++    for (id = 0; id < 512 && count < GS_MAX; id++)
++    {
++        uint16_t ch = 0, keycode = 0;
++        uint32_t mods = 0;
++
++        if (gs_get_value(id, &ch, &keycode, &mods) != kCGErrorSuccess || !gs_is_enabled(id)) continue;
++        for (w = 0; w < gs_wanted_count; w++)
++        {
++            if (gs_wanted[w].keycode == keycode && gs_wanted[w].mods == (mods & GS_MODS))
++            {
++                ids[count++] = id;
++                found[w] = TRUE;
++                UI_LOG(@"game shortcuts: %s goes to the game (macOS shortcut %d off while frontmost)\n",
++                       gs_wanted[w].name, id);
++                break;
++            }
++        }
++    }
++    for (w = 0; w < gs_wanted_count; w++)
++        if (!found[w]) UI_LOG(@"game shortcuts: no enabled macOS shortcut uses %s; the game already gets it\n",
++                              gs_wanted[w].name);
++    if (!count) return;
++
++    /* Record first: if the process dies with the shortcuts off, the run script restores them. */
++    gs_record_path(path, sizeof(path));
++    if (path[0])
++    {
++        FILE *f = fopen(path, "w");
++        if (f)
++        {
++            for (w = 0; w < count; w++) fprintf(f, "%d\n", ids[w]);
++            fclose(f);
++        }
++        else
++            ERR(@"game shortcuts: cannot write %s; shortcuts left with macOS\n", path);
++        if (!f) return;
++    }
++    else
++    {
++        static BOOL warned;
++        if (!warned) ERR(@"game shortcuts: WINEMAC_GAME_SHORTCUTS_RECORD unset; a crash would leave them off\n");
++        warned = TRUE;
++    }
++    {
++        static BOOL hooked;
++        if (!hooked) atexit(gs_restore);
++        hooked = TRUE;
++    }
++    for (w = 0; w < count; w++)
++    {
++        if (gs_set_enabled(ids[w], false) == kCGErrorSuccess) gs_off[gs_off_count++] = ids[w];
++    }
+ }
+ 
+ /* NSWorkspace: another app became frontmost; name it in the state line */
+@@ -4503,6 +4674,7 @@
+         }];
+         ui_power_update();
+         macdrv_ui_note_app_active();
++        if ([NSApp isActive]) gs_take();
+ 
+         [nc addObserverForName:NSWindowDidBecomeKeyNotification
+                         object:nil
+@@ -4989,6 +5161,7 @@
+     - (void)applicationDidBecomeActive:(NSNotification *)notification
+     {
+         macdrv_ui_note_app_active();
++        gs_take();
+         NSNumber* displayID;
+         NSDictionary* modesToRealize = [latentDisplayModes autorelease];
+ 
+@@ -5071,6 +5244,7 @@
+     - (void)applicationDidResignActive:(NSNotification *)notification
+     {
+         macdrv_ui_note_app_active();
++        gs_restore();
+         macdrv_event* event;
+         WineEventQueue* queue;
+ 

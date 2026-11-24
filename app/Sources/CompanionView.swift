@@ -1,38 +1,50 @@
 import SwiftUI
 import AppKit
 
-/// The main window: MacVolvo for NotProton (NotProton.swift). Like NotProton's own app it installs,
-/// updates and checks, and launches nothing. MacVolvo is an extra option in each game's
+/// The main window: macSteam for NotProton (NotProton.swift). Like NotProton's own app it installs,
+/// updates and checks, and launches nothing. macSteam is an extra option in each game's
 /// Compatibility settings in Steam, next to NotProton's CrossOver, which it doesn't replace.
-/// Nothing here installs Steam or a Wine environment of MacVolvo's own; Advanced switches to that
+/// Nothing here installs Steam or a Wine environment of macSteam's own; Advanced switches to that
 /// (SetupView) for troubleshooting.
 struct CompanionView:View {
     @Bindable var model:AppModel
     @State private var advanced=false
     @State private var confirmRemove=false
     @State private var confirmWindowsSteam=false
+    @State private var choosingGame=false
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     var body:some View {
         GeometryReader { geometry in
             ScrollView {
                 VStack(spacing:0) {
                     VStack(spacing:20) {
+                        // The wordmark is the name; no second "macSteam" as text under it.
                         Wordmark(height:84)
-                        LauncherHeading(title:"MacVolvo for NotProton",subtitle:"Mouse and display fixes for the games you play in the macOS Steam app.")
                         statusPanel
                         VStack(spacing:12) { actions }
                         if !model.notice.isEmpty { LauncherNotice(text:model.notice) }
-                        if !model.gameTools.isEmpty { gameToolsPanel }
+                        gameToolsPanel
                         renderersPanel
                         profilesPanel
                         mousePanel
+                        keyOverridesPanel
                         advancedPanel
                     }.frame(maxWidth:LauncherStyle.contentWidth).padding(.top,34)
                     Spacer(minLength:28)
                     VersionStatus(model:model).padding(.bottom,12)
-                    HStack(spacing:12) {
-                        FooterTile(title:"Help & FAQ",symbol:"questionmark.circle") { model.makeReport();model.sheet = .help }
-                        FooterTile(title:"About",symbol:"info.circle") { model.sheet = .about }
+                    VStack(spacing:12) {
+                        HStack(spacing:12) {
+                            FooterTile(title:"About",symbol:"info.circle") { model.sheet = .about }
+                            FooterTile(title:"Help & FAQ",symbol:"questionmark.circle") { model.makeReport();model.sheet = .help }
+                        }
+                        // Everything macSteam and its game tools created (UninstallSheet, Uninstaller.swift).
+                        Button(role:.destructive) { model.sheet = .uninstall } label: {
+                            Label("Uninstall \(Brand.name)…",systemImage:"trash").font(LauncherStyle.font(13,.medium))
+                                .frame(maxWidth:.infinity,minHeight:36)
+                        }.buttonStyle(.borderless).hoverGrow().foregroundStyle(.red.opacity(0.9))
+                            .background(.red.opacity(0.10),in:RoundedRectangle(cornerRadius:LauncherStyle.radius,style:.continuous))
+                            .disabled(model.uninstall == .working)
+                            .help("Remove \(Brand.name) and everything it set up")
                     }.frame(maxWidth:LauncherStyle.contentWidth).padding(.bottom,24)
                 }.padding(.horizontal,36).frame(maxWidth:.infinity).frame(minHeight:geometry.size.height)
             }.scrollIndicators(.hidden)
@@ -48,17 +60,19 @@ struct CompanionView:View {
                 .onDisappear { model.updateSheetClosed() }
             case .whatsNew: WhatsNewSheet()
             case .settings: SettingsSheet(model:model)
+            case .keyOverrides: KeyOverridesSheet(model:model)
+            case .profileSettings: ProfileSettingsSheet(model:model)
             }
         }
-        .alert("Remove MacVolvo from Steam?",isPresented:$confirmRemove) {
+        .alert("Remove macSteam from Steam?",isPresented:$confirmRemove) {
             Button("Cancel",role:.cancel) {}
             Button("Remove",role:.destructive,action:model.removeFromNotProton)
-        } message: { Text("Removes MacVolvo’s options from your games’ Compatibility settings, and its driver. NotProton, CrossOver, Steam and your games stay as they are; games that used MacVolvo run on NotProton’s CrossOver as before.") }
+        } message: { Text("Removes macSteam’s options from your games’ Compatibility settings, and its driver. NotProton, CrossOver, Steam and your games stay as they are; games that used macSteam run on NotProton’s CrossOver as before.") }
         .alert("Restart Steam now?",isPresented:$model.askRestartSteam) {
             Button("Later",role:.cancel) {}
             Button("Restart Steam",action:model.restartSteam).keyboardShortcut(.defaultAction)
         } message: { Text("Steam reads \(Brand.name)’s options when it starts, so it shows the change after a restart. Steam is asked to quit as usual; if a game or download is running, it stays open.") }
-        .alert("Use MacVolvo’s own Steam?",isPresented:$confirmWindowsSteam) {
+        .alert("Use macSteam’s own Steam?",isPresented:$confirmWindowsSteam) {
             Button("Cancel",role:.cancel) {}
             Button("Continue") { model.useWindowsSteam(true) }
         } message: { Text("For troubleshooting. \(Brand.name) installs Windows Steam in a Wine environment of its own, apart from NotProton and the macOS Steam app. It needs about 70 GB per game. You can come back here at any time.") }
@@ -84,13 +98,11 @@ struct CompanionView:View {
                     StatusLine(.warning,"\(Brand.name)’s driver is built for CrossOver 26.3. NotProton uses \(builds.isEmpty ? "no CrossOver yet; open NotProton to set it up" : builds.joined(separator:", ")).")
                 case .available(let tools):
                     StatusLine(.good,"NotProton is installed, with \(names(tools,\.display)).")
-                    StatusLine(.pending,"\(Brand.name)’s options aren’t in Steam yet.")
                 case .added(let tools):
                     StatusLine(.good,"NotProton is installed, with \(names(tools,\.display)).")
-                    if model.notProtonCurrent {
-                        StatusLine(.good,"\(Brand.name)’s options are in your games’ Compatibility settings, up to date.")
-                    } else {
-                        StatusLine(.warning,"\(Brand.name)’s options are in Steam, but this version of \(Brand.name) has newer files: choose Update.")
+                    if model.rowsRemoved {
+                        StatusLine(.warning,"The SteamDriver rows (mouse and profiles) were removed in NotProton’s plugin page, so \(Brand.name) leaves them out. The driver and renderers are still there.",
+                                   button:"Put Rows Back",action:model.restoreRows)
                     }
                 }
             }
@@ -100,58 +112,83 @@ struct CompanionView:View {
         tools.map { "\u{201C}\($0[keyPath:key])\u{201D}" }.joined(separator:" and ")
     }
 
+    /// The first step, large at the top until it's done: get NotProton, then add the SteamDriver
+    /// tool (also in Game runtimes, where it stays once added).
     @ViewBuilder private var actions:some View {
-        switch model.notProton {
-        case .notInstalled:
+        if case .notInstalled=model.notProton {
             LauncherPrimaryAction(title:"Get NotProton") { NSWorkspace.shared.open(NotProton.projectURL) }
-        case .unsupported:
-            EmptyView()
-        case .available:
-            LauncherPrimaryAction(title:"Add to Steam",action:model.addToNotProton).keyboardShortcut(.defaultAction)
-        case .added:
-            if !model.notProtonCurrent {
-                LauncherPrimaryAction(title:"Update",action:model.addToNotProton).keyboardShortcut(.defaultAction)
-            }
-            LauncherNotice(text:"In Steam, open a game’s Properties › Compatibility and keep NotProton’s CrossOver. Under Developer, choose \u{201C}MacVolvo driver\u{201D}, a \u{201C}MacVolvo renderer\u{201D} if you like (with the matching graphics backend), and turn on \u{201C}MacVolvo mouse\u{201D}. To use them for every game, save them as NotProton’s defaults for CrossOver 26.3.",symbol:"gamecontroller")
-            HStack(spacing:18) {
-                Button(model.restartingSteam ? "Restarting Steam…" : "Restart Steam",action:model.restartSteam)
-                    .buttonStyle(.borderless).font(LauncherStyle.font(13,.medium)).disabled(model.restartingSteam)
-                Button("Remove from Steam…",role:.destructive) { confirmRemove=true }
-                    .buttonStyle(.borderless).foregroundStyle(.red).font(LauncherStyle.font(13,.medium))
-            }
+        } else if let tool=model.gameTools.first,model.gameToolStates[tool.id] ?? .notInstalled == .notInstalled {
+            LauncherPrimaryAction(title:model.installingGameTool != nil ? "Adding SteamDriver…" : "Add to Steam") { model.installGameTool(tool) }
+                .keyboardShortcut(.defaultAction).disabled(model.installingGameTool != nil)
         }
     }
 
-    // MARK: Game runtimes (GameTools.swift)
+    // MARK: Game runtimes: SteamDriver for every game (NotProton.swift), and games with a Wine of
+    // their own (GameTools.swift)
     private var gameToolsPanel:some View {
         LauncherPanel(inset:16) {
-            VStack(alignment:.leading,spacing:10) {
+            VStack(alignment:.leading,spacing:12) {
                 VStack(alignment:.leading,spacing:2) {
                     Text("Game runtimes").font(LauncherStyle.font(14,.semibold))
-                    Text("Games that need a Wine of their own get it as a compatibility tool in Steam. In the game’s Properties › Compatibility, turn on \u{201C}Force the use of a specific Steam Play compatibility tool\u{201D} and choose it. Uses NotProton’s Steam Play and Steam bridge.")
+                    Text("How your games run in Steam. SteamDriver is \(Brand.name)’s own Wine, for every game: in a game’s Properties › Compatibility, turn on \u{201C}Force the use of a specific Steam Play compatibility tool\u{201D} and choose \u{201C}SteamDriver\u{201D}. SteamDriver on CrossOver instead adds \(Brand.name)’s driver, renderer and mouse options to NotProton’s CrossOver, for games that run better there.")
                         .font(LauncherStyle.font(12)).foregroundStyle(.secondary).fixedSize(horizontal:false,vertical:true)
                 }
                 if case .notInstalled=model.notProton {
                     StatusLine(.problem,"Needs NotProton: install it and open it once first.")
                 }
                 ForEach(model.gameTools) { tool in
-                    HStack(alignment:.center,spacing:12) {
-                        VStack(alignment:.leading,spacing:2) {
-                            Text(tool.game).font(LauncherStyle.font(13,.semibold))
-                            Text(gameToolDetail(tool)).font(LauncherStyle.font(12)).foregroundStyle(.secondary).fixedSize(horizontal:false,vertical:true)
-                        }
-                        Spacer(minLength:12)
-                        gameToolButtons(tool)
-                    }
+                    runtimeRow(tool.display,subtitle:"Global",detail:gameToolDetail(tool)) { gameToolButtons(tool) }
                 }
+                runtimeRow("SteamDriver on CrossOver",subtitle:"NotProton options",detail:steamDriverDetail) { steamDriverButtons }
+                if case .added=model.notProton {
+                    Button(model.restartingSteam ? "Restarting Steam…" : "Restart Steam",action:model.restartSteam)
+                        .buttonStyle(.borderless).hoverGrow().font(LauncherStyle.font(12,.medium)).disabled(model.restartingSteam)
+                }
+            }
+        }
+    }
+    private func runtimeRow<Buttons:View>(_ title:String,subtitle:String,detail:String,@ViewBuilder buttons:()->Buttons)->some View {
+        HStack(alignment:.center,spacing:12) {
+            VStack(alignment:.leading,spacing:2) {
+                HStack(spacing:6) {
+                    Text(title).font(LauncherStyle.font(13,.semibold))
+                    Text(subtitle).font(LauncherStyle.font(11,.semibold)).foregroundStyle(.secondary)
+                }
+                Text(detail).font(LauncherStyle.font(12)).foregroundStyle(.secondary).fixedSize(horizontal:false,vertical:true)
+            }
+            Spacer(minLength:12)
+            buttons()
+        }
+    }
+    private var steamDriverDetail:String {
+        switch model.notProton {
+        case .notInstalled: return "macSteam’s Mac driver, renderers and mouse options on NotProton’s CrossOver. Needs NotProton."
+        case .unsupported(let builds): return "Built for CrossOver 26.3; NotProton uses \(builds.isEmpty ? "no CrossOver yet (open NotProton to set it up)" : builds.joined(separator:", "))."
+        case .available: return "macSteam’s Mac driver, renderers and mouse options on NotProton’s CrossOver. Not in Steam yet."
+        case .added:
+            if !model.notProtonCurrent { return "In Steam; this version of \(Brand.name) has newer files." }
+            return "In Steam. In a game’s Properties › Compatibility, keep NotProton’s CrossOver; under Developer choose \u{201C}SteamDriver driver\u{201D}, a \u{201C}SteamDriver renderer\u{201D} if you like, and turn on \u{201C}SteamDriver mouse\u{201D}. Save them as NotProton’s defaults for CrossOver 26.3 to use them everywhere."
+        }
+    }
+    @ViewBuilder private var steamDriverButtons:some View {
+        switch model.notProton {
+        case .notInstalled, .unsupported: EmptyView()
+        case .available:
+            Button("Add to Steam",action:model.addToNotProton).buttonStyle(.bordered).hoverGrow().buttonBorderShape(.capsule)
+        case .added:
+            HStack(spacing:10) {
+                if !model.notProtonCurrent {
+                    Button("Update",action:model.addToNotProton).buttonStyle(.bordered).hoverGrow().buttonBorderShape(.capsule)
+                }
+                Button("Remove") { confirmRemove=true }.buttonStyle(.borderless).hoverGrow().foregroundStyle(.red).font(LauncherStyle.font(12,.medium))
             }
         }
     }
     private func gameToolDetail(_ tool:GameTools.Tool)->String {
         if model.installingGameTool==tool.id { return "Installing \u{201C}\(tool.display)\u{201D}…" }
         switch model.gameToolStates[tool.id] ?? .notInstalled {
-        case .notInstalled: return "Not in Steam yet. Adds \u{201C}\(tool.display)\u{201D} (runtime \(tool.runtime))."
-        case .installed: return "\u{201C}\(tool.display)\u{201D} is in Steam (runtime \(tool.runtime))."
+        case .notInstalled: return "\(Brand.name)’s own Wine for every game: Apple D3DMetal, key combo overrides, the High-precision mouse. Not in Steam yet (runtime \(tool.runtime))."+(GameTools.legacyInstalled ? " Replaces the older \u{201C}SteamDriver: THE FINALS\u{201D} tool; choose SteamDriver for THE FINALS again afterwards." : "")
+        case .installed: return "In Steam (runtime \(tool.runtime)). Choose \u{201C}SteamDriver\u{201D} as a game’s compatibility tool."+(model.gptk.version == nil ? " It needs Apple’s Game Porting Toolkit, below under Renderers." : "")
         case .outdated(let old): return "In Steam with runtime \(old); this version of \(Brand.name) has \(tool.runtime)."
         case .foreign: return "Steam has a \u{201C}\(tool.id)\u{201D} tool \(Brand.name) didn’t install; it is left as it is."
         }
@@ -160,16 +197,33 @@ struct CompanionView:View {
         let busy=model.installingGameTool != nil
         switch model.gameToolStates[tool.id] ?? .notInstalled {
         case .notInstalled:
-            Button("Add to Steam") { model.installGameTool(tool) }.buttonStyle(.bordered).buttonBorderShape(.capsule).disabled(busy)
+            Button("Add to Steam") { model.installGameTool(tool) }.buttonStyle(.bordered).hoverGrow().buttonBorderShape(.capsule).disabled(busy)
         case .outdated:
             HStack(spacing:10) {
-                Button("Update") { model.installGameTool(tool) }.buttonStyle(.bordered).buttonBorderShape(.capsule).disabled(busy)
-                Button("Remove") { model.removeGameTool(tool) }.buttonStyle(.borderless).foregroundStyle(.red).disabled(busy)
+                Button("Update") { model.installGameTool(tool) }.buttonStyle(.bordered).hoverGrow().buttonBorderShape(.capsule).disabled(busy)
+                Button("Remove") { model.removeGameTool(tool) }.buttonStyle(.borderless).hoverGrow().foregroundStyle(.red).disabled(busy)
             }
         case .installed:
-            Button("Remove") { model.removeGameTool(tool) }.buttonStyle(.borderless).foregroundStyle(.red).font(LauncherStyle.font(12,.medium)).disabled(busy)
+            Button("Remove") { model.removeGameTool(tool) }.buttonStyle(.borderless).hoverGrow().foregroundStyle(.red).font(LauncherStyle.font(12,.medium)).disabled(busy)
         case .foreign:
             EmptyView()
+        }
+    }
+
+    // MARK: Apple's Game Porting Toolkit (NotProtonExtras.gptkStatus)
+    @ViewBuilder private var gptkStatus:some View {
+        let steps="1. Download Game Porting Toolkit 4 from [Apple](https://developer.apple.com/games/game-porting-toolkit/).\n2. Open the Game Porting Toolkit, then open \u{201C}Evaluation environment for Windows games\u{201D} in it.\n3. Copy its redist folder into the folder that Show Folder opens."
+        switch model.gptk {
+        case .ready(let version):
+            StatusLine(.good,"Apple D3DMetal \(version), from your Game Porting Toolkit. THE FINALS uses it; NotProton games can choose it under SteamDriver renderer, with D3DMetal as the graphics backend.")
+        case .empty:
+            StatusLine(.pending,"\(Brand.name) doesn’t include Apple D3DMetal (DirectX 12). To add it:\n"+steps,markdown:true)
+        case .missing(let files):
+            StatusLine(.warning,"The Game Porting Toolkit folder is incomplete: \(files.prefix(3).joined(separator:", ").replacingOccurrences(of:"_",with:"\\_"))\(files.count>3 ? " and \(files.count-3) more" : "").\n"+steps,markdown:true)
+        case .notApple(let file):
+            StatusLine(.problem,"\(file) in the Game Porting Toolkit folder isn’t signed by Apple, so nothing uses it. Copy the redist folder again from Apple’s image.")
+        case .tooOld(let version):
+            StatusLine(.warning,"D3DMetal \(version) is too old: THE FINALS needs Game Porting Toolkit 4 or later.")
         }
     }
 
@@ -179,52 +233,75 @@ struct CompanionView:View {
             VStack(alignment:.leading,spacing:12) {
                 VStack(alignment:.leading,spacing:2) {
                     Text("Renderers").font(LauncherStyle.font(14,.semibold))
-                    Text("Offered per game under \u{201C}MacVolvo renderer\u{201D}, next to NotProton’s own. Pick the matching graphics backend for the game too.")
+                    Text("Offered per game under \u{201C}SteamDriver renderer\u{201D}, next to NotProton’s own. Pick the matching graphics backend for the game too.")
                         .font(LauncherStyle.font(12)).foregroundStyle(.secondary).fixedSize(horizontal:false,vertical:true)
                 }
-                StatusLine(.good,"MacVolvo DXMT: included with \(Brand.name). Use it with DXMT as the graphics backend.")
-                if let version=model.d3dmetalVersion {
-                    HStack(alignment:.top,spacing:12) {
-                        StatusLine(.good,"Apple D3DMetal \(version), from your Game Porting Toolkit. Use it with D3DMetal as the graphics backend.")
-                        Button("Remove",action:model.removeGPTK).buttonStyle(.borderless).foregroundStyle(.red).font(LauncherStyle.font(12,.medium))
-                    }
-                    Button("Choose Another Game Porting Toolkit…",action:model.chooseGPTK).buttonStyle(.bordered).buttonBorderShape(.capsule).controlSize(.small)
-                        .disabled(model.importingGPTK)
-                } else if let version=model.runnerD3DMetal {
-                    StatusLine(.good,"Apple D3DMetal \(version): included with NotProton’s CrossOver. Choose D3DMetal as the graphics backend and keep MacVolvo renderer on Default, which is NotProton’s own D3DMetal. It gets an entry of its own only if you import a newer Game Porting Toolkit.")
-                    Button(model.importingGPTK ? "Checking Apple’s signature and copying D3DMetal…" : "Use a Newer Game Porting Toolkit…",action:model.chooseGPTK)
-                        .buttonStyle(.bordered).buttonBorderShape(.capsule).controlSize(.small).disabled(model.importingGPTK)
-                } else {
-                    StatusLine(.pending,model.importingGPTK ? "Checking Apple’s signature and copying D3DMetal…" :
-                        "Apple D3DMetal: uses your own Game Porting Toolkit, which Apple doesn’t let \(Brand.name) include. Download it from Apple, then choose its \u{201C}Evaluation environment for Windows games\u{201D} image.",
-                               button:model.importingGPTK ? nil : "Choose Game Porting Toolkit…",action:model.chooseGPTK)
-                }
+                StatusLine(.good,"SteamDriver DXMT: included with \(Brand.name). Use it with DXMT as the graphics backend.")
+                gptkStatus
+                Button { model.showGPTKFolder() } label: { Label("Show Folder",systemImage:"folder") }
+                    .buttonStyle(.bordered).hoverGrow().buttonBorderShape(.capsule).controlSize(.small)
+                    .help("Open the folder Apple’s files go in")
             }
         }
     }
 
-    // MARK: Game profiles
+    // MARK: Profiles (Profiles.swift)
     private var profilesPanel:some View {
         LauncherPanel(inset:16) {
             VStack(alignment:.leading,spacing:10) {
                 VStack(alignment:.leading,spacing:2) {
-                    Text("Game profiles").font(LauncherStyle.font(14,.semibold))
-                    Text("Each one you install appears as a row for that game in Steam’s Compatibility settings. They tune MacVolvo DXMT.")
+                    Text("Profiles").font(LauncherStyle.font(14,.semibold))
+                    Text("Renderer settings for every DX11 or DX12 game, or for one game, which wins over the global one.")
                         .font(LauncherStyle.font(12)).foregroundStyle(.secondary).fixedSize(horizontal:false,vertical:true)
                 }
-                ForEach(NotProton.Profile.allCases) { profile in
+                ForEach(model.profiles) { profile in
                     HStack(alignment:.center,spacing:12) {
+                        Image(systemName:profile.isGlobal ? "square.stack.3d.up" : "gamecontroller").foregroundStyle(.secondary).frame(width:18)
                         VStack(alignment:.leading,spacing:2) {
-                            Text(profile.title).font(LauncherStyle.font(13,.semibold))
-                            Text(profile.detail).font(LauncherStyle.font(12)).foregroundStyle(.secondary).fixedSize(horizontal:false,vertical:true)
+                            HStack(spacing:6) {
+                                Text(profile.name).font(LauncherStyle.font(13,.semibold)).lineLimit(1)
+                                if !profile.isGlobal { Text(profile.kind.title).font(LauncherStyle.font(11,.semibold)).foregroundStyle(.secondary) }
+                            }
+                            Text(profileDetail(profile)).font(LauncherStyle.font(12)).foregroundStyle(.secondary).fixedSize(horizontal:false,vertical:true)
                         }
                         Spacer(minLength:12)
-                        Toggle(profile.title,isOn:Binding(get:{ model.profiles.contains(profile) },set:{ model.setProfile(profile,$0) }))
-                            .labelsHidden().toggleStyle(.switch).tint(LauncherStyle.accent)
+                        if profile.kind == .dx11 {
+                            Button("Settings…") { model.editProfile(profile) }.buttonStyle(.borderless).hoverGrow().font(LauncherStyle.font(12,.medium))
+                        }
+                        Button { model.removeProfile(profile) } label: { Image(systemName:"minus.circle.fill").foregroundStyle(.secondary) }
+                            .buttonStyle(.borderless).hoverGrow().help("Remove \(profile.name)")
                     }
+                }
+                HStack(spacing:10) {
+                    ForEach(Profiles.Kind.allCases) { kind in
+                        if !model.profiles.contains(where: { $0.id==Profiles.globalID(kind) }) {
+                            Button { model.addGlobalProfile(kind) } label: { Label("Global \(kind.title)",systemImage:"plus") }
+                                .buttonStyle(.bordered).hoverGrow().buttonBorderShape(.capsule).controlSize(.small)
+                        }
+                    }
+                    Button { choosingGame=true } label: { Label("Game Profile…",systemImage:"plus") }
+                        .buttonStyle(.bordered).hoverGrow().buttonBorderShape(.capsule).controlSize(.small)
+                        .popover(isPresented:$choosingGame,arrowEdge:.bottom) {
+                            GameProfilePicker(taken:Set(model.profiles.compactMap(\.appID))) { game,kind in
+                                choosingGame=false;model.addGameProfile(game,kind)
+                            }
+                        }
                 }
             }
         }
+    }
+    private func profileDetail(_ p:Profiles.Profile)->String {
+        // A game whose last launch through SteamDriver loaded the other Direct3D.
+        if let app=p.appID,let seen=Profiles.detected(app),seen != p.kind {
+            return "Its last launch used \(seen.title), so this \(p.kind.title) profile doesn’t apply. Remove it and add a \(seen.title) profile."
+        }
+        if p.kind == .dx12 {
+            return (p.isGlobal ? "Every DX12 game. " : "")+"No settings for D3DMetal yet; MetalFX upscaling will go here."
+        }
+        let row=p.isGlobal ? "\u{201C}SteamDriver DX11 profile\u{201D}" : "\u{201C}SteamDriver profile: \(p.name)\u{201D}"
+        let settings=Profiles.settings(p.id).map { Profiles.summary($0).prefix(1).uppercased()+Profiles.summary($0).dropFirst() } ?? "No settings file"
+        let shown=NotProton.rowProfiles().contains(p) ? "Row in Steam: \(row)" : "Not in Steam: more than \(NotProton.maxProfileRows) profiles"
+        return "\(settings). \(shown)."
     }
 
     // MARK: Mouse
@@ -237,6 +314,24 @@ struct CompanionView:View {
         }
     }
 
+    // MARK: Key combo overrides (KeyOverridesSheet)
+    private var keyOverridesPanel:some View {
+        LauncherPanel(inset:16) {
+            HStack(alignment:.center,spacing:12) {
+                VStack(alignment:.leading,spacing:2) {
+                    Text("Key combo overrides").font(LauncherStyle.font(14,.semibold))
+                    Text(keyOverridesSummary).font(LauncherStyle.font(12)).foregroundStyle(.secondary).fixedSize(horizontal:false,vertical:true)
+                }
+                Spacer(minLength:12)
+                Button("Key Combos…") { model.sheet = .keyOverrides }.buttonStyle(.bordered).hoverGrow().buttonBorderShape(.capsule)
+            }
+        }
+    }
+    private var keyOverridesSummary:String {
+        let count=KeyOverrides.profilesWithCombos().reduce(0) { $0+KeyOverrides.load($1).count }
+        return KeyOverrides.blurb+(count==0 ? "" : " \(count) set up now.")
+    }
+
     // MARK: Advanced
     private var advancedPanel:some View {
         LauncherPanel(inset:16) {
@@ -247,7 +342,7 @@ struct CompanionView:View {
                         Image(systemName:"chevron.down").font(.system(size:10,weight:.semibold)).rotationEffect(.degrees(advanced ? 180 : 0))
                         Spacer(minLength:0)
                     }.contentShape(Rectangle())
-                }.buttonStyle(.plain)
+                }.buttonStyle(.plain).hoverGrow()
                 if advanced {
                     HStack(alignment:.center,spacing:12) {
                         VStack(alignment:.leading,spacing:2) {
@@ -256,10 +351,66 @@ struct CompanionView:View {
                                 .font(LauncherStyle.font(12)).foregroundStyle(.secondary).fixedSize(horizontal:false,vertical:true)
                         }
                         Spacer(minLength:12)
-                        Button("Open…") { confirmWindowsSteam=true }.buttonStyle(.bordered).buttonBorderShape(.capsule).disabled(model.busy)
+                        Button("Open…") { confirmWindowsSteam=true }.buttonStyle(.bordered).hoverGrow().buttonBorderShape(.capsule).disabled(model.busy)
                     }
                 }
             }
         }
+    }
+}
+
+/// Picks the game for a new game profile: installed Steam games and those started with a game
+/// tool, searchable, with DX11 or DX12 (known games preset).
+struct GameProfilePicker:View {
+    let taken:Set<String>
+    let pick:(Profiles.Game,Profiles.Kind)->Void
+    @State private var games:[Profiles.Game]=[]
+    @State private var search=""
+    @State private var kind:Profiles.Kind = .dx11
+    @State private var chosen:Profiles.Game?
+    private var matches:[Profiles.Game] {
+        let query=search.trimmingCharacters(in:.whitespaces)
+        let open=games.filter { !taken.contains($0.appID) }
+        guard !query.isEmpty else { return open }
+        return open.filter { $0.name.localizedCaseInsensitiveContains(query) || $0.appID.hasPrefix(query) }
+    }
+    var body:some View {
+        VStack(alignment:.leading,spacing:8) {
+            TextField("Search games or type an app id",text:$search).textFieldStyle(.roundedBorder)
+                .onSubmit { if let first=matches.first { choose(first) } else if Profiles.valid(search) { choose(Profiles.Game(appID:search,name:"App \(search)")) } }
+            ScrollView {
+                VStack(alignment:.leading,spacing:2) {
+                    ForEach(matches) { game in
+                        Button { choose(game) } label: {
+                            HStack(spacing:8) {
+                                Image(systemName:"checkmark").font(.system(size:11,weight:.bold)).opacity(chosen==game ? 1 : 0)
+                                VStack(alignment:.leading,spacing:1) {
+                                    Text(game.name).font(LauncherStyle.font(13,.medium)).lineLimit(1)
+                                    Text("App \(game.appID)"+(game.detected.map { " · \($0.title), detected" } ?? "")).font(LauncherStyle.font(11)).foregroundStyle(.secondary)
+                                }
+                                Spacer(minLength:0)
+                            }.padding(.horizontal,6).padding(.vertical,5).contentShape(Rectangle())
+                        }.buttonStyle(.plain).hoverGrow()
+                    }
+                    if matches.isEmpty {
+                        Text(Profiles.valid(search) ? "Press Return to use app \(search)." : games.isEmpty ? "No Steam games found." : "No game matches \u{201C}\(search)\u{201D}.")
+                            .font(LauncherStyle.font(11)).foregroundStyle(.secondary).padding(6)
+                    }
+                }.frame(maxWidth:.infinity,alignment:.leading)
+            }.frame(maxHeight:260).fixedSize(horizontal:false,vertical:true)
+            Divider()
+            HStack {
+                Picker("",selection:$kind) { ForEach(Profiles.Kind.allCases) { Text($0.title).tag($0) } }
+                    .pickerStyle(.segmented).labelsHidden().frame(width:120)
+                Spacer()
+                Button("Add") { if let chosen { pick(chosen,kind) } }.buttonStyle(.borderedProminent).hoverGrow().disabled(chosen==nil)
+                    .keyboardShortcut(.defaultAction)
+            }
+        }.padding(12).frame(width:340)
+            .onAppear { games=Profiles.steamGames() }
+    }
+    private func choose(_ game:Profiles.Game) {
+        chosen=game
+        kind=Profiles.suggestedKind(game.appID)
     }
 }

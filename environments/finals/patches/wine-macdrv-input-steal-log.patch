@@ -1,0 +1,315 @@
+From: MacFinals
+Subject: [PATCH] winemac.drv: log why the game takes the mouse and keyboard back after Cmd-Tab (C18)
+
+Rasmus (2026-11-24): after Cmd-Tab away from THE FINALS the game keeps taking the cursor and
+keyboard; it only stops after switching to an app with a window on the same screen and then
+moving to another monitor. Read of the driver: after deactivation mouselook releases the
+pointer where it froze it (over the game window, by design), the game window stays the top
+window on its screen (seen live: layer 0, first in the stack while another app was active),
+and acceptsFirstMouse returns YES - so the next click there both re-activates the game and
+is delivered into it, and UE re-captures the mouse. Not yet seen in one capture; this logs
+each link with timestamps. Logging only, by Rasmus's choice: behaviour is unchanged.
+
+On the macfinals_ui channel (WINEDEBUG=+macfinals_ui), each line now carries a wall-clock
+time and the pid:
+- which app became frontmost (NSWorkspace), also in the stuck dump's state line
+  ("app inactive; frontmost: VSCodium (pid 7397)");
+- why the app became active: "activated by a click on hwnd X, also delivered into the game"
+  (a mouse-down within 0.5 s of the activation), "activated by a driver request", or plain;
+  every driver activation request (tryToActivateIgnoringOtherApps) with its call stack;
+- mouselook on/off, and whether the pointer was released over the game window;
+- cursor hidden/shown for the client, and cursor clip on/off (handler, app state);
+- 0.5 s after each deactivation: whether the game window is still uncovered on its screen
+  and whether the pointer is over it (window server metadata, CGWindowListCopyWindowInfo).
+---
+--- a/dlls/winemac.drv/cocoa_app.m
++++ b/dlls/winemac.drv/cocoa_app.m
+@@ -31,6 +31,9 @@
+ #import <IOKit/hidsystem/IOHIDLib.h>
+ #include <dlfcn.h>
+ #include <os/lock.h>
++#include <sys/time.h>
++#include <time.h>
++#include <unistd.h>
+ #import <objc/runtime.h>
+ 
+ #pragma GCC diagnostic ignored "-Wdeclaration-after-statement"
+@@ -1060,6 +1063,25 @@
+ 
+ /* Reads AppKit's actual state rather than trusting the caller: applicationDidBecomeActive:
+    is also called by hand, on the display-capture path whether or not the app is active. */
++/* C18: why the app became active - a click macOS delivered into the game along with the
++ * activation (acceptsFirstMouse), a driver activation request, or neither (Cmd-Tab, Dock) */
++static double ui_became_active;   /* systemUptime of an activation not yet attributed, or 0 */
++static double ui_driver_request;  /* systemUptime of the last driver activation request */
++
++static void ui_note_inactive(NSRunningApplication *front)
++{
++    char buf[160];
++
++    if (front && front.processIdentifier != getpid())
++        snprintf(buf, sizeof(buf), "app inactive; frontmost: %s (pid %d)",
++                 front.localizedName ? front.localizedName.UTF8String : "?", (int)front.processIdentifier);
++    else
++        snprintf(buf, sizeof(buf), "app inactive (another app is frontmost)");
++    ui_state(0, buf);
++}
++
++/* Reads AppKit's actual state rather than trusting the caller: applicationDidBecomeActive:
++   is also called by hand, on the display-capture path whether or not the app is active. */
+ void macdrv_ui_note_app_active(void)
+ {
+     static int last = -1;
+@@ -1067,11 +1089,133 @@
+ 
+     if (active == last) return;
+     last = active;
+-    ui_state(0, active ? "app active (frontmost)" : "app inactive (another app is frontmost)");
++    if (!active)
++    {
++        ui_became_active = 0;
++        ui_note_inactive([[NSWorkspace sharedWorkspace] frontmostApplication]);
++        return;
++    }
++    ui_became_active = [[NSProcessInfo processInfo] systemUptime];
++    if (ui_driver_request && ui_became_active - ui_driver_request < 1.0)
++    {
++        ui_became_active = 0;
++        ui_state(0, "app active (frontmost) - activated by a driver request");
++    }
++    else
++        ui_state(0, "app active (frontmost)");
+ }
+ 
++/* NSWorkspace: another app became frontmost; name it in the state line */
++static void ui_note_frontmost(NSRunningApplication *app)
++{
++    if (!app || app.processIdentifier == getpid() || [NSApp isActive]) return;
++    ui_note_inactive(app);
++}
++
++/* local mouse-down monitor: attribute an activation to the click that came with it */
++static void ui_note_mouse_down(NSEvent *event)
++{
++    double now;
++    void *hwnd;
++    char buf[160];
++
++    if (!ui_became_active) return;
++    now = [[NSProcessInfo processInfo] systemUptime];
++    if (now - ui_became_active > 0.5)
++    {
++        ui_became_active = 0;
++        return;
++    }
++    ui_became_active = 0;
++    hwnd = [event.window isKindOfClass:[WineWindow class]] ? macdrv_get_window_hwnd((macdrv_window)event.window) : NULL;
++    snprintf(buf, sizeof(buf), "app active (frontmost) - activated by a click on hwnd %p, also delivered into the game", hwnd);
++    ui_state(0, buf);
++}
++
++/* tryToActivateIgnoringOtherApps: the driver asks macOS to make this app frontmost */
++static void ui_note_activation_request(BOOL ignore)
++{
++    ui_driver_request = [[NSProcessInfo processInfo] systemUptime];
++    if (macdrv_ui_on)
++    {
++        NSArray *stack = [NSThread callStackSymbols];
++        NSMutableString *frames = [NSMutableString string];
++        NSUInteger i;
++
++        for (i = 1; i < MIN((NSUInteger)7, stack.count); i++)
++            [frames appendFormat:@"\n    %@", stack[i]];
++        LogTrace("activation", @"the driver requests app activation (ignoringOtherApps %d), called from:%@\n",
++                 ignore, frames);
++    }
++}
++
++static void *ui_game_hwnd;
++
++/* half a second after a deactivation (time for the new app to raise its windows): is the
++   game window still uncovered on its screen, and is the pointer over it? */
++static void ui_check_cover(void)
++{
++    NSWindow *game = nil;
++    CFArrayRef list;
++    CGRect gameBounds = CGRectNull;
++    NSString *cover = nil;
++    BOOL found = NO, pointerOver;
++    pid_t self_pid = getpid();
++
++    if (!macdrv_ui_on || !ui_game_hwnd || [NSApp isActive]) return;
++    for (NSWindow *w in [NSApp windows])
++    {
++        if ([w isKindOfClass:[WineWindow class]] && macdrv_get_window_hwnd((macdrv_window)w) == ui_game_hwnd)
++        {
++            game = w;
++            break;
++        }
++    }
++    if (!game || ![game isVisible]) return;
++
++    list = CGWindowListCopyWindowInfo(kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements,
++                                      kCGNullWindowID);
++    if (!list) return;
++    for (NSDictionary *info in (NSArray *)list)
++    {
++        CGRect bounds;
++        if ([info[(id)kCGWindowNumber] integerValue] != game.windowNumber) continue;
++        if (CGRectMakeWithDictionaryRepresentation((CFDictionaryRef)info[(id)kCGWindowBounds], &bounds))
++        {
++            gameBounds = bounds;
++            found = YES;
++        }
++        break;
++    }
++    if (found)
++    {
++        /* front to back: a normal-layer window of another app over the game's bounds */
++        for (NSDictionary *info in (NSArray *)list)
++        {
++            CGRect bounds;
++            if ([info[(id)kCGWindowNumber] integerValue] == game.windowNumber) break;
++            if ([info[(id)kCGWindowLayer] integerValue] != 0) continue;
++            if ([info[(id)kCGWindowOwnerPID] intValue] == self_pid) continue;
++            if (!CGRectMakeWithDictionaryRepresentation((CFDictionaryRef)info[(id)kCGWindowBounds], &bounds)) continue;
++            if (bounds.size.width < 50 || bounds.size.height < 50) continue;
++            if (CGRectIntersectsRect(bounds, gameBounds))
++            {
++                cover = info[(id)kCGWindowOwnerName];
++                break;
++            }
++        }
++    }
++    pointerOver = NSPointInRect([NSEvent mouseLocation], [game frame]);
++    LogTrace("cover", @"0.5 s after deactivation: game window hwnd %p is %@; the pointer is %s it\n", ui_game_hwnd,
++             !found ? @"not on screen" :
++             cover ? [NSString stringWithFormat:@"covered (at least partly) by %@", cover] :
++                     @"on top of its screen (no other app's window over it)",
++             pointerOver ? "over" : "not over");
++    CFRelease(list);
++}
++
+ static void *ui_key_hwnd;   /* the current key window, NULL if none */
+-static void *ui_game_hwnd;  /* the most recent key window, kept after it resigns */
++/* ui_game_hwnd (above): the most recent key window, kept after it resigns */
+ 
+ void macdrv_ui_note_key_window(void *hwnd, int became_key)
+ {
+@@ -2519,6 +2663,7 @@
+             {
+                 [NSCursor hide];
+                 cursorHidden = TRUE;
++                UI_LOG(@"cursor hidden for the client (app %s)\n", [NSApp isActive] ? "active" : "inactive");
+             }
+ 
+             if (!cursorIsCurrent)
+@@ -2531,6 +2676,7 @@
+             {
+                 [NSCursor unhide];
+                 cursorHidden = FALSE;
++                UI_LOG(@"cursor shown again for the client (app %s)\n", [NSApp isActive] ? "active" : "inactive");
+             }
+         }
+         else
+@@ -2544,6 +2690,8 @@
+             {
+                 [NSCursor unhide];
+                 cursorHidden = FALSE;
++                UI_LOG(@"cursor shown again: pointer left the client's windows (app %s)\n",
++                       [NSApp isActive] ? "active" : "inactive");
+             }
+         }
+     }
+@@ -2831,6 +2979,10 @@
+ 
+         if (![clipCursorHandler startClippingCursor:rect])
+             return FALSE;
++        UI_LOG(@"cursor clip on: %.0f,%.0f %.0fx%.0f (%s handler, app %s)\n", rect.origin.x, rect.origin.y,
++               rect.size.width, rect.size.height,
++               [clipCursorHandler isKindOfClass:[WineConfinementClipCursorHandler class]] ? "confinement" : "event tap",
++               [NSApp isActive] ? "active" : "inactive");
+ 
+         // A frozen mouselook pointer stays put; Wine's position is clipped by Wine.
+         if (!mouselookWindow)
+@@ -2849,6 +3001,7 @@
+ 
+         if (![clipCursorHandler stopClippingCursor])
+             return FALSE;
++        UI_LOG(@"cursor clip off (app %s)\n", [NSApp isActive] ? "active" : "inactive");
+ 
+         lastSetCursorPositionTime = [[NSProcessInfo processInfo] systemUptime];
+ 
+@@ -2961,6 +3114,8 @@
+         position = macdrv_v1_canvas_point(window, position, FALSE);
+ 
+         mouselookWindow = [window retain];
++        UI_LOG(@"mouselook on: hwnd %p, pointer frozen at %.0f,%.0f%s\n", macdrv_get_window_hwnd((macdrv_window)window),
++               location.x, location.y, mouselookWarpDelta.x || mouselookWarpDelta.y ? " (warped to the window centre)" : "");
+         mouselookRemainderX = mouselookRemainderY = 0;
+         os_unfair_lock_lock(&mouselook_lock);
+         mouselook_position = CGPointMake(floor(position.x), floor(position.y));
+@@ -2993,7 +3148,13 @@
+         {
+             CGPoint physical = macdrv_v1_canvas_point(window, position, TRUE);
+             [self setCursorPosition:cgpoint_mac_from_win(physical)];
++            UI_LOG(@"mouselook off: hwnd %p, app active, pointer moved to Wine's cursor position\n",
++                   macdrv_get_window_hwnd((macdrv_window)window));
+         }
++        else
++            UI_LOG(@"mouselook off: hwnd %p, app %s, pointer released where it was (%s the window)\n",
++                   macdrv_get_window_hwnd((macdrv_window)window), [NSApp isActive] ? "active" : "inactive",
++                   NSPointInRect([NSEvent mouseLocation], [window frame]) ? "over" : "not over");
+ 
+         [window release];
+         mouselookRemainderX = mouselookRemainderY = 0;
+@@ -4319,6 +4480,15 @@
+                      usingBlock:^(NSNotification *note){ ui_screen_locked = 1; ui_power_update(); }];
+         [dnc addObserverForName:@"com.apple.screenIsUnlocked" object:nil queue:nil
+                      usingBlock:^(NSNotification *note){ ui_screen_locked = 0; ui_power_update(); }];
++        /* C18: which app took the front, and the click (if any) that brought us back */
++        [wsnc addObserverForName:NSWorkspaceDidActivateApplicationNotification object:nil queue:nil
++                      usingBlock:^(NSNotification *note){ ui_note_frontmost(note.userInfo[NSWorkspaceApplicationKey]); }];
++        [NSEvent addLocalMonitorForEventsMatchingMask:NSEventMaskLeftMouseDown | NSEventMaskRightMouseDown |
++                                                      NSEventMaskOtherMouseDown
++                                              handler:^NSEvent *(NSEvent *event){
++            ui_note_mouse_down(event);
++            return event;
++        }];
+         ui_power_update();
+         macdrv_ui_note_app_active();
+ 
+@@ -4551,6 +4721,7 @@
+         NSDictionary *userInfo;
+ 
+         if ([NSApp isActive]) return;  /* Nothing to do. */
++        ui_note_activation_request(ignore);
+ 
+         if (!ignore ||
+             ![NSApplication instancesRespondToSelector:@selector(yieldActivationToApplication:)])
+@@ -4891,6 +5062,10 @@
+         macdrv_event* event;
+         WineEventQueue* queue;
+ 
++        if (macdrv_ui_on)
++            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 500 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
++                ui_check_cover();
++            });
+         activation_resync_needed = TRUE;
+         cocoa_stats.resigns++;
+         macdrv_v1_canvas_app_resigned();
+@@ -5125,7 +5300,13 @@
+     @autoreleasepool
+     {
+         NSString* message = [[NSString alloc] initWithFormat:format arguments:args];
+-        fprintf(stderr, "trace:%s:%s", func, [message UTF8String]);
++        struct timeval tv;
++        struct tm tm;
++
++        gettimeofday(&tv, NULL);
++        localtime_r(&tv.tv_sec, &tm);
++        fprintf(stderr, "trace:macfinals_ui:%s %02d:%02d:%02d.%03d pid %d: %s", func, tm.tm_hour, tm.tm_min,
++                tm.tm_sec, (int)(tv.tv_usec / 1000), (int)getpid(), [message UTF8String]);
+         [message release];
+     }
+     va_end(args);

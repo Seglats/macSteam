@@ -191,6 +191,7 @@ python3 scripts/build_portable_runtime.py --workspace $W --jobs 4   # Wine; incr
 python3 scripts/assemble_portable_runtime.py --workspace $W \
   --identity "MacFinals Signing" --version macfinals-N
 python3 scripts/add_nt_hook.py --workspace $W --base-version macfinals-N --version macfinals-N+1
+python3 scripts/unbundle_gptk.py --workspace $W --base-version macfinals-N+1 --version macfinals-N+2
 # assemble also builds d3d12_layer/ via build.sh (MinGW-w64 GCC + the workspace winebuild);
 # it needs the wine-build tree the source builds produced, so run it after they finish
 DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
@@ -198,7 +199,16 @@ DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
   --runtime-archive $W/artifacts/macfinals-N+1.tar.gz --output runtime/build/MacFinals-M.app
 ```
 
-`N+1` means the next free number, written out, and `M` is the next free app number. **Do not
+`N+1` means the next free number, written out, and `M` is the next free app number.
+**What macSteam ships is the `unbundle_gptk.py` runtime (`N+2`)** (since `macfinals-144`,
+2026-11-24): it carries none of Apple's files. Each one becomes a link into `lib/apple-gptk`,
+which the Steam tool's run script points at the player's own Game Porting Toolkit
+(`~/Library/Application Support/SteamDriver/GPTK`, the contents of `redist/lib`, installed or
+checked by macSteam). Apple's files and the d3d12 layer are unchanged. The probe-checked route:
+`d3d12_factory_probe.exe` creates a device through the layer and Apple's d3d12.dll on 144.
+`tests/finals_bisect/launch_main.sh` still runs the runtime it is given, so for local testing
+use the `N+1` runtime (with Apple's files) or link `lib/apple-gptk` to `gptk/gptk/redist/lib`
+yourself. **Do not
 skip `add_nt_hook.py`.** An assembled runtime has no hook and signs the Wine executables with
 the hardened runtime, which makes dyld strip the insertion, so the app would silently ship
 without the NT fix. It adds `tests/rosetta_nt/hooklib.dylib` and re-signs those executables ad hoc.
@@ -244,6 +254,7 @@ variables, no switch files.
 | `macfinals_hook` | `tests/rosetta_nt/hooklib.c` (parses WINEDEBUG itself with Wine's rules: it runs before ntdll) | counter dumps every 2.4 s, `/tmp/rosetta-re/hook-<pid>.log`, payload ring capture |
 | `macfinals_dx12` | `d3d12_layer/layer.c` (through ntdll's `__wine_dbg_*`) | every rewritten shader and pipeline; **warn** = pipeline creation ≥ 50 ms, with thread name and epoch time |
 | `macfinals_scan` | hooklib's arena scan at process exit | trace class only; heavy, own channel like relay |
+| `macfinals_ui` | `dlls/winemac.drv` (C06 patches; `macdrv_ui_on`, `LogTrace`) | every change of app active / key window / game-window visibility / display sleep, screen saver, screen lock, and Cocoa-main-thread waits over 20 ms (OnMainThread, queries); C18 activation causes and menu bar/Dock changes; game shortcuts taken/handed back (`STEAMDRIVER_SHORTCUTS`). The stuck dump's `ui state` / `ui wait` lines need no channel; only waits > 10 s ERR by default |
 
 Only our output: `WINEDEBUG=-all,+macfinals_hook,+macfinals_dx12` (a named channel always beats
 `all`, whatever the order); one process only: `Discovery.exe:+macfinals_dx12`. Channel names are

@@ -9,6 +9,6 @@ enum WhatsNew {
         ("checkmark.circle","Wine session cleanup",
          "Temporary launch requests are reaped, and closing Steam waits for its remaining Wine services to exit."),
         ("rectangle.expand.vertical","Deadlock display issue remains under investigation",
-         "UI and click positions may shift after changing video settings. Try closing Deadlock, turning off Fullscreen in MacVolvo and relaunching at a resolution that fits your display."),
+         "UI and click positions may shift after changing video settings. Try closing Deadlock, turning off Fullscreen in macSteam and relaunching at a resolution that fits your display."),
     ]
 }

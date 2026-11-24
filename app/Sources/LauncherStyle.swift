@@ -25,18 +25,32 @@ enum LauncherStyle {
         // Chakra Petch runs small next to SF Pro at the same point size.
         return .custom(face,fixedSize:size*1.08)
     }
-    static func ground(_ scheme:ColorScheme) -> Color {
-        scheme == .dark ? .black : .white
-    }
+    /// macSteam is always dark (Main.swift sets the dark appearance; the system theme doesn't
+    /// apply, Rasmus 2026-11-24): a blue ground like Steam's logo, dark navy at the top to a
+    /// lighter blue at the bottom, a little darker than Steam's own gradient.
+    static let groundTop=Color(red:0.020,green:0.035,blue:0.094)      // #05091a
+    static let groundMiddle=Color(red:0.035,green:0.098,blue:0.212)   // #091936
+    static let groundBottom=Color(red:0.063,green:0.220,blue:0.384)   // #103862
+    static func ground(_ scheme:ColorScheme) -> Color { groundMiddle }
+    /// Panels: translucent dark navy, so the gradient shows through.
     static func surface(_ scheme:ColorScheme) -> Color {
-        scheme == .dark ? Color(white:0.08) : Color(white:0.96)
+        Color(red:0.02,green:0.05,blue:0.12).opacity(0.55)
     }
 }
 struct LauncherBackground: View {
-    @Environment(\.colorScheme) private var scheme
+    /// The gradient's axis leans π/20 (9°) off vertical, so its bands slope down to the left;
+    /// worked out from the real size so the angle holds in any window or sheet.
+    static let slope=Double.pi/20
     var body:some View {
-        LauncherStyle.ground(scheme)
-            .ignoresSafeArea().allowsHitTesting(false).accessibilityHidden(true)
+        GeometryReader { geometry in
+            let w=max(geometry.size.width,1),h=max(geometry.size.height,1)
+            let dx=tan(Self.slope)*h/w/2
+            LinearGradient(stops:[.init(color:LauncherStyle.groundTop,location:0),
+                                  .init(color:LauncherStyle.groundMiddle,location:0.55),
+                                  .init(color:LauncherStyle.groundBottom,location:1)],
+                           startPoint:UnitPoint(x:0.5-dx,y:0),endPoint:UnitPoint(x:0.5+dx,y:1))
+        }
+        .ignoresSafeArea().allowsHitTesting(false).accessibilityHidden(true)
     }
 }
 struct AppArtwork: View {
@@ -86,7 +100,7 @@ struct LauncherPrimaryAction: View {
     let action:()->Void
     var body:some View {
         Button(action:action) { Text(title).font(LauncherStyle.font(15,.semibold)) }
-            .buttonStyle(LauncherActionStyle())
+            .buttonStyle(LauncherActionStyle()).hoverGrow()
     }
 }
 /// "Open Steam": the hero action with a neutral game-controller symbol, so it reads as
@@ -101,7 +115,7 @@ struct ClientAction: View {
                 Image(systemName:"gamecontroller.fill").font(.system(size:15,weight:.semibold)).accessibilityHidden(true)
                 Text(title).font(LauncherStyle.font(15,.semibold))
             }
-        }.buttonStyle(secondary ? LauncherActionStyle(fill:Color.primary.opacity(0.1),text:.primary) : LauncherActionStyle())
+        }.buttonStyle(secondary ? LauncherActionStyle(fill:Color.primary.opacity(0.1),text:.primary) : LauncherActionStyle()).hoverGrow()
     }
 }
 /// Stops what the launcher is doing (the launching screen's Cancel).
@@ -110,7 +124,7 @@ struct LauncherCancelAction: View {
     let action:()->Void
     var body:some View {
         Button(action:action) { Text(title).font(LauncherStyle.font(15,.semibold)) }
-            .buttonStyle(LauncherActionStyle())
+            .buttonStyle(LauncherActionStyle()).hoverGrow()
     }
 }
 private struct LauncherActionStyle: ButtonStyle {
@@ -140,7 +154,7 @@ struct LauncherNotice: View {
             VStack(alignment:.leading,spacing:12) {
                 Text(text).lineSpacing(3).fixedSize(horizontal:false,vertical:true)
                 if let action {
-                    Button(action.title,action:action.run).buttonStyle(.bordered).buttonBorderShape(.capsule).foregroundStyle(.primary)
+                    Button(action.title,action:action.run).buttonStyle(.bordered).hoverGrow().buttonBorderShape(.capsule).foregroundStyle(.primary)
                 }
             }
         } icon: { Image(systemName:symbol) }
@@ -162,4 +176,20 @@ struct SheetHero: View {
             LauncherHeading(title:title,subtitle:subtitle,compact:true)
         }
     }
+}
+
+/// Buttons in the app grow 3 % while the pointer is over them (added after every .buttonStyle).
+/// Disabled ones stay as they are; with Reduce Motion the size changes without animating.
+struct HoverGrow:ViewModifier {
+    @State private var hovering=false
+    @Environment(\.isEnabled) private var enabled
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    func body(content:Content)->some View {
+        content.scaleEffect(hovering && enabled ? 1.03 : 1)
+            .animation(reduceMotion ? nil : .easeOut(duration:0.12),value:hovering && enabled)
+            .onHover { hovering=$0 }
+    }
+}
+extension View {
+    func hoverGrow()->some View { modifier(HoverGrow()) }
 }

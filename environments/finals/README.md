@@ -20,7 +20,7 @@ All paths in this folder's docs are relative to `environments/finals/`, except
 | Build: dependencies, Wine, assemble, hook | [`scripts/`](scripts/), [`tests/rosetta_nt/build_hook.sh`](tests/rosetta_nt/build_hook.sh) |
 | d3d12 layer (skin fix, pipeline timing) | [`d3d12_layer/`](d3d12_layer/) |
 | Rosetta hook and its history | [`tests/rosetta_nt/`](tests/rosetta_nt/), [`ROSETTA_NT_APPROACH.md`](ROSETTA_NT_APPROACH.md) |
-| Running the game from macOS Steam (compatibility tool "SteamDriver: THE FINALS") | [`compat-tool/`](compat-tool/README.md) |
+| Running the game from macOS Steam (compatibility tool "SteamDriver", formerly "SteamDriver: THE FINALS") | [`compat-tool/`](compat-tool/README.md) |
 | Running the game outside the app, logs | [`tests/finals_bisect/launch_main.sh`](tests/finals_bisect/launch_main.sh) |
 | Windows probes | [`tests/windows_probe/`](tests/windows_probe/) |
 

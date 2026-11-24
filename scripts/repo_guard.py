@@ -12,19 +12,26 @@ import sys
 # Every hash ever reviewed stays listed: a pre-push scan covers whole history
 # when a new tag or branch is pushed, so older commits must still pass.
 APP_ICON_PATH = 'app/Resources/AppIcon.png'
-# The Recall icon (2026-10-01); earlier Overwatch 2 Mac artwork stays listed.
-APP_ICON_SHA256 = 'cf35f2034332cb5071b7b1e057fe4c5e767e73dafb8f13e2f40ca5ac993d044e'
-PREVIOUS_APP_ICON_SHA256 = {'512923aab9fb505b84eec26289bf36cd228c4741db42ce6fefdeba6892d265d3',
+# The macSteam icon (2026-11-24): the owner's AppIcon.svg on the window's gradient, rendered by
+# scripts/render_app_icon.swift. The Recall icon and earlier Overwatch 2 Mac artwork stay listed.
+APP_ICON_SHA256 = '071f3c6db1db4304ac29249a0dcdd8bd1791bad9d7f619ba8e7a7888dd2493e4'
+PREVIOUS_APP_ICON_SHA256 = {'cf35f2034332cb5071b7b1e057fe4c5e767e73dafb8f13e2f40ca5ac993d044e',
+                            '512923aab9fb505b84eec26289bf36cd228c4741db42ce6fefdeba6892d265d3',
                             '7eb25ba04e3d0060c3379e955da0b121e11935939881bcf07946abeb8da75f63'}
 
 REVIEWED_ASSETS = {
     APP_ICON_PATH: {APP_ICON_SHA256, *PREVIOUS_APP_ICON_SHA256},
+    # The owner's mark the app icon is rendered from (scripts/render_app_icon.swift).
+    'app/Resources/AppIcon.svg': {'0c06f830d6f8bb4b4d4b390a1e6381e2763382ddf0f2acb7a39d8558c19f1b38'},
     # README banner, the owner's light and dark lockups, the author photo.
     'app/Resources/Banner.png': {'95cf86bd46fdd56f2765ac8498191a187c4888c4d1de73c34ace8fdaa706a3d9'},
     'app/Resources/Wordmark.png': {'214af160c00a88ae0260a7a31e19c210096233278d683c84da8d1c31a04153a7',
-                                   '8ca131902bd73f9bbbf5a9fe88e0639a14795c245c7390f030748bc330a4ef0a'},
+                                   '8ca131902bd73f9bbbf5a9fe88e0639a14795c245c7390f030748bc330a4ef0a',
+                                   # macSteam wordmark (2026-11-24: rainbow "mac", two diagonal colours a letter; Chakra Petch Bold, rendered, no metadata)
+                                   '66a095ca996b388da823165442fed77fcdbfa2dadd61dbce6d9fcf2f5074fb00'},
     'app/Resources/WordmarkDark.png': {'8237bef1d48e0ec229e9ed589657e97f1feb22151e8f6d87e1a7943e72fc8617',
-                                       '1703fc952ed83b6e1c96d7fc4d7e6f1d15d7874900f1d37eabf8715efe8b0773'},
+                                       '1703fc952ed83b6e1c96d7fc4d7e6f1d15d7874900f1d37eabf8715efe8b0773',
+                                       'dbf4e38b9fd2608966f90c5a8c7f6a7b936ed04cfdf196477b8de2be2c74cb63'},
     'app/Resources/AuthorPhoto.jpg': {'e747a105c7c3af851b78ca01bf1a037e6e089f70908a4b093c7ba566ff883f19',
                                       'f8aeb51a72f48b9f3156c51a875f519b9cede050749ed78e9e1ae555364daf94'},
     'app/Resources/MosaicLogo.png': {'7d596a74bfaefce23a7cad874d7b14a016b2ae00b2c551260596623b32791aba'},

@@ -9,7 +9,7 @@ enum InstallLocation {
     static var standard:URL { FileManager.default.urls(for:.applicationSupportDirectory,in:.userDomainMask)[0].appendingPathComponent(folderName) }
     static func isStandard(_ root:URL)->Bool { root.standardizedFileURL.path == standard.standardizedFileURL.path }
     /// Picking an existing app-made folder reconnects it; any other folder gets
-    /// an MacVolvo folder inside it.
+    /// an macSteam folder inside it.
     static func root(forChosen folder:URL)->URL {
         let folder=folder.standardizedFileURL
         let marker=folder.appendingPathComponent(Brand.ownerMarker).path
@@ -48,7 +48,7 @@ enum InstallLocation {
         var ancestor=root.standardizedFileURL
         while ancestor.path != "/" {
             if FileManager.default.fileExists(atPath:ancestor.appendingPathComponent(Brand.otherOwnerMarker).path) {
-                return "This location belongs to the other MacVolvo app. Choose a separate folder."
+                return "This location belongs to the other macSteam app. Choose a separate folder."
             }
             ancestor=ancestor.deletingLastPathComponent()
         }

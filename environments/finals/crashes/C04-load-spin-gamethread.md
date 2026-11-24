@@ -44,3 +44,11 @@ else.
 A/B in game with `ab_launches.py`: `MACFINALS_NT_OFF=syscall` against fast path on, several match
 loads each. If it only happens with the fast path on, look at it like C03 (counters, per-thread
 pending words in a trace build).
+
+**Update 2026-11-17:** the 2026-11-15 capture of the *same watchdog crash* ("Hang detected on
+GameThread", GameThread leaf in `NtUserPeekMessage`) turned out to be a **block, not a spin** —
+one `NtUserPeekMessage` that never returned, wedged on the winemac event-queue lock; that is
+[C06](C06-gamethread-stop-in-play.md), diagnosed and mitigated there (`macfinals-133`). C04's
+signature stays distinct: PeekMessage *returns* ~2 M times a second (a lost wakeup somewhere),
+so C04 is not covered by C06's fix. If C04 recurs, its counters should be checked for the same
+one-call-never-returns shape first before treating it as the spin again.

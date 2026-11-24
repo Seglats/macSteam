@@ -65,6 +65,8 @@ the facts about NotProton it rests on. Sources: NotProton's GPL source
    name stays "SteamDriver: THE FINALS". NotProton's cleanup (`remove_unlisted_tools`) only removes
    `notproton*` folders it wrote itself (a `flavor` file or its own `run` header), so ours stays.
    After a rename, Steam needs a restart and the game's Compatibility choice has to be set again.
+   (2026-11-24: renamed again to `notproton-steamdriver`, "SteamDriver", as macSteam's global
+   tool; the prefix rule still holds.)
 
 ## Where to look when it fails
 

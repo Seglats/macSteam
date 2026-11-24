@@ -49,3 +49,8 @@ one underlying problem. The alt-tab may have played a part.
    its dump line.
 2. A comparison on `macfinals-112` (old runtime and hook) to see whether these freezes happen
    there too.
+
+Update 2026-11-15: the loader-lock holder shape is explained — in C17's live capture the
+`loader_section` holder sat in `NtUserThreadDetach`, blocked in its own `NtClose` behind the
+wedged `fd_cache_mutex`. If this freeze's owner is the same shape, the root cause is C17's, not
+winmm: [C17](C17-slow-leave-and-quit-messagecall-ebadf.md).

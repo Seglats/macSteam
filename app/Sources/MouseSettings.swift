@@ -1,9 +1,9 @@
 import SwiftUI
 import AppKit
 
-/// How games in MacVolvo's own Windows Steam get the mouse (Settings; AppModel.MouseInput, from
+/// How games in macSteam's own Windows Steam get the mouse (Settings; AppModel.MouseInput, from
 /// Recall 1.6): Standard, Classic or High-precision, and how often movement is sent. That Steam
-/// runs as part of MacVolvo, so MacVolvo holds Input Monitoring and asks macOS itself; with
+/// runs as part of macSteam, so macSteam holds Input Monitoring and asks macOS itself; with
 /// High-precision this says whether it has it and a mouse is connected. In NotProton's Steam the
 /// same choices are per game in Steam (NotProton.swift) and Steam holds the permission
 /// (SteamMouseStatus).
@@ -14,7 +14,7 @@ struct MousePanel:View {
     @State private var explainHighPrecision=false
     @State private var advanced=false
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    /// MacVolvo's own Steam takes the mouse settings when it opens, so they wait until it's closed.
+    /// macSteam's own Steam takes the mouse settings when it opens, so they wait until it's closed.
     private var locked:Bool { model.running != nil }
     var body:some View {
         LauncherPanel(inset:16) {
@@ -58,7 +58,7 @@ struct MousePanel:View {
         if appAccess != .allowed {
             StatusLine(.problem,"Needs Input Monitoring. Turn on \(Brand.name) in System Settings › Privacy & Security › Input Monitoring. Until then, the mouse works as Standard does.",
                        button:appAccess == .undecided ? "Allow…" : "Open System Settings") {
-                // Undecided: macOS's own prompt, which also adds MacVolvo to the list. Decided: only the player can change it.
+                // Undecided: macOS's own prompt, which also adds macSteam to the list. Decided: only the player can change it.
                 if appAccess == .undecided { InputMonitoring.ask() } else { NSWorkspace.shared.open(InputMonitoring.privacySettings) }
                 refresh()
             }
@@ -87,7 +87,7 @@ struct MousePanel:View {
                         Text(label(rate)).font(LauncherStyle.font(12)).monospacedDigit()
                     }
                 }.foregroundStyle(.secondary).contentShape(Rectangle())
-            }.buttonStyle(.plain)
+            }.buttonStyle(.plain).hoverGrow()
                 .accessibilityHint(advanced ? "Hides the advanced mouse setting" : "Shows how often your game gets your mouse’s movement")
             if advanced {
                 if classic {
@@ -126,18 +126,18 @@ struct MousePanel:View {
     }
 }
 
-/// The High-precision mouse in NotProton's Steam, as MacVolvo's driver reported it in the latest
+/// The High-precision mouse in NotProton's Steam, as macSteam's driver reported it in the latest
 /// game that used it (NotProton.MouseStatus). The game may read the mouse if Steam, which started it,
 /// may read input: through Device Control and Data Access (Accessibility before macOS 27), which
-/// NotProton asks for, or Input Monitoring. Only the game can tell. MacVolvo never asks for itself here.
+/// NotProton asks for, or Input Monitoring. Only the game can tell. macSteam never asks for itself here.
 struct SteamMouseStatus:View {
     @Bindable var model:AppModel
     var body:some View {
         if let report=model.mouseStatus {
             let when="in \(report.process), \(report.date.formatted(.relative(presentation:.named)))"
             if report.access != "granted" {
-                StatusLine(.problem,"Steam isn’t allowed to read your mouse (\(when)). In System Settings › Privacy & Security, turn on Steam under Device Control and Data Access (NotProton asks for it there) or Input Monitoring, then quit and reopen Steam. Until then, the mouse works as Standard does.",
-                           button:"Open System Settings") { NSWorkspace.shared.open(InputMonitoring.privacySettings) }
+                StatusLine(.problem,"Steam isn’t allowed to read your mouse (\(when)). In System Settings › Privacy & Security › Device Control and Data Access, turn on Steam (NotProton asks for it there), then quit and reopen Steam. Until then, the game uses the standard mouse.",
+                           button:"Open System Settings") { NSWorkspace.shared.open(InputMonitoring.deviceControlSettings) }
             } else if report.reporting {
                 StatusLine(.good,"High-precision mouse is working: your game reads your mouse directly (\(when)).")
             } else if report.mice > 0 {
@@ -146,7 +146,7 @@ struct SteamMouseStatus:View {
                 StatusLine(.warning,"Steam may read your mouse, but none was connected (\(when)). A trackpad works as Standard does.")
             }
         } else {
-            StatusLine(.pending,"No game has used High-precision yet. In Steam, choose MacVolvo driver and turn on MacVolvo mouse › High-precision for a game, then start it. It works if Steam is on under Device Control and Data Access, which NotProton asks for; otherwise macOS asks to allow Input Monitoring for Steam, and it works from the next launch. This shows how it went.")
+            StatusLine(.pending,"No game has reported the mouse yet. SteamDriver uses High-precision in every game: it reads your mouse directly when Steam is turned on under [Device Control and Data Access](x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility) in System Settings (NotProton asks for it), and uses the standard mouse until then. With SteamDriver on CrossOver, turn on SteamDriver mouse › High-precision for the game. This shows how it went.",markdown:true)
         }
     }
 }
@@ -158,15 +158,21 @@ struct StatusLine:View {
     let text:String
     var button:String?=nil
     var action:()->Void={}
-    init(_ kind:Kind,_ text:String,button:String?=nil,action:@escaping ()->Void={}) {
-        self.kind=kind;self.text=text;self.button=button;self.action=action
+    /// Renders [text](url) links in the text (other markdown too), in Steam's link blue.
+    var markdown=false
+    init(_ kind:Kind,_ text:String,button:String?=nil,markdown:Bool=false,action:@escaping ()->Void={}) {
+        self.kind=kind;self.text=text;self.button=button;self.markdown=markdown;self.action=action
+    }
+    private var line:Text {
+        if markdown,let attributed=try? AttributedString(markdown:text,options:.init(interpretedSyntax:.inlineOnlyPreservingWhitespace)) { return Text(attributed) }
+        return Text(text)
     }
     var body:some View {
         HStack(alignment:.top,spacing:10) {
             Image(systemName:symbol).font(.system(size:14,weight:.semibold)).foregroundStyle(color).frame(width:18).accessibilityHidden(true)
             VStack(alignment:.leading,spacing:8) {
-                Text(text).font(LauncherStyle.font(12,.medium)).fixedSize(horizontal:false,vertical:true)
-                if let button { Button(button,action:action).buttonStyle(.bordered).buttonBorderShape(.capsule).controlSize(.small) }
+                line.font(LauncherStyle.font(12,.medium)).fixedSize(horizontal:false,vertical:true).tint(Color(red:0.4,green:0.75,blue:0.96))
+                if let button { Button(button,action:action).buttonStyle(.bordered).hoverGrow().buttonBorderShape(.capsule).controlSize(.small) }
             }
             Spacer(minLength:0)
         }.accessibilityElement(children:.combine)
@@ -207,7 +213,7 @@ struct MouseChoice:View {
                 }
                 Spacer(minLength:0)
             }.contentShape(Rectangle())
-        }.buttonStyle(.plain).disabled(disabled).opacity(disabled ? 0.6 : 1)
+        }.buttonStyle(.plain).hoverGrow().disabled(disabled).opacity(disabled ? 0.6 : 1)
             .accessibilityElement(children:.combine).accessibilityAddTraits(selected ? .isSelected : [])
     }
 }

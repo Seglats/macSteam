@@ -1,0 +1,21 @@
+From: MacFinals
+Subject: [PATCH] ntdll: export syscall_log_current_wtid for the mac driver
+
+Wine compiles the unix side with -fvisibility=hidden, and winemac.drv's .so links ntdll.so
+directly, so only symbols explicitly marked visible resolve there (same mechanism as the
+existing __attribute__((visibility("default"))) exports in loader.c, e.g. CW Hack 24067).
+
+The C04 event-queue lock diagnostics (wine-macdrv-event-queue-lock.patch) call this from
+cocoa_event.m to name the lock holder with the same Wine tid the syscall log uses; without
+the export the winemac.drv link fails with "Undefined symbols: _syscall_log_current_wtid".
+---
+--- a/dlls/ntdll/unix/loader.c
++++ b/dlls/ntdll/unix/loader.c
+@@ -1516,6 +1516,7 @@
+ 
+ /* C17: this thread's Windows tid for the fd-cache section owner record (server.c); 0 when the
+  * thread has no slot (uncounted threads never block a dump reading either) */
++__attribute__((visibility("default")))
+ UINT32 syscall_log_current_wtid(void)
+ {
+     if (syscall_log_my <= (void *)1) return 0;

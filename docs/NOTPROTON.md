@@ -13,8 +13,8 @@ them, and shows whether the High-precision mouse works. It installs no Steam and
 |---|---|
 | `MacVolvo NotProton/<build>/winemac.so` | MacVolvo's Mac driver for that CrossOver build |
 | `MacVolvo NotProton/<build>/dxmt/` | MacVolvo DXMT, bundled with the app (from its runtime) |
-| `MacVolvo NotProton/d3dmetal/` | Apple's D3DMetal, only after you choose your own Game Porting Toolkit image |
-| `MacVolvo NotProton/profiles/<game>.conf` | the game profiles you installed |
+| `SteamDriver/GPTK/` | your own Game Porting Toolkit 4: the `redist` folder you copied in from Apple's image |
+| `SteamDriver/profiles/<id>/` | the profiles you made: Global DX11, Global DX12, `app-<id>` ([PROFILES.md](PROFILES.md)) |
 | `notproton/variants/macvolvo.conf` | two dropdowns, **MacVolvo driver** and **MacVolvo renderer**; choices from both combine |
 | `notproton/plugins/macvolvo.conf` | rows in each game's Compatibility page (Developer section) |
 
@@ -29,20 +29,15 @@ The variants:
 - **MacVolvo DXMT** is Recall's DXMT. Its `winemetal.so` finds the Mac driver by install name,
   so choose it together with MacVolvo driver. CrossOver also loads a copy of `winemetal.dll`
   from `lib/wine`, and its PE half has to match the Unix half, so that copy is replaced too.
-- **Apple D3DMetal:** Apple doesn't allow it to be redistributed, so MacVolvo ships none. Choose
-  Game Porting Toolkit… asks for the "Evaluation environment for Windows games" image.
-  `NotProtonExtras.swift` `importGPTK` then:
-  1. mounts it read-only
-  2. checks `com.apple.D3DMetal` version 3 or later, Apple's signature on every native file,
-     the required modules, and that no links point outside the package
-  3. copies `redist/lib` and Apple's notices with `ditto`
-  4. swaps the copy in
-
-  A bad image changes nothing.
-- **NotProton's own D3DMetal:** NotProton's CrossOver already has one
-  (`runners/crossover-<build>/CrossOver/lib64/apple_gptk`). The window shows it as available
-  (`runnerD3DMetalVersion`); it needs no MacVolvo renderer, only D3DMetal as the backend.
-  Importing a Game Porting Toolkit is for a newer D3DMetal than that.
+- **Apple D3DMetal:** macSteam ships no D3DMetal and installs nothing of Apple's itself. The
+  player downloads Game Porting Toolkit 4 from Apple, opens "Evaluation environment for Windows
+  games" (macOS shows Apple's license) and copies its `redist` folder into `SteamDriver/GPTK`
+  (**Show Folder** under Renderers; `redist/lib` or `lib`'s contents work too, `gptkLib` finds
+  them). `gptkStatus` checks the files (the required modules, D3DMetal 4, Apple's signature on
+  every native file; cached until they change) before the "Apple D3DMetal" variant offers them
+  or the SteamDriver tool uses them. The variant lays them, unchanged, over the runner's
+  `lib64/apple_gptk`. NotProton's CrossOver has a D3DMetal of its own; macSteam no longer points
+  to it.
 - **Graphics backend:** choose NotProton's matching backend for the game (DXMT or D3DMetal).
 
 The rows:
@@ -54,12 +49,18 @@ The rows:
 | ↳ **Classic timing** | `WINEMAC_INPUT_VARIANT=classic` (a later row's `env` wins) |
 | ↳ **Mouse updates** (slider) | `NOTPROTON_ENV_WINEMAC_MOUSELOOK_RAW_INTERVAL_US`; the default writes nothing, which is the driver's own 1 ms |
 
-| **MacVolvo *game* profile** (installed from Game profiles) | `DXMT_CONFIG_FILE=Z:\…\profiles\<game>.conf` |
+| **SteamDriver DX11 profile** (Global DX11) | `DXMT_CONFIG_FILE=Z:\…\profiles\global-dx11\dxmt.conf` |
+| **SteamDriver profile: *game*** (a DX11 game profile, `apps = <id>`, after the global row so it wins) | `DXMT_CONFIG_FILE=Z:\…\profiles\app-<id>\dxmt.conf` |
 
-**Game profiles:**
-- `scripts/build_native_app.py` `notproton_profiles` generates them from the runtime's DXMT
-  renderer profile. The canvas-size lines are dropped (NotProton's Steam has no resolution
-  setting), and CS2 gets 4 shader compiler threads.
+**Profiles** ([PROFILES.md](PROFILES.md)): only DX11 profiles become rows (a DX12 profile has no
+renderer setting yet). CS2 and Deadlock keep their row ids (`NOTPROTON_MACVOLVO_PROFILE_CS2`,
+`_DEADLOCK`), so games keep them switched on. At most 16 profile rows: NotProton shows 32 rows
+across all plugin files.
+- `scripts/build_native_app.py` `notproton_profiles` generates the settings from the runtime's DXMT
+  renderer profile: `cs2.conf` and `deadlock.conf` (with their `[exe]` section) and `dx11.conf`
+  (no section, so DXMT applies it to every program) for Global DX11 and other games. The
+  canvas-size lines are dropped (NotProton's Steam has no resolution setting), and CS2 gets 4
+  shader compiler threads.
 - The **Deadlock** profile also switches `boot.vcfg`'s `DefaultRenderSystemOption` from
   `-vulkan` to `-dx11` in every Steam library (`libraryfolders.vdf`), keeping
   `boot.vcfg.macvolvo-backup`. A saved Vulkan choice bypasses DXMT and D3DMetal. It's
@@ -137,10 +138,16 @@ picker. The **NotProton** tile there switches back.
   launch and every few seconds while the window is open). Nothing has to be removed first.
   NotProton stamps each variant runner with its files' sizes and times, so it rebuilds it on the
   next launch.
-- **Restart:** Steam reads plugin and variant files when it starts. After any change, if Steam is
-  running, the window asks to restart it (`NotProton.restartSteam`): `steam://exit` as NotProton
-  does, up to 30 seconds, then it opens NotProton's patched Steam app (its `steamAppPath`
-  setting, else `/Applications/Steam.app`). It never forces Steam to quit.
+- **Restart:** Steam reads the plugin rows live (NotProton 1.2.7) but the variants, and the
+  compatibility tools, only when it starts. So the window asks to restart Steam
+  (`NotProton.restartSteam`) only after a change to the variants (`NotProton.Change.restart`):
+  `steam://exit` as NotProton does, up to 30 seconds, then it opens NotProton's patched Steam app
+  (its `steamAppPath` setting, else `/Applications/Steam.app`). It never forces Steam to quit.
+  Profile changes rewrite only the rows (`NotProton.writeRows`); a new driver or DXMT needs
+  nothing, since NotProton rebuilds its runner copy at the next launch.
+- **Rows removed in NotProton's plugin page** (`plugins/steamdriver.conf` moved to the Trash)
+  stay removed: refresh and profile changes leave them out (`NotProton.rowsRemoved`), and the
+  window offers Put Rows Back.
 
 ## Separate compatibility tool: not possible
 

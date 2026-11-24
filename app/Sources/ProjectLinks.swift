@@ -50,7 +50,7 @@ struct RepositoryLink:View {
                 .background(.black,in:Capsule())
                 .overlay { Capsule().strokeBorder(.white.opacity(0.18),lineWidth:1) }
                 .contentShape(Capsule())
-        }.buttonStyle(.plain).environment(\.colorScheme,.light).accessibilityLabel("\(Brand.name) on GitHub")
+        }.buttonStyle(.plain).hoverGrow().environment(\.colorScheme,.light).accessibilityLabel("\(Brand.name) on GitHub")
             .help("Open the project repository in your browser")
     }
 }
@@ -63,7 +63,7 @@ private enum ProjectArtwork {
         Bundle.main.url(forResource:name,withExtension:type).flatMap { NSImage(contentsOf:$0) } ?? NSImage()
     }
 }
-/// The MacVolvo lockup (mark and name) in its light- and dark-appearance versions; the
+/// The macSteam lockup (mark and name) in its light- and dark-appearance versions; the
 /// mark is the square at its leading edge. A badge marks a state, as on the app icon
 /// (a failure, a paused setup, a missing drive).
 struct Wordmark:View {
@@ -71,9 +71,10 @@ struct Wordmark:View {
     var badge:String?
     @Environment(\.colorScheme) private var scheme
     var body:some View {
+        // In its own colours (the rainbow "mac"); the light and dark files differ only in "Steam".
         Image(nsImage:scheme == .dark ? ProjectArtwork.wordmarkDark : ProjectArtwork.wordmark)
-            .renderingMode(.template).resizable().interpolation(.high)
-            .scaledToFit().frame(height:height).foregroundStyle(.primary)
+            .renderingMode(.original).resizable().interpolation(.high)
+            .scaledToFit().frame(height:height)
             .overlay(alignment:.leading) {
                 if let badge {
                     Color.clear.frame(width:height,height:height).overlay(alignment:.bottomTrailing) {
@@ -96,10 +97,10 @@ struct AuthorLink:View {
                 Text("by").foregroundStyle(.secondary)
                 Text(Brand.author).foregroundStyle(LauncherStyle.accent)
             }.font(LauncherStyle.font(13,.semibold)).tracking(0.6)
-        }.buttonStyle(.plain).pointerStyle(.link).help("haeli05 on GitHub")
+        }.buttonStyle(.plain).hoverGrow().pointerStyle(.link).help("haeli05 on GitHub")
     }
 }
-/// The project MacVolvo is built on, credited in About.
+/// The project macSteam is built on, credited in About.
 struct UpstreamLink:View {
     var body:some View {
         Link(destination:Brand.upstream) {
@@ -107,6 +108,6 @@ struct UpstreamLink:View {
                 Text("Based on Recall by Joshua Asher Nelson")
                 Image(systemName:"arrow.up.right").font(.system(size:8,weight:.semibold)).accessibilityHidden(true)
             }.font(LauncherStyle.font(12,.medium))
-        }.buttonStyle(.plain).foregroundStyle(.secondary).help("Open Recall’s repository in your browser")
+        }.buttonStyle(.plain).hoverGrow().foregroundStyle(.secondary).help("Open Recall’s repository in your browser")
     }
 }

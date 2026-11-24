@@ -6,13 +6,13 @@ import UniformTypeIdentifiers
 @MainActor @Observable
 final class AppModel {
     enum Screen: String, CaseIterable { case welcome, moveApp, checking, readyToInstall, preparing, launching, installer, ready, running, driveMissing, failure }
-    enum Sheet: String, Identifiable { case settings, help, about, uninstall, update, whatsNew; var id: String { rawValue } }
+    enum Sheet: String, Identifiable { case settings, help, about, uninstall, update, whatsNew, keyOverrides, profileSettings; var id: String { rawValue } }
     enum UninstallState: Equatable { case idle, working, done(appRemoved: Bool), failed(String) }
     enum UpdateState: Equatable { case idle, checking, upToDate, available(AvailableUpdate), downloading(Double), installing, failed(String) }
     var uninstall: UninstallState = .idle
     var update: UpdateState = .idle
     var updateNotice=""
-    /// The games MacVolvo starts through Steam (worker: launch --game, status games).
+    /// The games macSteam starts through Steam (worker: launch --game, status games).
     enum Game: String, CaseIterable, Identifiable {
         case cs2, deadlock
         var id:String { rawValue }
@@ -77,7 +77,7 @@ final class AppModel {
     var mouseRate=MouseRate(rawValue:UserDefaults.standard.string(forKey:"mouseRate") ?? "") ?? .all {
         didSet { UserDefaults.standard.set(mouseRate.rawValue,forKey:"mouseRate") }
     }
-    /// MacVolvo in NotProton's Steam (NotProton.swift): its status, as Settings last checked.
+    /// macSteam in NotProton's Steam (NotProton.swift): its status, as Settings last checked.
     var notProton=NotProton.Status.notInstalled
     var notProtonCurrent=false
     /// What the driver reported about the High-precision mouse in the latest game (NotProton.swift).
@@ -86,82 +86,104 @@ final class AppModel {
         notProton=NotProton.status(resources)
         notProtonCurrent=NotProton.isCurrent(resources:resources)
         mouseStatus=NotProton.mouseStatus()
-        d3dmetalVersion=NotProton.d3dmetalVersion
-        runnerD3DMetal=NotProton.supported(resources).first.flatMap(NotProton.runnerD3DMetalVersion)
-        profiles=Set(NotProton.installedProfiles)
+        checkGPTK()
+        profiles=Profiles.list()
+        rowsRemoved=NotProton.rowsRemoved
         checkGameTools()
-        // A newer MacVolvo, or files changed underneath: update in place, never remove and add again.
-        if case .added=notProton,!notProtonCurrent,NotProton.refresh(resources:resources) {
+        // A newer macSteam, or files changed underneath: update in place, never remove and add again.
+        if case .added=notProton,!notProtonCurrent {
+            let change=NotProton.refresh(resources:resources)
             notProtonCurrent=NotProton.isCurrent(resources:resources)
             // Only once: a copy that still differs afterwards shows Update instead of asking every 4 seconds.
-            if notProtonCurrent { changedSteam("Updated MacVolvo’s options in Steam to this version.") }
+            if change != .none,notProtonCurrent { changedSteam("Updated macSteam’s options in Steam to this version.",change) }
         }
     }
-    /// The D3DMetal NotProton's CrossOver already has, offered with D3DMetal as the graphics backend.
-    var runnerD3DMetal:String?
-    /// Steam reads MacVolvo's options when it starts: after a change, ask to restart it.
+    /// The player removed macSteam's rows in NotProton's plugin page; they stay out until put back.
+    var rowsRemoved=false
+    func restoreRows() {
+        do { changedSteam("The SteamDriver rows are back in your games’ Compatibility settings.",try NotProton.add(resources:resources,restoreRows:true)) }
+        catch { notice=error.localizedDescription }
+        checkNotProton()
+    }
+    /// Steam reads macSteam's options when it starts: after a change, ask to restart it.
     var askRestartSteam=false
     var restartingSteam=false
-    private func changedSteam(_ message:String) {
+    /// Steam reads the rows live (NotProton 1.2.7), the variants only when it starts: only a
+    /// change to the variants asks for a restart.
+    private func changedSteam(_ message:String,_ change:NotProton.Change) {
         notice=message
-        if NotProton.steamRunning { askRestartSteam=true }
+        if change == .restart,NotProton.steamRunning { askRestartSteam=true }
     }
     func restartSteam() {
         restartingSteam=true;notice="Restarting Steam…"
         Task {
             let done=await Task.detached { NotProton.restartSteam() }.value
             restartingSteam=false
-            notice=done ? "Steam restarted with MacVolvo’s changes." :
+            notice=done ? "Steam restarted with macSteam’s changes." :
                 "Steam didn’t quit, perhaps because a game or download is running. Quit Steam yourself, then open it again."
         }
     }
-    /// Apple's D3DMetal as the player imported it from their Game Porting Toolkit (NotProtonExtras.swift).
-    var d3dmetalVersion:String?
-    var importingGPTK=false
-    /// The game profiles chosen for NotProton's Steam.
-    var profiles=Set<NotProton.Profile>()
-    /// After a change to the renderers or profiles, the rows in Steam follow at once if added.
-    private func rewriteNotProton() {
-        guard case .added=notProton else { return }
-        do { try NotProton.add(resources:resources);changedSteam("Changed in Steam.") } catch { notice=error.localizedDescription }
-    }
-    func chooseGPTK() {
-        let panel=NSOpenPanel()
-        panel.message="Choose Apple’s \u{201C}Evaluation environment for Windows games\u{201D} disk image from the Game Porting Toolkit."
-        panel.prompt="Use"
-        panel.allowedContentTypes=[.diskImage]
-        panel.directoryURL=FileManager.default.urls(for:.downloadsDirectory,in:.userDomainMask).first
-        guard panel.runModal() == .OK,let image=panel.url else { return }
-        importingGPTK=true;notice=""
+    /// The player's own Game Porting Toolkit in SteamDriver/GPTK (NotProtonExtras.swift), as last checked.
+    var gptk=NotProton.GPTKStatus.empty
+    private var checkingGPTK=false
+    /// Off the main thread: the first check runs codesign over Apple's files.
+    private func checkGPTK() {
+        guard !checkingGPTK else { return }
+        checkingGPTK=true
         Task {
-            let result=await Task.detached { Result { try NotProton.importGPTK(image) } }.value
-            importingGPTK=false
-            switch result {
-            case .success(let version):
-                rewriteNotProton()
-                notice="Apple D3DMetal \(version) is ready. Choose it under MacVolvo renderer in a game’s Compatibility settings, with D3DMetal as the graphics backend."
-            case .failure(let error): notice=error.localizedDescription
-            }
-            checkNotProton()
+            gptk=await Task.detached { NotProton.gptkStatus() }.value
+            checkingGPTK=false
         }
     }
-    func removeGPTK() {
-        do { try NotProton.removeGPTK();rewriteNotProton() } catch { notice=error.localizedDescription }
-        checkNotProton()
+    /// The profiles (Profiles.swift): Global DX11, Global DX12, then game profiles.
+    var profiles:[Profiles.Profile]=[]
+    /// The profile the settings sheet shows (ProfileSettingsSheet).
+    var editingProfile=""
+    func editProfile(_ profile:Profiles.Profile) { editingProfile=profile.id;sheet = .profileSettings }
+    /// After a change to the renderers, everything in Steam follows at once if added.
+    private func rewriteNotProton() {
+        guard case .added=notProton else { return }
+        do { changedSteam("Changed in Steam.",try NotProton.add(resources:resources)) } catch { notice=error.localizedDescription }
     }
-    func setProfile(_ profile:NotProton.Profile,_ on:Bool) {
+    /// After a profile change only the rows change, which Steam shows without a restart.
+    private func rewriteRows(_ message:String) {
         do {
-            try NotProton.setProfile(profile,installed:on,resources:resources)
-            rewriteNotProton()
+            let change=try NotProton.writeRows(resources:resources)
+            notice=change == .rows ? message+" Steam shows it right away." : message
+        } catch { notice=error.localizedDescription }
+    }
+    /// Show Folder: the player copies Apple's redist folder in by hand (NotProtonExtras.gptkFolder).
+    func showGPTKFolder() {
+        do { NSWorkspace.shared.open(try NotProton.prepareGPTKFolder()) }
+        catch { notice=error.localizedDescription }
+    }
+    func addGlobalProfile(_ kind:Profiles.Kind) {
+        do {
+            try Profiles.addGlobal(kind,resources:resources)
+            rewriteRows(kind == .dx11 ? "Added Global DX11: switch on \u{201C}SteamDriver DX11 profile\u{201D} in a DX11 game’s Compatibility settings." :
+                "Added Global DX12. D3DMetal has no settings yet; MetalFX upscaling will go here.")
         } catch { notice=error.localizedDescription }
         checkNotProton()
     }
+    func addGameProfile(_ game:Profiles.Game,_ kind:Profiles.Kind) {
+        do {
+            try Profiles.addGame(appID:game.appID,name:game.name,kind:kind,resources:resources)
+            rewriteRows(kind == .dx11 ? "Added a profile for \(game.name): switch on \u{201C}SteamDriver profile: \(game.name)\u{201D} in its Compatibility settings." :
+                "Added a DX12 profile for \(game.name).")
+        } catch { notice=error.localizedDescription }
+        checkNotProton()
+    }
+    func removeProfile(_ profile:Profiles.Profile) {
+        do { try Profiles.remove(profile.id);rewriteRows("Removed \(profile.name).") } catch { notice=error.localizedDescription }
+        checkNotProton()
+    }
+
     func addToNotProton() {
         let wasAdded:Bool={ if case .added=notProton { return true };return false }()
         do {
-            try NotProton.add(resources:resources)
+            let change=try NotProton.add(resources:resources)
             changedSteam(wasAdded ? "Updated in place. Games you start from now on use it." :
-                "Added. MacVolvo is now in your games’ Compatibility settings in Steam.")
+                "Added. macSteam is now in your games’ Compatibility settings in Steam.",change)
         } catch { notice=error.localizedDescription }
         checkNotProton()
     }
@@ -179,20 +201,20 @@ final class AppModel {
             let result=await Task.detached { Result { try GameTools.install(tool) } }.value
             installingGameTool=nil
             switch result {
-            case .success: changedSteam("\(tool.display) is in Steam. In \(tool.game)’s Properties › Compatibility, force a compatibility tool and choose it.")
+            case .success: changedSteam("\(tool.display) is in Steam. In a game’s Properties › Compatibility, force a compatibility tool and choose \u{201C}\(tool.display)\u{201D}.",.restart)
             case .failure(let error): notice=error.localizedDescription
             }
             checkGameTools()
         }
     }
     func removeGameTool(_ tool:GameTools.Tool) {
-        do { try GameTools.remove(tool);changedSteam("\(tool.display) removed from Steam.") } catch { notice=error.localizedDescription }
+        do { try GameTools.remove(tool);changedSteam("\(tool.display) removed from Steam.",.restart) } catch { notice=error.localizedDescription }
         checkGameTools()
     }
     func removeFromNotProton() {
         do {
             try NotProton.remove()
-            changedSteam("Removed from Steam.")
+            changedSteam("Removed from Steam.",.restart)
         } catch { notice=error.localizedDescription }
         checkNotProton()
     }
@@ -318,10 +340,11 @@ final class AppModel {
         root=selectedRoot
         service=SetupService(root:selectedRoot,helper:Bundle.main.bundleURL.appendingPathComponent("Contents/Helpers/ow2-setup"))
         release=configuration
-        // A newer MacVolvo brings a newer driver and run script for NotProton's Steam.
-        if NotProton.refresh(resources:resources) {
-            notice="Updated MacVolvo’s options in Steam to this version."
-            if NotProton.steamRunning { askRestartSteam=true }
+        // A newer macSteam brings a newer driver and run script for NotProton's Steam.
+        let change=NotProton.refresh(resources:resources)
+        if change != .none {
+            notice="Updated macSteam’s options in Steam to this version."
+            if change == .restart,NotProton.steamRunning { askRestartSteam=true }
         }
     }
     func receive(_ value: [String:Any]) {
@@ -394,14 +417,14 @@ final class AppModel {
         // Opened from the disk image: move to Applications before anything else.
         if AppLocation.needsMove(Bundle.main.bundleURL) { prepareMove();return }
         if automaticUpdates { checkForUpdates(manual:false) }
-        // MacVolvo for NotProton needs no setup of its own: no worker, no Steam install.
+        // macSteam for NotProton needs no setup of its own: no worker, no Steam install.
         guard windowsSteam else { checkNotProton();return }
         startWindowsSteam(autoLaunch:true)
     }
-    /// What the main window is. By default MacVolvo for NotProton (CompanionView): it installs,
-    /// updates and configures MacVolvo's driver and mouse for NotProton's macOS Steam, and
+    /// What the main window is. By default macSteam for NotProton (CompanionView): it installs,
+    /// updates and configures macSteam's driver and mouse for NotProton's macOS Steam, and
     /// launches nothing. For troubleshooting, Settings › Advanced in that window switches to
-    /// MacVolvo's own Windows Steam in its own Wine environment (SetupView), and back.
+    /// macSteam's own Windows Steam in its own Wine environment (SetupView), and back.
     var windowsSteam=UserDefaults.standard.bool(forKey:"windowsSteamMode") {
         didSet { UserDefaults.standard.set(windowsSteam,forKey:"windowsSteamMode") }
     }
@@ -632,7 +655,7 @@ final class AppModel {
         if panel.runModal() == .OK,let folder=panel.url { useLocation(InstallLocation.root(forChosen:folder)) }
     }
     /// Stop waiting for a disconnected drive. Nothing on it is changed; choosing
-    /// its MacVolvo folder later reconnects that installation.
+    /// its macSteam folder later reconnects that installation.
     func useThisMac() {
         setRoot(InstallLocation.standard);notice="";recheck()
     }
@@ -647,7 +670,7 @@ final class AppModel {
         update = .upToDate
         state["onboarding_complete"]=value != .welcome && value != .readyToInstall && value != .installer
         installedGames=[.cs2]
-        if value == .moveApp { moveReplaces=["MacVolvo Beta"] }
+        if value == .moveApp { moveReplaces=["macSteam Beta"] }
         let args=CommandLine.arguments
         if let i=args.firstIndex(of:"--preview-macos"),args.indices.contains(i+1) { macOS=args[i+1] }
         // The launching screen's "Preparing graphics" details: preparing, done, first,
@@ -1069,7 +1092,7 @@ final class AppModel {
         saveLaunchOptions(for:selectedGame)
         notice="\(selectedGame.title) opens at \(initial.label) next time."
     }
-    func uninstallEverything() {
+    func uninstallEverything(keepPrefixes:Bool=false) {
         guard !isPreview else { uninstall = .done(appRemoved:true);return }
         uninstall = .working
         Task {
@@ -1077,9 +1100,16 @@ final class AppModel {
             while busy { cancel(); try? await Task.sleep(for:.milliseconds(100)) }
             busy=true; notice=""
             defer { busy=false }
-            // MacVolvo in NotProton's Steam: only MacVolvo's own files; NotProton and Steam stay.
+            // A game running from a game tool (or a NotProton runner built with macSteam's
+            // variants) keeps its files open: nothing is removed until it is quit.
+            if Uninstaller.runningGame() != nil {
+                uninstall = .failed("A game is running through \(Brand.name)’s options. Quit it, then try again. Nothing was removed.");return
+            }
+            // macSteam in NotProton's Steam: only macSteam's own files; NotProton and Steam stay.
             do { try NotProton.remove() } catch { uninstall = .failed(error.localizedDescription);return }
-            // MacVolvo's own Steam (troubleshooting), only when it was ever set up here.
+            // Everything else macSteam and its game tools set up outside its folders (Uninstaller.swift).
+            for line in Uninstaller.run(removePrefixes:!keepPrefixes) { print("uninstall: \(line)") }
+            // macSteam's own Steam (troubleshooting), only when it was ever set up here.
             if fm.fileExists(atPath:root.path) {
                 do { _ = try await service.run("uninstall",event:receive) }
                 catch { uninstall = .failed((error as? SetupFailure ?? SetupFailure(code:"unexpected_setup_error")).message);return }

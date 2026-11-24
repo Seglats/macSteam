@@ -2,7 +2,7 @@ import SwiftUI
 
 /// "Preparing graphics" before Steam opens, as the worker reports it (graphics
 /// events from the pipeline helper, scripts/portable_pipeline.swift). Before each
-/// session MacVolvo prepares the shaders the games used on this Mac in earlier ones.
+/// session macSteam prepares the shaders the games used on this Mac in earlier ones.
 /// After an update or a macOS update it first warms the game's own shader cache
 /// with all of them, once.
 struct GraphicsProgress {
@@ -89,7 +89,7 @@ struct GraphicsDetails: View {
                         Image(systemName:"chevron.down").font(.system(size:11,weight:.semibold)).foregroundStyle(.secondary)
                             .rotationEffect(.degrees(expanded ? 180 : 0))
                     }.contentShape(Rectangle())
-                }.buttonStyle(.plain).accessibilityLabel(progress.summary).accessibilityHint(expanded ? "Hides the shaders" : "Shows each shader as it’s prepared")
+                }.buttonStyle(.plain).hoverGrow().accessibilityLabel(progress.summary).accessibilityHint(expanded ? "Hides the shaders" : "Shows each shader as it’s prepared")
                 if expanded {
                     if progress.items.isEmpty {
                         Text(progress.phase == .done ? progress.explanation : "Shaders appear here as they’re prepared.")

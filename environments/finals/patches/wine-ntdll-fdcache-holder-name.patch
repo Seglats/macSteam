@@ -1,0 +1,156 @@
+From: MacFinals
+Subject: [PATCH] ntdll: name the fd_cache_mutex holder in the syscall-log stuck dump
+
+C17 (crashes/C17): the live macfinals-129 capture showed the whole quit hanging behind one
+thread wedged inside the fd_cache_mutex uninterrupted section - 17 threads frozen in NtClose,
+the NtUserThreadDetach holder of loader_section, the threadpool locks, and the never-pumping
+SendMessage owner all queued behind it, with both wineserver threads provably healthy. The
+only indefinitely-blocking client-side op in that section is wine_server_receive_fd's untimed
+recvmsg on the shared fd_socket, but the dump cannot say which thread actually holds the
+section.
+
+This records the holder (wtid + acquisition time) on server_enter/leave_uninterrupted_section
+for fd_cache_mutex, and the stuck dump prints it first:
+
+    fd cache section: held by tid %04x for %.1f s; every NtClose and fd-cache fill queues behind it
+
+or "free". pthread_exit_wrapper releases the mutex if the dying thread holds it: a pthread
+mutex has no owner-death recovery, and the wrapper runs in that very thread, so it can still
+unlock - this turns a dead-holder quit hang into a recoverable close. The record stores are
+relaxed; races only blur the reading, never the code (the pointer compare per enter/leave is
+negligible against the two sigmask calls already there).
+
+No ERR variant: the wedge is permanent, so the 60 s stuck dump (which fires on the holder's
+own stuck call) is the right vehicle, at the same cadence the game data is read.
+---
+--- a/dlls/ntdll/unix/server.c
++++ b/dlls/ntdll/unix/server.c
+@@ -105,7 +105,53 @@
+ static int initial_cwd = -1;
+ static pid_t server_pid;
+ pthread_mutex_t fd_cache_mutex = PTHREAD_MUTEX_INITIALIZER;
++
++/* C17 (crashes/C17): the fd-cache section is process-global, and one thread wedged inside it
++ * (a live capture showed an untimed recvmsg in wine_server_receive_fd as the only blockable
++ * op with a healthy wineserver) freezes every NtClose and every uncached wait/read behind it.
++ * Record the current holder so the syscall-log stuck dump can name it. Diagnostic only: the
++ * stores are relaxed; races only blur the reading, never the code. */
++static struct
++{
++    volatile UINT32 wtid;   /* 0 = free */
++    volatile UINT64 since;  /* acquisition time (wine_diag_now_ns) */
++} fd_cache_section_owner;
++
++static void fd_cache_note_section_owner( void )
++{
++    UINT32 wtid = syscall_log_current_wtid();
++    if (!wtid) return;
++    __atomic_store_n( &fd_cache_section_owner.since, wine_diag_now_ns(), __ATOMIC_RELAXED );
++    __atomic_store_n( &fd_cache_section_owner.wtid, wtid, __ATOMIC_RELAXED );
++}
++
++static void fd_cache_clear_section_owner( void )
++{
++    /* only the holder clears, so a queued thread's exit cannot erase the next holder */
++    UINT32 wtid = syscall_log_current_wtid();
++    if (wtid && __atomic_load_n( &fd_cache_section_owner.wtid, __ATOMIC_RELAXED ) == wtid)
++        __atomic_store_n( &fd_cache_section_owner.wtid, 0, __ATOMIC_RELAXED );
++}
+ 
++/* for the stuck dump (loader.c): the current holder and since when, 0 = free */
++UINT32 fd_cache_section_holder( UINT64 *since )
++{
++    UINT32 wtid = __atomic_load_n( &fd_cache_section_owner.wtid, __ATOMIC_ACQUIRE );
++    if (wtid && since) *since = __atomic_load_n( &fd_cache_section_owner.since, __ATOMIC_ACQUIRE );
++    return wtid;
++}
++
++/* a dying owner would leave the mutex locked forever (a pthread mutex has no owner-death
++ * recovery); pthread_exit_wrapper runs in that very thread, so it can still release it */
++void fd_cache_release_if_owner( void )
++{
++    UINT32 wtid = syscall_log_current_wtid();
++    if (!wtid) return;
++    if (__atomic_load_n( &fd_cache_section_owner.wtid, __ATOMIC_RELAXED ) != wtid) return;
++    __atomic_store_n( &fd_cache_section_owner.wtid, 0, __ATOMIC_RELAXED );
++    mutex_unlock( &fd_cache_mutex );
++}
++
+ /* atomically exchange a 64-bit value */
+ static inline LONG64 interlocked_xchg64( LONG64 *dest, LONG64 val )
+ {
+@@ -339,6 +385,7 @@
+ {
+     pthread_sigmask( SIG_BLOCK, &server_block_set, sigset );
+     mutex_lock( mutex );
++    if (mutex == &fd_cache_mutex) fd_cache_note_section_owner();
+ }
+ 
+ 
+@@ -347,6 +394,7 @@
+  */
+ void server_leave_uninterrupted_section( pthread_mutex_t *mutex, sigset_t *sigset )
+ {
++    if (mutex == &fd_cache_mutex) fd_cache_clear_section_owner();
+     mutex_unlock( mutex );
+     pthread_sigmask( SIG_SETMASK, sigset, NULL );
+ }
+--- a/dlls/ntdll/unix/loader.c
++++ b/dlls/ntdll/unix/loader.c
+@@ -1156,6 +1156,16 @@
+     fprintf( file, "%lld.%03d stuck-dump: thread %04x in %s for over 60 s; every thread's NT call:\n",
+              (long long)tv.tv_sec, (int)(tv.tv_usec / 1000),
+              syscall_log_dump_wtid, syscall_log_dump_name[0] ? syscall_log_dump_name : "?" );
++    {   /* C17: the fd-cache section serializes every NtClose and fd-cache fill; a wedged holder
++         * is the mechanism behind the quit hang, so name it up front (0 = free) */
++        UINT64 held_since;
++        UINT32 holder = fd_cache_section_holder( &held_since );
++        if (holder)
++            fprintf( file, "  fd cache section: held by tid %04x for %.1f s; every NtClose and fd-cache fill queues behind it\n",
++                     holder, (now - held_since) / 1000000000.0 );
++        else
++            fprintf( file, "  fd cache section: free\n" );
++    }
+     for (t = 0; t < used; t++)
+     {
+         struct syscall_log_tcalls *tc = &syscall_log_tc[t];
+@@ -1502,6 +1512,14 @@
+     /* (void *)1 marks threads past the table end; NULL means never counted */
+     if (syscall_log_my > (void *)1)
+         __atomic_store_n( &syscall_log_my->exited, 1, __ATOMIC_RELEASE );
++}
++
++/* C17: this thread's Windows tid for the fd-cache section owner record (server.c); 0 when the
++ * thread has no slot (uncounted threads never block a dump reading either) */
++UINT32 syscall_log_current_wtid(void)
++{
++    if (syscall_log_my <= (void *)1) return 0;
++    return syscall_log_my->wtid;
+ }
+ 
+ static BOOL syscall_log_noreturn( UINT idx, UINT num )
+--- a/dlls/ntdll/unix/thread.c
++++ b/dlls/ntdll/unix/thread.c
+@@ -1105,6 +1105,9 @@
+ static DECLSPEC_NORETURN void pthread_exit_wrapper( int status )
+ {
+     syscall_log_thread_exiting();  /* mark the slot: a death mid-call must not read as "stuck" */
++    /* C17: if this thread dies holding the fd-cache section, the pthread mutex would stay
++     * locked forever and hang every NtClose in the process; we are the owner, so release it */
++    fd_cache_release_if_owner();
+     close( ntdll_get_thread_data()->alert_fd );
+     close( ntdll_get_thread_data()->wait_fd[0] );
+     close( ntdll_get_thread_data()->wait_fd[1] );
+--- a/dlls/ntdll/unix/unix_private.h
++++ b/dlls/ntdll/unix/unix_private.h
+@@ -332,6 +332,10 @@
+ extern void signal_init_process(void);
+ extern BOOL syscall_log_enabled(void);
+ extern void syscall_log_thread_exiting(void);
++/* C17: fd-cache section holder diagnostics (server.c / loader.c / thread.c) */
++extern UINT32 syscall_log_current_wtid(void);
++extern UINT32 fd_cache_section_holder( UINT64 *since );
++extern void fd_cache_release_if_owner(void);
+ 
+ /* WINE_SYSCALL_LOG diagnostics (loader.c): signal, fault and virtual_mutex counters */
+ enum wine_diag_counter

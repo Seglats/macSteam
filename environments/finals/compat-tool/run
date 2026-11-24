@@ -1,8 +1,9 @@
 #!/bin/zsh -f
-# SteamDriver: THE FINALS — a Steam Play compatibility tool for macOS Steam (2026-11-09).
+# SteamDriver — a Steam Play compatibility tool for macOS Steam (2026-11-09; THE FINALS' Wine, the
+# global SteamDriver runtime for every game since 2026-11-24, id notproton-steamdriver).
 #
 # macOS Steam (with NotProton switching Steam Play on) runs this as `run <verb> <game> <args>`
-# when THE FINALS' Properties › Compatibility names "SteamDriver: THE FINALS". It starts the
+# when a game's Properties › Compatibility names "SteamDriver". It starts the
 # game in the finals environment's Wine (runtime/ next to this script): D3DMetal, the d3d12
 # skin-fix layer, the in-process Rosetta syscall hook and SteamDriver's Mac driver mouse.
 # Everything runs inside the game's own process, from our own build; nothing outside is
@@ -13,9 +14,10 @@
 # unchanged): they are copied into the prefix's Steam folder, and our Wine's
 # wine-steamclient-lsteamclient.patch points steamclient64.dll at lsteamclient.dll.
 #
-# Options, as Steam launch options in front of %command% (e.g. `STEAMDRIVER_MOUSE=hid %command%`):
-#   STEAMDRIVER_MOUSE=precise|hid|classic|off   Mac driver mouse (default precise; hid = High-precision,
-#                                                macOS then asks for Input Monitoring for Steam)
+# Options, as Steam launch options in front of %command% (e.g. `STEAMDRIVER_MOUSE=precise %command%`):
+#   STEAMDRIVER_MOUSE=hid|precise|classic|off   Mac driver mouse (default hid = High-precision: reads the
+#                                                mouse directly once Steam may (Device Control and Data Access), else
+#                                                the driver uses precise by itself; precise = never HID)
 #   STEAMDRIVER_NT_HOOK=0                       without the Rosetta syscall hook
 #   STEAMDRIVER_MSYNC=0, STEAMDRIVER_AVX=0      MSync / ROSETTA_ADVERTISE_AVX off
 #   STEAMDRIVER_GAME_MODE=0                     without game apps. By default every program starts from a
@@ -24,9 +26,17 @@
 #   WINEMAC_DIRECT_PRESENT=1                    a covering, focused game window presents through a plain
 #                                                overlay window the window server shows directly, instead
 #                                                of compositing it (microstutter test, 2026-11-12)
-#   STEAMDRIVER_GPU_WARNING=1                   always show the game's "Minimum Hardware Requirements Not
+#   STEAMDRIVER_GPU_WARNING=1                   always show THE FINALS' "Minimum Hardware Requirements Not
 #                                                Met" box (by default it is shown on the first launch only;
 #                                                afterwards Wine answers it OK unseen, as if clicked)
+#   STEAMDRIVER_SHORTCUTS='ctrl+space,cmd+space' macOS system shortcuts that go to the game instead of
+#                                                macOS while it is in front (default none: nothing is
+#                                                changed). Modifiers ctrl/alt(opt)/shift/cmd; keys a-z, 0-9,
+#                                                space, tab, esc, return, f1-f20, arrows, ... (cocoa_app.m
+#                                                gs_keycode). Handed back when you switch away or it quits.
+#                                                Added to the app's Key combo overrides (Global and
+#                                                this game's profile: every game launched through this
+#                                                tool gets one), which need no launch options
 #   WINEDEBUG=...                               Wine's channels (default: errors and DLL loads)
 #   STEAMDRIVER_PERF=1                          per-process performance counters, 10 a second, in
 #                                                <compatdata>/perf/<date>/; read them with
@@ -36,7 +46,7 @@
 #                                                Apple's capture layer into the game)
 # Log: <compatdata>/steamdriver-run.log; Wine's output: <compatdata>/steamdriver-wine.log.
 #
-# The folder is named notproton-steamdriver-finals: NotProton's launch hook in macOS Steam hands a
+# The folder is named notproton-steamdriver: NotProton's launch hook in macOS Steam hands a
 # game's launch command to /bin/sh only for tools under compatibilitytools.d/notproton*
 # (dylib/feats/compat.c np_compat_runs_tool); without it Steam fails with "OS Error 260". NotProton
 # only removes notproton* folders it wrote itself (a flavor file or its own run header), so this
@@ -53,7 +63,10 @@ case $verb in
   getnativepath) print -r -- "$1"; exit 0 ;;
 esac
 
+# Dialogs only for the game itself: Steam first runs the game's install script
+# (iscriptevaluator.exe, verb "run") through the tool too, which would show each one twice.
 alert() {
+  [[ $verb == waitforexitandrun ]] || return 0
   /usr/bin/osascript -e 'on run argv' -e 'display alert (item 1 of argv) message (item 2 of argv) as critical' \
     -e 'end run' "$1" "$2" >/dev/null 2>&1 &
 }
@@ -65,12 +78,40 @@ say "=== $verb $* (tool ${tool:t}, runtime $(/usr/bin/sed -n 's/.*"version": *"\
 
 if [[ ! -x $engine/bin/wine ]]; then
   say "no runtime at $engine"
-  alert "SteamDriver: THE FINALS is incomplete" "Its Wine runtime is missing. Install it again from SteamDriver."
+  alert "SteamDriver is incomplete" "Its Wine runtime is missing. Add it to Steam again in macSteam."
   exit 1
+fi
+# Apple's Game Porting Toolkit is the player's own (macSteam ships none of Apple's files): a
+# runtime made by environments/finals/scripts/unbundle_gptk.py links Apple's modules into
+# lib/apple-gptk, which points at SteamDriver/GPTK, the contents of the toolkit's redist/lib.
+# macSteam checks that folder in full; here only that it's there and Apple-signed, unchanged.
+gptk="$HOME/Library/Application Support/SteamDriver/GPTK"
+# The player copies the image's redist folder in (or its lib folder, or lib's contents).
+for nested in redist/lib lib; do [[ -d $gptk/$nested/external ]] && { gptk=$gptk/$nested; break; }; done
+if [[ -L $engine/lib/external/libd3dshared.dylib ]]; then
+  gptk_missing=()
+  for f in external/D3DMetal.framework/Versions/A/D3DMetal external/libd3dshared.dylib \
+           wine/x86_64-windows/{d3d11,dxgi,d3d12,d3d12core}.dll wine/x86_64-unix/{d3d11,dxgi,d3d12,d3d12core}.so; do
+    [[ -f $gptk/$f ]] || gptk_missing+=($f)
+  done
+  if (( ${#gptk_missing} )); then
+    say "Apple's Game Porting Toolkit is incomplete in $gptk: missing ${gptk_missing[*]}"
+    alert "Apple's Game Porting Toolkit is needed" "SteamDriver uses your own copy of Apple's Game Porting Toolkit 4. Download it from Apple, open it, then open Evaluation environment for Windows games and copy its redist folder into the folder macSteam's Show Folder opens (under Renderers)."
+    exit 1
+  fi
+  for f in "$gptk/external/D3DMetal.framework" "$gptk/external/libd3dshared.dylib"; do
+    if ! /usr/bin/codesign --verify --strict -R='anchor apple' "$f" 2>/dev/null; then
+      say "not signed by Apple: $f"
+      alert "Apple's Game Porting Toolkit is damaged" "${f:t} in your Game Porting Toolkit folder isn't signed by Apple. Copy the redist folder again from Apple's image."
+      exit 1
+    fi
+  done
+  /bin/ln -sfn "$gptk" "$engine/lib/apple-gptk" || { say "could not link $engine/lib/apple-gptk"; exit 1; }
+  say "Apple's Game Porting Toolkit from $gptk ($(/usr/bin/plutil -extract CFBundleShortVersionString raw "$gptk/external/D3DMetal.framework/Resources/Info.plist" 2>/dev/null))"
 fi
 if [[ ! -f $bridge/lsteamclient.dll || ! -f $bridge/x86_64-unix/lsteamclient.so || ! -f $bridge/steam.exe ]]; then
   say "NotProton's Steam bridge is missing at $bridge"
-  alert "NotProton is needed" "SteamDriver: THE FINALS uses NotProton's Steam bridge. Install NotProton and open it once."
+  alert "NotProton is needed" "SteamDriver uses NotProton's Steam bridge. Install NotProton and open it once."
   exit 1
 fi
 
@@ -91,7 +132,7 @@ fi
 for f in steamclient64.dll steamclient.dll tier0_s64.dll vstdlib_s64.dll lsteamclient.dll steam.exe x86_64-unix/lsteamclient.so; do
   dst="$prefix_steam/${f:t}"
   /usr/bin/cmp -s "$bridge/$f" "$dst" || /bin/cp -c -f "$bridge/$f" "$dst" 2>/dev/null || /bin/cp -f "$bridge/$f" "$dst" || {
-    say "could not copy $f"; alert "SteamDriver: THE FINALS" "A Steam file could not be copied into the game's prefix."; exit 1; }
+    say "could not copy $f"; alert "SteamDriver" "A Steam file could not be copied into the game's prefix."; exit 1; }
 done
 
 # The finals environment (as environments/finals/tests/finals_bisect/launch_main.sh sets it).
@@ -104,24 +145,127 @@ export WINEESYNC=0
 [[ ${STEAMDRIVER_MSYNC:-1} == 0 ]] && unset WINEMSYNC || export WINEMSYNC=1
 export ROSETTA_ADVERTISE_AVX=$([[ ${STEAMDRIVER_AVX:-1} == 0 ]] && print 0 || print 1)
 export WINEDEBUG=${WINEDEBUG:-err+all,fixme-all,+loaddll}
-# The game's minimum-spec warning (Unreal's, every start on a Mac GPU): shown on the first launch
-# in this prefix, then answered OK as if clicked. Deleting the marker shows it once more.
+# MoltenVK logs outside WINEDEBUG; at its default (info) every Vulkan start dumps its whole device
+# and extension list into the Wine log. 1 = errors only; MVK_CONFIG_LOG_LEVEL=3 brings it back.
+export MVK_CONFIG_LOG_LEVEL=${MVK_CONFIG_LOG_LEVEL:-1}
+# THE FINALS' minimum-spec warning (every start on a Mac GPU): shown on the first launch in this
+# prefix, then answered OK as if clicked. Deleting the marker shows it once more. THE FINALS only
+# (Steam app 2073850): no other game's dialog is answered and no marker is written for it.
+finals_app=2073850
+is_finals=0; [[ ${STEAM_COMPAT_APP_ID:-${compat:t}} == $finals_app ]] && is_finals=1
 gpu_warning_seen=$compat/steamdriver-gpu-warning-seen
-if [[ ${STEAMDRIVER_GPU_WARNING:-0} == 0 && -f $gpu_warning_seen ]]; then
+if (( is_finals )) && [[ ${STEAMDRIVER_GPU_WARNING:-0} == 0 && -f $gpu_warning_seen ]]; then
   export WINE_MSGBOX_ACCEPT='Minimum Hardware Requirements Not Met'
 fi
 
-# SteamDriver's Mac driver mouse (its NotProton rows, docs/NOTPROTON.md). The list names each
-# game's own executable: THE FINALS, and KovaaK's (no anti-cheat, so it can be profiled for the
-# movement stutter both games share).
-case ${STEAMDRIVER_MOUSE:-precise} in
+# SteamDriver's Mac driver mouse (as its NotProton rows, docs/NOTPROTON.md), for every game.
+case ${STEAMDRIVER_MOUSE:=hid} in
   off) ;;
   *)
-    export WINEMAC_MOUSELOOK='Discovery.exe;FPSAimTrainer-Win64-Shipping.exe' WINEMAC_INPUT_VARIANT=precise WINEMAC_RAW_STATUS=$compat/hid-status.json
+    # Every program but Steam's own and Wine's desktop (as macSteam's NotProton mouse row,
+    # NotProton.mouselook); the report goes where macSteam's mouse panel reads it.
+    export WINEMAC_MOUSELOOK='*;!steam.exe;!steamwebhelper.exe;!steamwebhelper_real.exe;!steamservice.exe;!steamerrorreporter.exe;!steamerrorreporter64.exe;!gameoverlayui.exe;!gameoverlayui64.exe;!explorer.exe'
+    export WINEMAC_INPUT_VARIANT=precise WINEMAC_RAW_STATUS="$HOME/Library/Application Support/SteamDriver/hid-status.json"
     [[ ${STEAMDRIVER_MOUSE:-} == classic ]] && export WINEMAC_INPUT_VARIANT=classic
-    [[ ${STEAMDRIVER_MOUSE:-} == hid ]] && export WINEMAC_RAW_SOURCE=hid WINEMAC_RAW_REQUEST=1
+    [[ $STEAMDRIVER_MOUSE == hid ]] && export WINEMAC_RAW_SOURCE=hid WINEMAC_RAW_REQUEST=1
     ;;
 esac
+
+# High-precision is tried on every launch. The first time the game's report says Steam may not
+# read the mouse (no Device Control and Data Access, or Input Monitoring refused), a dialog says once that it's
+# recommended and where to allow it; the driver already uses the precise mouse meanwhile. The
+# first report written after this launch decides; later launches still try, without a dialog.
+hid_status="$HOME/Library/Application Support/SteamDriver/hid-status.json"
+hid_note="$HOME/Library/Application Support/SteamDriver/.hid-note-shown"
+if [[ $verb == waitforexitandrun && $STEAMDRIVER_MOUSE == hid && ! -e $hid_note ]]; then
+  {
+    started=$(/bin/date +%s)
+    for i in {1..90}; do
+      /bin/sleep 1
+      [[ -f $hid_status ]] && (( $(/usr/bin/stat -f %m "$hid_status") >= started )) || continue
+      if /usr/bin/grep -q '"access":"denied"' "$hid_status" && [[ ! -e $hid_note ]]; then
+        : > "$hid_note"
+        say "High-precision mouse: Steam may not read the mouse; showing the note once"
+        /usr/bin/osascript -e 'on run argv' \
+          -e 'set r to display alert (item 1 of argv) message (item 2 of argv) buttons {"Not Now", "Open Settings"} default button 2 giving up after 300' \
+          -e 'if button returned of r is "Open Settings" then do shell script "open " & quoted form of (item 3 of argv)' -e 'end run' \
+          "High-precision mouse is recommended" \
+          "SteamDriver reads your mouse directly for the most precise aim, but Steam isn't allowed to yet, so the game uses the standard mouse.
+
+In System Settings › Privacy & Security › Device Control and Data Access, turn on Steam, then quit and reopen Steam. You only see this once." \
+          "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility" >/dev/null 2>&1
+      fi
+      break
+    done
+  } &!
+fi
+
+# The first game started through SteamDriver: a note, once, on the macOS questions that follow.
+first_start="$HOME/Library/Application Support/SteamDriver/.first-start-shown"
+if [[ $verb == waitforexitandrun && ! -e $first_start ]]; then
+  /bin/mkdir -p "${first_start:h}" && : > "$first_start"
+  /usr/bin/osascript -e 'on run argv' -e 'display alert (item 1 of argv) message (item 2 of argv)' -e 'end run' \
+    "Your first game with SteamDriver" \
+    "macOS may ask about the game the first time. Choose Allow:
+• Local Network, for online play
+• Microphone, for voice chat
+• Steam reading your mouse (Device Control and Data Access, or Input Monitoring), for the High-precision mouse; it works from the next launch
+
+You only see this once." >/dev/null 2>&1 &
+fi
+
+# Game shortcuts (wine-macdrv-game-shortcuts.patch): the Mac driver switches the listed macOS
+# shortcuts off in WindowServer while the game is in front and records their ids per process in
+# $shortcut_records. That switch outlives a crashed or killed process, so whatever a record still
+# lists is switched back on here (osascript's JavaScript bridge reaches the same SkyLight call;
+# nothing to install). Only records of processes that are gone are touched.
+shortcut_records=$compat/shortcuts-taken
+restore_shortcuts() {
+  local f pid ids
+  for f in $shortcut_records/<->(N); do
+    pid=${f:t}
+    /bin/kill -0 $pid 2>/dev/null && continue
+    ids=(${(f)"$(<$f)"})
+    (( ${#ids} )) && /usr/bin/osascript -l JavaScript -e 'function run(argv) { ObjC.import("AppKit");
+      ObjC.bindFunction("CGSSetSymbolicHotKeyEnabled", ["int", ["int", "bool"]]);
+      argv.forEach(function (id) { $.CGSSetSymbolicHotKeyEnabled(parseInt(id, 10), true); }); }' $ids >/dev/null 2>&1 &&
+      say "macOS shortcuts $ids handed back to macOS (left off by process $pid)"
+    /bin/rm -f $f
+  done
+}
+# The list: the app's key combo overrides (app/Sources/KeyOverrides.swift; one combo per line):
+# Global, then this game's own, plus STEAMDRIVER_SHORTCUTS from the launch options.
+# Each game launched through this tool is recorded in games/<app id> (its name on the first line),
+# so the app can offer it a profile of its own. The app id is the name of Steam's
+# compatdata/<app id> folder; the name comes from Steam's appmanifest next to the game.
+steamdriver="$HOME/Library/Application Support/SteamDriver"
+# Before the app was renamed (MacVolvo, until 2026-11-24) and has moved its folder over:
+[[ ! -d $steamdriver && -d "$HOME/Library/Application Support/MacVolvo NotProton" ]] &&
+  steamdriver="$HOME/Library/Application Support/MacVolvo NotProton"
+app_id=${compat:t}
+if [[ $verb == waitforexitandrun && $app_id == <-> ]]; then
+  game_name= install=${STEAM_COMPAT_INSTALL_PATH:-/nonexistent/x/y}
+  for manifest in "${install:h:h}/appmanifest_$app_id.acf" "${compat:h:h}/appmanifest_$app_id.acf"; do
+    [[ -f $manifest ]] || continue
+    game_name=$(/usr/bin/sed -n 's/^[[:space:]]*"name"[[:space:]]*"\(.*\)"$/\1/p' "$manifest" | head -1)
+    [[ -n $game_name ]] && break
+  done
+  /bin/mkdir -p "$steamdriver/games" &&
+    # Line 4, the Direct3D detected at a previous exit (below), stays until a launch sees another.
+    known_d3d=$( [[ -f $steamdriver/games/$app_id ]] && /usr/bin/grep -m1 '^direct3d=' "$steamdriver/games/$app_id" )
+    print -rl -- "${game_name:-App $app_id}" "${tool:t}" "$(/bin/date '+%Y-%m-%d %H:%M:%S')" ${known_d3d:+"$known_d3d"} > "$steamdriver/games/$app_id"
+fi
+shortcuts=(${(s:,:)${STEAMDRIVER_SHORTCUTS:-}})
+for f in "$steamdriver/key-overrides/global.txt" "$steamdriver/key-overrides/app-$app_id.txt"; do
+  [[ -f $f ]] && shortcuts+=(${${(f)"$(<$f)"}:#\#*})
+done
+shortcuts=(${(u)shortcuts})
+if (( ${#shortcuts} )); then
+  STEAMDRIVER_SHORTCUTS=${(j:,:)shortcuts}
+  /bin/mkdir -p "$shortcut_records"
+  export WINEMAC_GAME_SHORTCUTS=$STEAMDRIVER_SHORTCUTS WINEMAC_GAME_SHORTCUTS_RECORD=$shortcut_records
+fi
+restore_shortcuts
 
 # The in-process Rosetta syscall hook (environments/finals/tests/rosetta_nt). It replaces
 # anything Steam asked to insert: the hook has to be the process's own, and DISABLE_AOT has
@@ -132,7 +276,7 @@ if [[ ${STEAMDRIVER_NT_HOOK:-1} != 0 && -f $engine/lib/macfinals-nt-hook.dylib ]
 fi
 
 say "WINEDLLOVERRIDES=$WINEDLLOVERRIDES"
-say "hook=${DYLD_INSERT_LIBRARIES:-off} mouse=${STEAMDRIVER_MOUSE:-precise} msync=${WINEMSYNC:-0} avx=$ROSETTA_ADVERTISE_AVX nt_off=${MACFINALS_NT_OFF:--}"
+say "hook=${DYLD_INSERT_LIBRARIES:-off} mouse=${STEAMDRIVER_MOUSE:-precise} shortcuts=${STEAMDRIVER_SHORTCUTS:-none} msync=${WINEMSYNC:-0} avx=$ROSETTA_ADVERTISE_AVX nt_off=${MACFINALS_NT_OFF:--}"
 shim='C:\Program Files (x86)\Steam\steam.exe'
 
 case $verb in
@@ -163,15 +307,37 @@ case $verb in
     fi
     say "launching: $shim $*"
     started=$SECONDS
+    wlog_start=$( [[ -f $wlog ]] && /usr/bin/stat -f %z "$wlog" || print 0 )
     "$WINELOADER" "$shim" "$@" >> "$compat/steamdriver-wine.log" 2>&1
     rc=$?
     say "game exited ($rc); ending the prefix's Wine session"
     # The warning appears at start: a session that lasted past it has shown it.
-    if [[ ! -f $gpu_warning_seen ]] && (( SECONDS - started > 30 )); then
+    if (( is_finals )) && [[ ! -f $gpu_warning_seen ]] && (( SECONDS - started > 30 )); then
       : > "$gpu_warning_seen"
       say "the minimum-spec warning has been shown once; later launches answer it"
     fi
     "$WINESERVER" -k 2>/dev/null
+    "$WINESERVER" -w 2>/dev/null
+    restore_shortcuts
+    # DX11/DX12 detection: which Direct3D this launch loaded, from Wine's own DLL-load lines
+    # (+loaddll, on by default above) in this launch's part of the Wine log; no game file is
+    # read. D3D12 wins (D3D12 games may load d3d11 too, for video or 11-on-12); d3d9 alone says
+    # nothing (launchers and overlays load it). Remembered per game as line 4 of games/<app id>,
+    # which macSteam shows and uses (Profiles.swift).
+    if [[ $app_id == <-> && -f $steamdriver/games/$app_id && -f $wlog ]]; then
+      d3d=${(L)$(/usr/bin/tail -c +$((wlog_start + 1)) "$wlog" | /usr/bin/grep -a ':loaddll:' \
+        | /usr/bin/grep -aoiE '\\(d3d12|d3d11)\.dll"' | /usr/bin/sort -u)}
+      kind=
+      [[ $d3d == *d3d11.dll* ]] && kind=dx11
+      [[ $d3d == *d3d12.dll* ]] && kind=dx12
+      if [[ -n $kind ]]; then
+        rec=("${(@f)$(<$steamdriver/games/$app_id)}")
+        print -rl -- "${rec[1]}" "${rec[2]}" "${rec[3]}" "direct3d=$kind" > "$steamdriver/games/$app_id"
+        say "Direct3D: $kind"
+      else
+        say "Direct3D: not seen this launch (no d3d11/d3d12 load in the Wine log)"
+      fi
+    fi
     exit $rc ;;
   runinprefix)
     "$WINELOADER" "$@" >> "$log" 2>&1; exit $? ;;

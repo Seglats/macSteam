@@ -107,7 +107,11 @@ struct CompanionView:View {
                     StatusLine(.problem,"NotProton isn’t installed. It turns on Steam Play in the macOS Steam app. Install it, open it once so it sets up Steam, then come back here.")
                 case .unsupported(let builds):
                     StatusLine(.good,"NotProton is installed.")
-                    StatusLine(.warning,"\(Brand.name)’s driver is built for CrossOver 26.3. NotProton uses \(builds.isEmpty ? "no CrossOver yet; open NotProton to set it up" : builds.joined(separator:", ")).")
+                    if builds.isEmpty {
+                        StatusLine(.good,"SteamDriver doesn’t need CrossOver. Only SteamDriver on CrossOver does: to use it, add CrossOver 26.3 in NotProton.")
+                    } else {
+                        StatusLine(.warning,"\(Brand.name)’s driver is built for CrossOver 26.3. NotProton uses \(builds.joined(separator:", ")).")
+                    }
                 case .available(let tools):
                     StatusLine(.good,"NotProton is installed, with \(names(tools,\.display)).")
                 case .added(let tools):
@@ -175,7 +179,7 @@ struct CompanionView:View {
     private var steamDriverDetail:String {
         switch model.notProton {
         case .notInstalled: return "macSteam’s Mac driver, renderers and mouse options on NotProton’s CrossOver. Needs NotProton."
-        case .unsupported(let builds): return "Built for CrossOver 26.3; NotProton uses \(builds.isEmpty ? "no CrossOver yet (open NotProton to set it up)" : builds.joined(separator:", "))."
+        case .unsupported(let builds): return "Built for CrossOver 26.3; \(builds.isEmpty ? "NotProton has no CrossOver: add CrossOver 26.3 in NotProton to use this." : "NotProton uses "+builds.joined(separator:", ")+".")"
         case .available: return "macSteam’s Mac driver, renderers and mouse options on NotProton’s CrossOver. Not in Steam yet."
         case .added:
             if !model.notProtonCurrent { return "In Steam; this version of \(Brand.name) has newer files." }

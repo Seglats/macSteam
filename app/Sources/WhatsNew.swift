@@ -1,14 +1,16 @@
 // Offline release notes, also available from Help.
 enum WhatsNew {
-    static let version="1.1"
+    static let version="1.0"
     static let items:[(symbol:String, title:String, detail:String)]=[
-        ("macwindow","Open Steam requests its window",
-         "Restores Steam through its window request instead of only activating its process. The launcher no longer pulls focus back to your game afterward."),
-        ("arrow.clockwise","Steam browser recovery",
-         "Open Steam repairs an idle client after an update replaces its browser helper. Finish and close a running game before restarting Steam."),
-        ("checkmark.circle","Wine session cleanup",
-         "Temporary launch requests are reaped, and closing Steam waits for its remaining Wine services to exit."),
-        ("rectangle.expand.vertical","Deadlock display issue remains under investigation",
-         "UI and click positions may shift after changing video settings. Try closing Deadlock, turning off Fullscreen in macSteam and relaunching at a resolution that fits your display."),
+        ("gamecontroller","SteamDriver for every game",
+         "macSteam’s own Wine, offered in macOS Steam as a compatibility tool: Apple D3DMetal from your Game Porting Toolkit, key combo overrides and the High-precision mouse. Needs NotProton, not CrossOver."),
+        ("cursorarrow.motionlines","Lower input latency",
+         "Measured end to end in Counter-Strike 2: mouse 35 → 20 ms and keyboard 32 → 25 ms compared with CrossOver."),
+        ("slider.horizontal.3","Profiles and options in Steam",
+         "Global DX11, Global DX12 and per-game profiles, plus the SteamDriver driver, renderer and mouse options on NotProton’s CrossOver."),
+        ("headphones","Headphone surround (experimental)",
+         "5.1 and 7.1 game sound on headphones, with a test and live settings you can tune and save."),
+        ("gamecontroller.fill","More controller support (experimental)",
+         "Controllers in Xbox mode, such as 8BitDo pads, reach SteamDriver games directly at their full rate."),
     ]
 }

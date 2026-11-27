@@ -58,7 +58,13 @@ enum NotProton {
         case added([Tool])
     }
 
-    static var installed:Bool { fm.fileExists(atPath:support.appendingPathComponent("tools").path) }
+    /// NotProton has set up Steam. Its tool registry (`tools`) lists CrossOver runners only, so
+    /// without CrossOver there is none (NotProton 1.2.8, 2026-11-27); its install record
+    /// (`install-build.json`, written when it sets up Steam) is there either way. SteamDriver needs
+    /// only that: Steam Play on. CrossOver matters only for SteamDriver on CrossOver.
+    static var installed:Bool {
+        ["tools","install-build.json"].contains { fm.fileExists(atPath:support.appendingPathComponent($0).path) }
+    }
     private static func valid(_ s:Substring)->Bool {
         !s.isEmpty && s.allSatisfy { $0.isASCII && ($0.isLetter || $0.isNumber || "._-".contains($0)) }
     }

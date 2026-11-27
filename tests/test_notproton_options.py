@@ -441,6 +441,14 @@ class NotProtonOptions(unittest.TestCase):
         (self.lib / 'notproton/tools').unlink()
         self.assertEqual(self.run_tool('status'), {'status': 'notInstalled', 'current': False})
 
+    def test_notproton_without_crossover_counts_as_installed(self):
+        # NotProton 1.2.8 with no CrossOver (2026-11-27): Steam set up, install record there, but no
+        # tool registry, since that lists CrossOver runners only. SteamDriver works; only
+        # SteamDriver on CrossOver can't be added.
+        (self.lib / 'notproton/tools').unlink()
+        (self.lib / 'notproton/install-build.json').write_text('{"version":"1.2.8"}')
+        self.assertEqual(self.run_tool('status')['status'], 'unsupported')
+
 
 if __name__ == '__main__':
     unittest.main()

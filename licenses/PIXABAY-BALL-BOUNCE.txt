@@ -1,0 +1,12 @@
+Headphone surround test sound (scripts/surround/ball-bounce.wav)
+===============================================================
+
+Source: "bouncy ball on tile" (Pixabay id 95978), uploaded by freesound_community, from Pixabay.
+
+Licence: Pixabay Content License, https://pixabay.com/service/license-summary/
+Free to use and to change; no credit required. It may not be sold or distributed on its own,
+unchanged.
+
+Changes: one bounce cut out (0.297-0.497 s), made mono at 48 kHz, rumble below 80 Hz removed,
+faded in and out, peak set to 0.6 (scripts/surround/README.md). The sound is not covered by
+SteamDriver's Apache 2.0 licence.

@@ -1,0 +1,25 @@
+MIT Media Lab KEMAR HRTF measurements
+=====================================
+
+Used by: Headphone surround (scripts/surround/kemar.head, scripts/surround/kemar_elev0.h,
+scripts/surround/fitted_ir.h and the filters in the Wine patch
+environments/finals/patches/wine-coreaudio-headphone-surround-fitted.patch).
+
+Measurements: Bill Gardner and Keith Martin, MIT Media Lab, 1994.
+SOFA conversion: Acoustics Research Institute, Austrian Academy of Sciences (OeAW),
+sofacoustics.org (mit_kemar_normal_pinna.sofa).
+
+Licence, as given in the SOFA file's own licence field:
+
+    This HRTF data is provided without any usage restrictions. It is requested that you
+    cite Gardner and Martin (1995) when using this data for research or commercial
+    applications.
+
+Citation:
+
+    W. G. Gardner and K. D. Martin, "HRTF measurements of a KEMAR",
+    J. Acoust. Soc. Am. 97 (6), 3907-3908, 1995.
+
+What SteamDriver made from it: kemar.head is a table derived from the measurements (level per
+frequency and onset time per ear, by direction) by scripts/surround_fit/heads.py; the other files
+are filters computed from them. The data is not covered by SteamDriver's Apache 2.0 licence.

@@ -167,6 +167,9 @@ def build(output,workspace,runtime_archive,icon=None,identity=None,variant='dxmt
     with tempfile.TemporaryDirectory() as folder:
         run('/usr/bin/tar','-xzf',runtime_archive,'-C',folder,'licenses')
         shutil.copytree(Path(folder)/'licenses',resources/'Licenses')
+    # Headphone surround's data shipped in the app itself: the KEMAR head table and the test sound.
+    for name in ('MIT-KEMAR-HRTF.txt','PIXABAY-BALL-BOUNCE.txt'):
+        shutil.copy2(ROOT/'licenses'/name,resources/'Licenses'/name)
     shutil.copy2(ROOT/'licenses/PROJECT-APACHE-2.0',resources/'PROJECT-LICENSE.txt')
     shutil.copy2(ROOT/'licenses/PROJECT-NOTICE',resources/'NOTICE.txt')
     shutil.copy2(ROOT/'licenses/GITHUB-MARK-NOTICE.txt',resources/'GITHUB-MARK-NOTICE.txt')

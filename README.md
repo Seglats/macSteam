@@ -152,7 +152,14 @@ SteamDriver builds on:
 - DXMT by Feifan He through NerRobDog's fork;
 - Soju's runtime build recipe;
 - the design of THE FINALS' Rosetta hook, which draws on
-  [rosettax87_jit](https://github.com/Lifeisawful/rosettax87_jit) by Lifeisawful.
+  [rosettax87_jit](https://github.com/Lifeisawful/rosettax87_jit) by Lifeisawful;
+- Headphone surround's head responses: the MIT Media Lab KEMAR measurements by Bill Gardner and
+  Keith Martin (W. G. Gardner and K. D. Martin, "HRTF measurements of a KEMAR", J. Acoust. Soc.
+  Am. 97 (6), 1995), from the SOFA file at [sofacoustics.org](https://sofacoustics.org)
+  (conversion by the Acoustics Research Institute, OeAW). Provided without usage restrictions,
+  with this citation requested: [licenses/MIT-KEMAR-HRTF.txt](licenses/MIT-KEMAR-HRTF.txt);
+- Headphone surround's test sound: "bouncy ball on tile" by freesound_community on Pixabay,
+  under the Pixabay Content License: [licenses/PIXABAY-BALL-BOUNCE.txt](licenses/PIXABAY-BALL-BOUNCE.txt).
 
 THE FINALS' route uses NotProton's Steam bridge (GPL-3.0; Valve's lsteamclient and steam-helper
 from Proton) unchanged, from your NotProton install. Apple's D3DMetal comes from your own Game

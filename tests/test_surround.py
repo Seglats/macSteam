@@ -328,7 +328,7 @@ class SurroundTestInTheApp(unittest.TestCase):
         shutil.copy(ROOT / 'scripts/surround/ball-bounce.wav', cls.exe_dir / 'ball-bounce.wav')
         (root / 'harness.swift').write_text(APP_HARNESS)
         cls.harness = root / 'harness'
-        sources = ['SurroundTest', 'NotProton', 'NotProtonExtras', 'Profiles', 'KeyOverrides', 'Migration', 'Brand', 'InstallLocation', 'Surround', 'GameTools', 'ControllerSupport']
+        sources = ['SurroundTest', 'NotProton', 'NotProtonExtras', 'Profiles', 'KeyOverrides', 'Migration', 'Brand', 'InstallLocation', 'Surround', 'GameTools', 'CrossOverLicense', 'ControllerSupport']
         subprocess.run(['xcrun', 'swiftc', '-parse-as-library', *[str(ROOT / f'app/Sources/{s}.swift') for s in sources], str(root / 'harness.swift'),
                         '-o', str(cls.harness)], check=True, capture_output=True)
 

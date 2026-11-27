@@ -74,6 +74,9 @@ enum GameTools {
         if case .foreign=state(tool) {
             throw Failure(errorDescription:"Steam already has a \u{201C}\(tool.id)\u{201D} tool that \(Brand.name) didn’t install, so it was left as it is.")
         }
+        // A licensed CrossOver first, as NotProton requires for its own tool (CrossOverLicense.swift).
+        let license=CrossOverLicense.check()
+        guard license == .valid else { throw Failure(errorDescription:license.message+" Nothing was installed.") }
         try fm.createDirectory(at:parent,withIntermediateDirectories:true)
         let staging=parent.appendingPathComponent(".\(tool.id).installing"),old=parent.appendingPathComponent(".\(tool.id).old")
         try? fm.removeItem(at:staging);try? fm.removeItem(at:old)

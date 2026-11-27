@@ -108,7 +108,7 @@ struct CompanionView:View {
                 case .unsupported(let builds):
                     StatusLine(.good,"NotProton is installed.")
                     if builds.isEmpty {
-                        StatusLine(.good,"SteamDriver doesn’t need CrossOver. Only SteamDriver on CrossOver does: to use it, add CrossOver 26.3 in NotProton.")
+                        StatusLine(.warning,"NotProton has no CrossOver yet. SteamDriver on CrossOver needs CrossOver 26.3 added in NotProton.")
                     } else {
                         StatusLine(.warning,"\(Brand.name)’s driver is built for CrossOver 26.3. NotProton uses \(builds.joined(separator:", ")).")
                     }
@@ -135,7 +135,7 @@ struct CompanionView:View {
             LauncherPrimaryAction(title:"Get NotProton") { NSWorkspace.shared.open(NotProton.projectURL) }
         } else if let tool=model.gameTools.first,model.gameToolStates[tool.id] ?? .notInstalled == .notInstalled {
             LauncherPrimaryAction(title:model.installingGameTool != nil ? "Adding SteamDriver…" : "Add to Steam") { model.installGameTool(tool) }
-                .keyboardShortcut(.defaultAction).disabled(model.installingGameTool != nil)
+                .keyboardShortcut(.defaultAction).disabled(model.installingGameTool != nil || model.crossOverLicense != .valid)
         }
     }
 
@@ -151,6 +151,9 @@ struct CompanionView:View {
                 }
                 if case .notInstalled=model.notProton {
                     StatusLine(.problem,"Needs NotProton: install it and open it once first.")
+                }
+                if !model.gameTools.isEmpty,model.crossOverLicense != .valid {
+                    StatusLine(.problem,model.crossOverLicense.message)
                 }
                 ForEach(model.gameTools) { tool in
                     runtimeRow(tool.display,subtitle:"Global",detail:gameToolDetail(tool)) { gameToolButtons(tool) }
@@ -210,17 +213,17 @@ struct CompanionView:View {
         }
     }
     @ViewBuilder private func gameToolButtons(_ tool:GameTools.Tool)->some View {
-        let busy=model.installingGameTool != nil
+        let busy=model.installingGameTool != nil || model.crossOverLicense != .valid
         switch model.gameToolStates[tool.id] ?? .notInstalled {
         case .notInstalled:
             Button("Add to Steam") { model.installGameTool(tool) }.buttonStyle(.bordered).hoverGrow().buttonBorderShape(.capsule).disabled(busy)
         case .outdated:
             HStack(spacing:10) {
                 Button("Update") { model.installGameTool(tool) }.buttonStyle(.bordered).hoverGrow().buttonBorderShape(.capsule).disabled(busy)
-                Button("Remove") { model.removeGameTool(tool) }.buttonStyle(.borderless).hoverGrow().foregroundStyle(.red).disabled(busy)
+                Button("Remove") { model.removeGameTool(tool) }.buttonStyle(.borderless).hoverGrow().foregroundStyle(.red).disabled(model.installingGameTool != nil)
             }
         case .installed:
-            Button("Remove") { model.removeGameTool(tool) }.buttonStyle(.borderless).hoverGrow().foregroundStyle(.red).font(LauncherStyle.font(12,.medium)).disabled(busy)
+            Button("Remove") { model.removeGameTool(tool) }.buttonStyle(.borderless).hoverGrow().foregroundStyle(.red).font(LauncherStyle.font(12,.medium)).disabled(model.installingGameTool != nil)
         case .foreign:
             EmptyView()
         }

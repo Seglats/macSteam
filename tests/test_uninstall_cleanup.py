@@ -26,6 +26,7 @@ import Foundation
         try! Profiles.addGame(appID:"2073850",name:"THE FINALS",kind:.dx12,resources:res)
         try! NotProton.add(resources:res)
         NotProton.keepDeadlockOnDirectX11()
+        CrossOverLicense.answerForTests = .valid
         try! GameTools.install(GameTools.Tool(id:"notproton-steamdriver",game:"SteamDriver",display:"SteamDriver",
                                               runtime:"macfinals-test",bundle:URL(fileURLWithPath:a[4])))
         try! KeyOverrides.save(KeyOverrides.globalID,["ctrl+space"])
@@ -41,7 +42,7 @@ import Foundation
     print(String(data:try! JSONSerialization.data(withJSONObject:["notes":Uninstaller.run(removePrefixes:!keep)]),encoding:.utf8)!)
 }}
 '''
-SOURCES = ['Uninstaller', 'NotProton', 'NotProtonExtras', 'Profiles', 'KeyOverrides', 'Brand', 'GameTools', 'InstallLocation', 'ControllerSupport', 'Surround']
+SOURCES = ['Uninstaller', 'NotProton', 'NotProtonExtras', 'Profiles', 'KeyOverrides', 'Brand', 'GameTools', 'CrossOverLicense', 'InstallLocation', 'ControllerSupport', 'Surround']
 
 
 class UninstallCleanup(unittest.TestCase):

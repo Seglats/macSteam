@@ -125,7 +125,7 @@ class AppSettings(unittest.TestCase):
                         '-o', cls.helpers / 'surround_preview'], check=True, capture_output=True)
         (root / 'harness.swift').write_text(APP_HARNESS)
         cls.harness = root / 'harness'
-        sources = ['SurroundSettings', 'NotProton', 'NotProtonExtras', 'Profiles', 'KeyOverrides', 'Migration', 'Brand', 'InstallLocation', 'Surround', 'GameTools', 'ControllerSupport']
+        sources = ['SurroundSettings', 'NotProton', 'NotProtonExtras', 'Profiles', 'KeyOverrides', 'Migration', 'Brand', 'InstallLocation', 'Surround', 'GameTools', 'CrossOverLicense', 'ControllerSupport']
         subprocess.run(['xcrun', 'swiftc', '-parse-as-library', *[str(ROOT / f'app/Sources/{s}.swift') for s in sources], str(root / 'harness.swift'),
                         '-o', str(cls.harness)], check=True, capture_output=True)
         cls.home = root / 'home'

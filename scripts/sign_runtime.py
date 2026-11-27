@@ -3,6 +3,14 @@
 
 This records a signing derivation, not a fresh source build or release approval.
 The pinned Apple library is preserved. Requires Python 3.11 with tar data filter.
+
+The main runtime carries Apple's libd3dshared.dylib, which must stay Apple's. SteamDriver's runtime
+(environments/finals, unbundle_gptk.py) carries none: that path is a link into the player's own
+Game Porting Toolkit, left as it is. --keep-dyld adds allow-dyld-environment-variables to every
+executable that has entitlements: SteamDriver's runtime loads its Rosetta hook with
+DYLD_INSERT_LIBRARIES (compat-tool/run), which the hardened runtime otherwise drops
+(add_nt_hook.py signs those executables ad hoc for that reason; notarization needs the hardened
+runtime).
 """
 import argparse
 import copy
@@ -12,14 +20,58 @@ from pathlib import Path, PurePosixPath
 import plistlib
 import re
 import subprocess
+import struct
 import tarfile
 import tempfile
 
-from derive_runtime import sha, tree, unsigned_identical, write_archive
+from derive_runtime import sha, tree, write_archive
 
 APPLE = 'lib/external/libd3dshared.dylib'
 APPLE_SHA = '5131e631eee8b542eadf48f4df9fd662d9aeeb59139137e0e6e14047dc434995'
+KEEP_DYLD = 'com.apple.security.cs.allow-dyld-environment-variables'
 MAGICS = {b'\xcf\xfa\xed\xfe', b'\xfe\xed\xfa\xcf', b'\xca\xfe\xba\xbe', b'\xce\xfa\xed\xfe'}
+
+
+def linkedit_normalized(data):
+    """The Mach-O (thin or universal) with each __LINKEDIT segment's vmsize zeroed. A larger
+    signature (Developer ID with a timestamp instead of ad hoc) makes codesign reserve more of
+    __LINKEDIT in memory, and --remove-signature doesn't shrink it back; that field is signature
+    room, not code, so the unsigned comparison ignores it and nothing else."""
+    data = bytearray(data)
+
+    def thin(base):
+        magic = struct.unpack_from('<I', data, base)[0]
+        if magic not in (0xfeedfacf, 0xfeedface):
+            return
+        wide = magic == 0xfeedfacf
+        ncmds = struct.unpack_from('<I', data, base + 16)[0]
+        at = base + (32 if wide else 28)
+        for _ in range(ncmds):
+            cmd, size = struct.unpack_from('<II', data, at)
+            if cmd in (0x19, 0x1) and data[at + 8:at + 24].rstrip(b'\0') == b'__LINKEDIT':
+                if wide:
+                    struct.pack_into('<Q', data, at + 32, 0)
+                else:
+                    struct.pack_into('<I', data, at + 28, 0)
+            at += size
+
+    if struct.unpack_from('>I', data, 0)[0] == 0xcafebabe:
+        for i in range(struct.unpack_from('>I', data, 4)[0]):
+            thin(struct.unpack_from('>I', data, 8 + 20 * i + 8)[0])
+    else:
+        thin(0)
+    return bytes(data)
+
+
+def unsigned_same(original, resigned):
+    """True when the two files are the same with their signatures removed (and __LINKEDIT's
+    reserved size set aside, see linkedit_normalized)."""
+    with tempfile.TemporaryDirectory() as folder:
+        copies = [Path(folder) / 'a', Path(folder) / 'b']
+        for source, copy in zip((original, resigned), copies):
+            copy.write_bytes(source.read_bytes())
+            run('codesign', '--remove-signature', copy)
+        return linkedit_normalized(copies[0].read_bytes()) == linkedit_normalized(copies[1].read_bytes())
 
 
 def run(*args):
@@ -63,7 +115,7 @@ def extract_verified(archive, dest):
     return manifest
 
 
-def sign_runtime(archive, output, version, identity):
+def sign_runtime(archive, output, version, identity, keep_dyld=False):
     if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,63}', version):
         raise ValueError('Invalid version')
     if output.exists() or Path(str(output) + '.tar.gz').exists():
@@ -75,9 +127,12 @@ def sign_runtime(archive, output, version, identity):
         manifest = extract_verified(archive, base)
         before = tree(base)
         run('/bin/cp', '-Rc', base, output)
-        if sha(base / APPLE) != APPLE_SHA:
-            raise ValueError('Unexpected Apple component')
-        run('codesign', '--verify', '--strict', '-R=anchor apple', base / APPLE)
+        # Apple's own file, when the runtime carries it (a link into the player's GPTK otherwise).
+        apple = APPLE in manifest['files'] and 'symlink' not in manifest['files'][APPLE]
+        if apple:
+            if sha(base / APPLE) != APPLE_SHA:
+                raise ValueError('Unexpected Apple component')
+            run('codesign', '--verify', '--strict', '-R=anchor apple', base / APPLE)
         native = []
         for name, entry in manifest['files'].items():
             if 'symlink' not in entry:
@@ -87,6 +142,8 @@ def sign_runtime(archive, output, version, identity):
         bundles = sorted({str(p.relative_to(output)) for p in output.rglob('*.app')}, key=lambda s: -s.count('/'))
         for name in [*sorted(native), *bundles]:
             identifier, entitlements = signature(base / name)
+            if keep_dyld and entitlements is not None:
+                entitlements = {**entitlements, KEEP_DYLD: True}
             args = ['codesign', '--force', '--options', 'runtime', '--timestamp', '--sign', identity, '--identifier', identifier]
             if entitlements is not None:
                 plist = Path(temporary) / 'entitlements.plist'
@@ -101,12 +158,12 @@ def sign_runtime(archive, output, version, identity):
                 raise ValueError('Missing Developer ID or hardened runtime: ' + name)
             print('Signed ' + name, flush=True)
         for name in native:
-            if not unsigned_identical(base / name, output / name):
+            if not unsigned_same(base / name, output / name):
                 raise ValueError('Unsigned code changed: ' + name)
         after = tree(output)
         changed = {k for k in before.keys() | after.keys() if before.get(k) != after.get(k)}
         allowed = set(native) | {b + '/Contents/_CodeSignature/CodeResources' for b in bundles}
-        if not changed <= allowed or before[APPLE] != after[APPLE]:
+        if not changed <= allowed or before.get(APPLE) != after.get(APPLE):
             raise ValueError('Unexpected runtime changes: ' + str(sorted(changed - allowed)))
         original = copy.deepcopy(manifest)
         for name in changed:
@@ -115,7 +172,8 @@ def sign_runtime(archive, output, version, identity):
         manifest['version'] = version
         manifest['signing_derivation'] = {'base_version': original['version'], 'base_archive_sha256': sha(archive),
             'identity': identity, 'changed': sorted(changed), 'unsigned_code_identical': True,
-            'apple_component_unmodified': True}
+            'apple_component_unmodified': True, 'apple_component_bundled': apple,
+            'allow_dyld_environment_variables': keep_dyld}
         (output / 'runtime.json').write_text(json.dumps(manifest, indent=2) + '\n')
         result = write_archive(output)
         proof = {'version': version, 'archive_sha256': sha(result), 'archive_bytes': result.stat().st_size,
@@ -130,5 +188,6 @@ if __name__ == '__main__':
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--version', required=True)
     parser.add_argument('--identity', required=True)
+    parser.add_argument('--keep-dyld', action='store_true', help='SteamDriver runtime: keep DYLD_INSERT_LIBRARIES for the Rosetta hook')
     args = parser.parse_args()
-    sign_runtime(args.archive.resolve(), args.output.resolve(), args.version, args.identity)
+    sign_runtime(args.archive.resolve(), args.output.resolve(), args.version, args.identity, args.keep_dyld)

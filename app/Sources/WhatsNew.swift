@@ -3,7 +3,7 @@ enum WhatsNew {
     static let version="1.0"
     static let items:[(symbol:String, title:String, detail:String)]=[
         ("gamecontroller","SteamDriver for every game",
-         "macSteam’s own Wine, offered in macOS Steam as a compatibility tool: Apple D3DMetal from your Game Porting Toolkit, key combo overrides and the High-precision mouse. Needs NotProton, not CrossOver."),
+         "macSteam’s own Wine, offered in macOS Steam as a compatibility tool: Apple D3DMetal from your Game Porting Toolkit, key combo overrides and the High-precision mouse. Needs NotProton and a licensed CrossOver."),
         ("cursorarrow.motionlines","Lower input latency",
          "Measured end to end in Counter-Strike 2: mouse 35 → 20 ms and keyboard 32 → 25 ms compared with CrossOver."),
         ("slider.horizontal.3","Profiles and options in Steam",

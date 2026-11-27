@@ -299,10 +299,13 @@ final class AppModel {
     /// Compatibility tools for games with a Wine of their own (GameTools.swift), as last checked.
     var gameTools:[GameTools.Tool]=[]
     var gameToolStates:[String:GameTools.State]=[:]
+    /// A licensed CrossOver, which installing the SteamDriver tool needs (CrossOverLicense.swift).
+    var crossOverLicense:CrossOverLicense.Status = .valid
     var installingGameTool:String?
     func checkGameTools() {
         gameTools=GameTools.bundled(resources)
         gameToolStates=Dictionary(uniqueKeysWithValues:gameTools.map { ($0.id,GameTools.state($0)) })
+        if !gameTools.isEmpty { crossOverLicense=CrossOverLicense.check() }
     }
     func installGameTool(_ tool:GameTools.Tool) {
         installingGameTool=tool.id;notice="Installing \(tool.display)…"

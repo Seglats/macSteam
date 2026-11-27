@@ -21,7 +21,7 @@ import Foundation
     } catch { print(String(data:try! JSONSerialization.data(withJSONObject:["listed":listed,"error":error.localizedDescription]),encoding:.utf8)!) }
 }}
 '''
-SOURCES = ['OwnSteamGames', 'NotProton', 'NotProtonExtras', 'Profiles', 'KeyOverrides', 'Brand', 'GameTools', 'InstallLocation', 'ControllerSupport', 'Surround']
+SOURCES = ['OwnSteamGames', 'NotProton', 'NotProtonExtras', 'Profiles', 'KeyOverrides', 'Brand', 'GameTools', 'CrossOverLicense', 'InstallLocation', 'ControllerSupport', 'Surround']
 
 
 def manifest(appid, name, folder, size=100):

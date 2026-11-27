@@ -35,17 +35,39 @@ Set `ID="Developer ID Application: <name> (<TEAMID>)"`, `V=1.0` and `W` to the f
    `scripts/build_native_app.py`, and the notes in `app/Sources/WhatsNew.swift` (shown once after
    an update and from Help).
 2. **Tests:** `python3 -m unittest discover tests` must pass.
-3. **Build and sign the app** (hardened runtime and timestamp come with a real identity):
+3. **Sign both runtimes with the Developer ID.** Apple's notary service looks inside the
+   `.tar.gz` runtimes the app carries, and rejects every ad-hoc signed binary in them (the first
+   1.0 submission: 48 files). `scripts/sign_runtime.py` re-signs each native file with the
+   Developer ID, the hardened runtime and a timestamp, keeps identifiers and entitlements, checks
+   that no code changed, and writes a new runtime version:
+
+   ```sh
+   python3 scripts/sign_runtime.py --archive $W/artifacts/macfinals-<N>.tar.gz \
+     --output $W/artifacts/macfinals-<N+1> --version macfinals-<N+1> --identity "$ID" --keep-dyld
+   python3 scripts/sign_runtime.py --archive runtime/phase-2/artifacts/macvolvo-1.2-dev.4.tar.gz \
+     --output runtime/phase-2/artifacts/macvolvo-1.2-signed.1 --version macvolvo-1.2-signed.1 --identity "$ID"
+   ```
+
+   - `macfinals-<N>` is the newest runtime that has passed the release test games (212 for 1.0,
+     signed as 213).
+   - `--keep-dyld` is for SteamDriver's runtime only: it lets the Rosetta hook load under the
+     hardened runtime (`DYLD_INSERT_LIBRARIES`). Check it: run `bin/wine cmd /c echo hello` from
+     the signed runtime with `DYLD_INSERT_LIBRARIES=<runtime>/lib/macfinals-nt-hook.dylib` and
+     `WINEDEBUG=+macfinals_hook`; it must log "append hook installed", as the unsigned one does.
+   - The main runtime only changes when it's rebuilt; re-use its signed archive until then. Put
+     its version and `archive_sha256` (from `macvolvo-1.2-signed.1.tar.json`) in
+     `app/Resources/release.json` as `runtimeVersion` and `runtimeSHA256`.
+   - The main runtime archive isn't in git: in a fresh checkout copy it in, don't rebuild it
+     ([MAIN-RUNTIME.md](MAIN-RUNTIME.md)).
+4. **Build and sign the app** with the signed runtimes (hardened runtime and timestamp come with
+   a real identity):
 
    ```sh
    DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer python3 scripts/build_native_app.py \
-     --identity "$ID" --runtime-archive runtime/phase-2/artifacts/macvolvo-1.2-dev.4.tar.gz \
-     --game-tool finals=$W/artifacts/macfinals-<N>.tar.gz --output runtime/release/$V/macSteam.app
+     --identity "$ID" --runtime-archive runtime/phase-2/artifacts/macvolvo-1.2-signed.1.tar.gz \
+     --game-tool finals=$W/artifacts/macfinals-<N+1>.tar.gz --output runtime/release/$V/macSteam.app
    ```
-
-   `macfinals-<N>` is the newest runtime that has passed the release test games (212 when this
-   was written).
-4. **Notarize and staple the app:**
+5. **Notarize and staple the app:**
 
    ```sh
    ditto -c -k --keepParent runtime/release/$V/macSteam.app runtime/release/$V/macSteam.zip
@@ -56,7 +78,7 @@ Set `ID="Developer ID Application: <name> (<TEAMID>)"`, `V=1.0` and `W` to the f
 
    If Apple rejects it, `xcrun notarytool log <submission id> --keychain-profile macsteam` says
    which file. Fix the cause; never ship around a failed check.
-5. **The DMG** (signed, notarized, stapled; writes the `.sha256` beside it):
+6. **The DMG** (signed, notarized, stapled; writes the `.sha256` beside it):
 
    ```sh
    python3 scripts/build_release_dmg.py --app runtime/release/$V/macSteam.app \
@@ -64,10 +86,10 @@ Set `ID="Developer ID Application: <name> (<TEAMID>)"`, `V=1.0` and `W` to the f
    ```
 
    The file name must be `macSteam-<version>.dmg`: the updater looks for exactly that.
-6. **Test the DMG on a clean setup:** install from the DMG, add SteamDriver, add the Game
+7. **Test the DMG on a clean setup:** install from the DMG, add SteamDriver, add the Game
    Porting Toolkit, and run the games in [RELEASE-TEST-GAMES.md](RELEASE-TEST-GAMES.md). Write
    down each result and the known issues for the release notes.
-7. **Publish** on GitHub: a new release with tag `v1.0`, not marked as a pre-release (the updater
+8. **Publish** on GitHub: a new release with tag `v1.0`, not marked as a pre-release (the updater
    ignores pre-releases and drafts). Attach `macSteam-1.0.dmg` (GitHub records its SHA-256; the
    `.sha256` file is a fallback the updater also reads). The notes need:
    - a **What's new** heading with bullets: the updater shows those;
@@ -75,7 +97,7 @@ Set `ID="Developer ID Application: <name> (<TEAMID>)"`, `V=1.0` and `W` to the f
    - what users need besides the DMG: Steam, NotProton and Apple's Game Porting Toolkit (the
      README's Installing section);
    - the release test results and known issues.
-8. Keep the signed app and DMG (`runtime/release/`): the next release's update is checked against
+9. Keep the signed app and DMG (`runtime/release/`): the next release's update is checked against
    this one's team.
 
 ## What ships, and what doesn't

@@ -37,7 +37,8 @@ turns on Steam Play in the macOS Steam app. It's a fork of
 **SteamDriver** is CrossOver 26.3's Wine, built from source with our own patches. macSteam adds it
 to macOS Steam. In a game's **Properties › Compatibility**, turn on "Force the use of a specific
 Steam Play compatibility tool" and choose **SteamDriver**. It needs NotProton (for Steam Play and
-its Steam bridge) but not CrossOver.
+its Steam bridge) and a licensed copy of CrossOver: macSteam checks the CrossOver licence before it
+installs SteamDriver, as NotProton does for its own tool. The CrossOver trial isn't enough.
 
 - **Direct3D 12** through Apple's D3DMetal, from your own copy of Apple's Game Porting Toolkit;
   **Direct3D 11** through DXMT.
@@ -117,15 +118,17 @@ build bundles them.
 | macOS | macOS Tahoe 26.5 or later |
 | Steam | the macOS [Steam app](https://store.steampowered.com/about/) |
 | NotProton | [NotProton](https://github.com/NotProtonNot/NotProton), installed and opened once (it turns on Steam Play) |
+| CrossOver | a licensed copy of [CrossOver](https://www.codeweavers.com/crossover), installed and activated (the trial isn't supported) |
 | For DirectX 12 games | Apple's [Game Porting Toolkit 4](https://developer.apple.com/games/game-porting-toolkit/) (free; macSteam includes no D3DMetal) |
 | For SteamDriver on CrossOver (optional) | CrossOver 26.3, added in NotProton |
 
-1. **Install Steam and NotProton.** Open NotProton once so it sets up Steam, then quit Steam.
+1. **Install Steam, CrossOver and NotProton.** Activate CrossOver with your licence. Open
+   NotProton once so it sets up Steam, then quit Steam.
 2. **Download macSteam** from [Releases](https://github.com/Seglats/macSteam/releases): open
    `macSteam-<version>.dmg` and drag macSteam to Applications, then open it. If macOS asks to
    install Rosetta, allow it. macSteam updates itself from Releases afterwards.
 3. **Add SteamDriver to Steam:** choose **Add to Steam** at the top of macSteam and let it restart
-   Steam.
+   Steam. macSteam checks your CrossOver licence first.
 4. **Add Apple's Game Porting Toolkit** (for DirectX 12 games):
    1. Download Game Porting Toolkit 4 from
       [Apple](https://developer.apple.com/games/game-porting-toolkit/) (sign in with a free Apple
@@ -213,8 +216,10 @@ SteamDriver builds on:
 - Headphone surround's test sound: "bouncy ball on tile" by freesound_community on Pixabay,
   under the Pixabay Content License: [licenses/PIXABAY-BALL-BOUNCE.txt](licenses/PIXABAY-BALL-BOUNCE.txt).
 
-SteamDriver uses NotProton's Steam bridge (GPL-3.0; Valve's lsteamclient and steam-helper
-from Proton) unchanged, from your NotProton install. Apple's D3DMetal comes from your own Game
+SteamDriver uses NotProton's Steam bridge unchanged, from your NotProton install; nothing of
+NotProton's ships with macSteam. The bridge is NotProton's ports of Valve's lsteamclient
+(Steamworks SDK License) and of Proton's steam-helper (BSD-3-Clause); see NotProton's
+[NOTICE](https://github.com/NotProtonNot/NotProton/blob/main/NOTICE). Apple's D3DMetal comes from your own Game
 Porting Toolkit (`SteamDriver/GPTK`); the SteamDriver runtime only links to it
 (`environments/finals/scripts/unbundle_gptk.py`), and macSteam ships no D3DMetal (the main DXMT runtime from Recall still carries Apple's `libd3dshared.dylib`).
 

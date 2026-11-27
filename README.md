@@ -213,9 +213,14 @@ from Proton) unchanged, from your NotProton install. Apple's D3DMetal comes from
 Porting Toolkit (`SteamDriver/GPTK`); the SteamDriver runtime only links to it
 (`environments/finals/scripts/unbundle_gptk.py`), and macSteam ships no D3DMetal (the main DXMT runtime from Recall still carries Apple's `libd3dshared.dylib`).
 
-This route was prompted by seeing
-[zzoko's compatibility setup run THE FINALS](https://www.youtube.com/watch?v=_2PVUeov3_A), and by
-that setup's low fps and its need for macOS developer mode.
+I saw [zzoko's video](https://www.youtube.com/watch?v=_2PVUeov3_A) and public repository showing
+THE FINALS running on a Mac, which proved it could work. When I tried it myself I ran into a lot of
+issues, so I started on my own approach, and SteamDriver grew from there.
+
+SteamDriver builds on [MacVolvo](https://github.com/haeli05/MacVolvo) (CS2 and Deadlock on Steam)
+and [Recall](https://github.com/AsherJN/recall), and I kept adding to it: its own Wine environments,
+upscaling, headphone surround and controller support. Thanks to zzoko for making it public and
+showing it was possible.
 
 The original code is licensed under [Apache 2.0](LICENSE). Dependencies and patches keep their own
 licenses: see the [third-party notices](THIRD_PARTY_NOTICES.md) and [NOTICE](NOTICE).

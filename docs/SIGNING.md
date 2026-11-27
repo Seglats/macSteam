@@ -15,9 +15,7 @@ checks. The signed runtime archive is unchanged from v1.0.
 - SHA-256: `81f3c800db6f28a88db285ec77286f89447fb95b06797db533fd8be6c196cf3b`.
 
 Validation includes 137 portable tests, Swift launch-readiness/update checks
-and ten synthetic DXMT display-change checkpoints. Deadlock's reported UI
-misalignment remains unresolved; see [v1.1 release notes](releases/v1.1.md).
-The original v1.0 and GPTK4 evaluation installers are retained.
+and ten synthetic DXMT display-change checkpoints.
 
 ## MacVolvo 1.0 signing record
 

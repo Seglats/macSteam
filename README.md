@@ -10,8 +10,15 @@
 **Windows games from the macOS Steam app on Apple Silicon, with lower input latency, a Wine of
 its own for every game, and Apple's D3DMetal for DirectX 12.**
 
-SteamDriver is the project; **macSteam** is its app. The app installs **SteamDriver**, a Steam
-Play compatibility tool you choose per game in macOS Steam, and manages everything around it.
+The project has two parts:
+
+- **SteamDriver** runs the games. It's a Wine with our own patches, set up as a Steam Play
+  compatibility tool: in macOS Steam you pick it per game, the way Linux players pick Proton.
+- **macSteam** is the Mac app you download and open. It installs SteamDriver into Steam,
+  keeps it up to date, checks your Game Porting Toolkit files, and holds the settings
+  (profiles, mouse, audio, controllers). You don't play through macSteam: once SteamDriver is
+  in Steam, you start games from Steam as usual.
+
 SteamDriver works together with [NotProton](https://github.com/NotProtonNot/NotProton), which
 turns on Steam Play in the macOS Steam app. It's a fork of
 [MacVolvo](https://github.com/haeli05/MacVolvo), which is built on
@@ -19,7 +26,7 @@ turns on Steam Play in the macOS Steam app. It's a fork of
 
 > **Status: first release, 1.0, coming soon** at
 > [Releases](https://github.com/Seglats/macSteam/releases). Download it there (see
-> [Installing](#installing)); macSteam updates itself from there. Expect rough edges.
+> [Installing](#installing)); macSteam updates itself from there.
 
 **Questions, help or feedback:** join the [Discord](https://discord.gg/Y2pJE5g2Sw).
 
@@ -162,11 +169,9 @@ that risk with.
 
 ## Known issues
 
-- **THE FINALS:** short freezes (0.3–2 s), mostly while loading and in the first minutes of play.
-  The cause isn't known yet; shader compilation is ruled out. See
-  [PROFILING.md](environments/finals/tests/finals_bisect/PROFILING.md).
-- **Counter-Strike 2 and Deadlock on SteamDriver on CrossOver:** see MacVolvo's
-  [v1.1 release notes](docs/releases/v1.1.md); they still apply there.
+- **THE FINALS:** short freezes (about 0.2 s) when joining and leaving a match. They come from a
+  burst of exceptions, like the ones behind the earlier FPS fix. A fix is planned but isn't a
+  priority, since gameplay itself isn't affected.
 - **Controllers in Xbox mode** can miss a game's start if another program has them open at that
   moment (the game's log says `Failed Start Device Read Loop`). Unplugging and replugging the
   controller brings it back.

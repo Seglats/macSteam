@@ -69,5 +69,4 @@ saved per-game launch choices back to Steam. Use the app's Fullscreen control
 for a persistent windowed choice. The reporter still needs to verify recovery.
 
 The Steam window changes ship in [MacVolvo 1.1](releases/v1.1.md), using the
-original signed DXMT/Wine runtime. The Deadlock display issue remains unresolved.
-The v1.0 and GPTK4 evaluation installers are retained.
+original signed DXMT/Wine runtime.

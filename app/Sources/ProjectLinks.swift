@@ -97,17 +97,25 @@ struct AuthorLink:View {
                 Text("by").foregroundStyle(.secondary)
                 Text(Brand.author).foregroundStyle(LauncherStyle.accent)
             }.font(LauncherStyle.font(13,.semibold)).tracking(0.6)
-        }.buttonStyle(.plain).hoverGrow().pointerStyle(.link).help("haeli05 on GitHub")
+        }.buttonStyle(.plain).hoverGrow().pointerStyle(.link).help("seglats on GitHub")
     }
 }
-/// The project macSteam is built on, credited in About.
+/// The projects macSteam is built on, credited in About: Recall, and MacVolvo, which it forked.
 struct UpstreamLink:View {
     var body:some View {
-        Link(destination:Brand.upstream) {
-            HStack(spacing:4) {
-                Text("Based on Recall by Joshua Asher Nelson")
+        HStack(spacing:4) {
+            Text("Based on")
+            link("Recall by Joshua Asher Nelson",Brand.upstream,"Open Recall’s repository in your browser")
+            Text("and")
+            link("MacVolvo by @haeli05",Brand.macvolvo,"Open MacVolvo’s repository in your browser")
+        }.font(LauncherStyle.font(12,.medium)).foregroundStyle(.secondary)
+    }
+    private func link(_ title:String,_ url:URL,_ help:String)->some View {
+        Link(destination:url) {
+            HStack(spacing:3) {
+                Text(title)
                 Image(systemName:"arrow.up.right").font(.system(size:8,weight:.semibold)).accessibilityHidden(true)
-            }.font(LauncherStyle.font(12,.medium))
-        }.buttonStyle(.plain).hoverGrow().foregroundStyle(.secondary).help("Open Recall’s repository in your browser")
+            }
+        }.buttonStyle(.plain).hoverGrow().help(help)
     }
 }

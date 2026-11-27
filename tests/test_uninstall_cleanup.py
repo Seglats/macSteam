@@ -41,7 +41,7 @@ import Foundation
     print(String(data:try! JSONSerialization.data(withJSONObject:["notes":Uninstaller.run(removePrefixes:!keep)]),encoding:.utf8)!)
 }}
 '''
-SOURCES = ['Uninstaller', 'NotProton', 'NotProtonExtras', 'Profiles', 'KeyOverrides', 'Brand', 'GameTools', 'InstallLocation']
+SOURCES = ['Uninstaller', 'NotProton', 'NotProtonExtras', 'Profiles', 'KeyOverrides', 'Brand', 'GameTools', 'InstallLocation', 'ControllerSupport', 'Surround']
 
 
 class UninstallCleanup(unittest.TestCase):
@@ -88,6 +88,9 @@ class UninstallCleanup(unittest.TestCase):
             mk(sup / 'notproton/variants/macvolvo.conf', '# Written by MacVolvo.app, which also removes it.\n')
             mk(sup / 'notproton/plugins/macvolvo.conf', '# someone else\n')
             mk(sup / 'MacVolvo/.macvolvo-owner')
+            # More controller support's login item, and someone else's
+            mk(home / 'Library/LaunchAgents/app.steamdriver.controllers.plist')
+            mk(home / 'Library/LaunchAgents/com.example.other.plist')
             out = subprocess.run([str(self.tool), str(home)], check=True, capture_output=True, text=True).stdout
             notes = json.loads(out)['notes']
 
@@ -96,10 +99,12 @@ class UninstallCleanup(unittest.TestCase):
                     game / 'perf', game / 'captures', game / 'shortcuts-taken', game / 'pfx', game,
                     sup / 'notproton/runners/crossover-26.3+macvolvo-26.3@abc',
                     steam / 'steamapps/common/Deadlock/game/citadel/cfg/boot.vcfg.macvolvo-backup',
-                    sup / 'MacVolvo NotProton', sup / 'notproton/variants/macvolvo.conf', sup / 'MacVolvo']
+                    sup / 'MacVolvo NotProton', sup / 'notproton/variants/macvolvo.conf', sup / 'MacVolvo',
+                    home / 'Library/LaunchAgents/app.steamdriver.controllers.plist']
             kept = [steam / 'compatibilitytools.d/notproton-someoneelse/run',
                     steam / 'steamapps/compatdata/730/perf/x', steam / 'steamapps/compatdata/730/pfx/system.reg', sup / 'notproton/runners/crossover-26.3@def/bin/wine',
-                    steam / 'steamapps/common/Deadlock/game/citadel/cfg/boot.vcfg', sup / 'notproton/plugins/macvolvo.conf']
+                    steam / 'steamapps/common/Deadlock/game/citadel/cfg/boot.vcfg', sup / 'notproton/plugins/macvolvo.conf',
+                    home / 'Library/LaunchAgents/com.example.other.plist']
             for path in gone:
                 self.assertFalse(path.exists(), f'{path} should be gone; notes: {notes}')
             for path in kept:

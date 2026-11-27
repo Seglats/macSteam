@@ -125,6 +125,8 @@ import Darwin
     func applicationDidBecomeActive(_ notification:Notification) { model.syncSession();model.checkIfDue() }
     func applicationShouldHandleReopen(_ sender:NSApplication,hasVisibleWindows:Bool)->Bool { show();model.reopen();return false }
     func applicationShouldTerminateAfterLastWindowClosed(_ sender:NSApplication)->Bool { false }
+    /// The surround test's Wine players don't end with the app on their own: end them.
+    func applicationWillTerminate(_ notification:Notification) { model.surroundTest.stopForQuit();model.surroundSettings.stop() }
     func applicationShouldTerminate(_ sender:NSApplication)->NSApplication.TerminateReply {
         if model.quitsNow { return .terminateNow }
         if !model.canCancel { show();model.notice="Finishing the current step. You can quit as soon as it completes.";return .terminateCancel }

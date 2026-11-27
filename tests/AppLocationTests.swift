@@ -34,14 +34,14 @@ import Foundation
         // Only older copies of this app are retired: not the kept one, a newer
         // one, another app, or anything outside the folders' top level.
         let kept=system.appendingPathComponent("Recall.app")
-        try fakeApp(system.appendingPathComponent("Overwatch 2 Mac.app"),version:"0.1.6",build:20)
-        try fakeApp(system.appendingPathComponent("Overwatch 2 Mac RC.app"),version:"1.0.0",build:21)
+        try fakeApp(system.appendingPathComponent("MacVolvo.app"),version:"0.1.6",build:20)
+        try fakeApp(system.appendingPathComponent("MacVolvo RC.app"),version:"1.0.0",build:21)
         try fakeApp(kept,version:"1.0.0",build:22)
         try fakeApp(system.appendingPathComponent("Newer.app"),version:"1.0.1",build:1)
         try fakeApp(system.appendingPathComponent("Flashcards.app"),identifier:"com.example.recall",version:"0.1",build:1)
-        try fakeApp(system.appendingPathComponent("Games/Overwatch 2 Mac.app"),version:"0.1.0",build:1)
+        try fakeApp(system.appendingPathComponent("Games/MacVolvo.app"),version:"0.1.0",build:1)
         let older=AppLocation.olderCopies(identifier:identifier,version:"1.0.0",build:22,keeping:kept,in:[system,personal])
-        precondition(Set(older.map(\.url.lastPathComponent)) == ["Overwatch 2 Mac.app","Overwatch 2 Mac RC.app"],"\(older)")
+        precondition(Set(older.map(\.url.lastPathComponent)) == ["MacVolvo.app","MacVolvo RC.app"],"\(older)")
         // The destination never replaces a different app with the same name.
         let first=try AppLocation.destination(identifier:identifier,folders:[system,personal])
         precondition(first.path == kept.path)
@@ -67,7 +67,7 @@ import Foundation
               let version=info["CFBundleShortVersionString"] as? String,let build=Int(info["CFBundleVersion"] as? String ?? "") else { fatalError("Needs a Developer ID build") }
         let folders=[root.appendingPathComponent("Applications"),root.appendingPathComponent("home/Applications")]
         try fm.createDirectory(at:folders[0],withIntermediateDirectories:true)
-        try fakeApp(folders[0].appendingPathComponent("Overwatch 2 Mac.app"),version:"0.1.6",build:20)
+        try fakeApp(folders[0].appendingPathComponent("MacVolvo.app"),version:"0.1.6",build:20)
         try fakeApp(folders[0].appendingPathComponent("Recall.app"),version:"1.0.0",build:build-1)
         let target=try AppLocation.destination(identifier:identifier,folders:folders)
         precondition(target.path == folders[0].appendingPathComponent("Recall.app").path)
@@ -80,7 +80,7 @@ import Foundation
         precondition(AppLocation.copy(at:target)?.copy.build == build)
         precondition(getxattr(target.path,"com.apple.quarantine",nil,0,0,0) < 0,"Quarantine was kept")
         let retire=AppLocation.olderCopies(identifier:identifier,version:version,build:build,keeping:target,in:folders)
-        precondition(retire.map(\.url.lastPathComponent) == ["Overwatch 2 Mac.app"])
+        precondition(retire.map(\.url.lastPathComponent) == ["MacVolvo.app"])
         let leftovers=try fm.contentsOfDirectory(atPath:folders[0].path).filter { $0.hasPrefix(".") && $0 != ".DS_Store" }
         precondition(leftovers.isEmpty,"Left behind: \(leftovers)")
         print("PASS: real install of \(version) (\(build)) over an older copy; mismatched version refused; quarantine cleared")

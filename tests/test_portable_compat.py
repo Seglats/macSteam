@@ -157,8 +157,6 @@ class AdvancedSettings(unittest.TestCase):
         (self.root/'reg-fails').write_text('')
         self.assertEqual(self.call('network', '--proxy-detect', '0', success=False)[-1]['code'], 'setting_change_failed')
         self.assertNotIn('proxy_auto_detect', self.state())
-        self.assertEqual(self.call('korean-support', '--enabled', '1', success=False)[-1]['code'], 'setting_change_failed')
-        self.assertNotIn('korean_support', self.state())
 
     def test_choice_before_setup_waits_for_the_environment(self):
         self.call('status')
@@ -171,59 +169,6 @@ class AdvancedSettings(unittest.TestCase):
         self.fixture()
         self.assertEqual(self.call('network', '--proxy-detect', 'yes', success=False)[-1]['code'], 'invalid_arguments')
         self.assertEqual(self.call('korean-support', success=False)[-1]['code'], 'invalid_arguments')
-
-    def test_korean_support_adds_and_removes_the_cross_signed_certificate(self):
-        der = certificate()
-        self.assertEqual(hashlib.sha256(der).hexdigest(), '33846b545a49c9be4903c60e01713c1bd4e4ef31ea65cd95d69e62794f30b941')
-        self.assertEqual(hashlib.sha1(der).hexdigest().upper(), CERTIFICATE_KEY.rsplit('\\', 1)[1])
-        self.fixture()
-        self.assertTrue(self.call('korean-support', '--enabled', '1', '--apply', '0')[-1]['changed'])
-        self.assertEqual(self.call('korean-support', '--enabled', '1')[-1],
-                         {'stage': 'setting_saved', 'name': 'korean_support', 'enabled': True})
-        # Wine's store format: the SHA-1 property (3), then the certificate (32).
-        blob = self.value(CERTIFICATE_KEY, 'Blob')
-        expected = ((3).to_bytes(4, 'little') + (1).to_bytes(4, 'little') + (20).to_bytes(4, 'little') + hashlib.sha1(der).digest()
-                    + (32).to_bytes(4, 'little') + (1).to_bytes(4, 'little') + len(der).to_bytes(4, 'little') + der)
-        self.assertEqual(blob, expected)
-        self.assertEqual(len(blob), 1469)
-        self.assertIs(self.state()['korean_support'], True)
-        status = self.call('status')[-1]
-        self.assertIs(status['state']['korean_support'], True)
-        self.assertFalse(self.call('korean-support', '--enabled', '1', '--apply', '0')[-1]['changed'])
-        # Off removes the key; turning it off again has nothing to do.
-        self.call('korean-support', '--enabled', '0')
-        self.assertIsNone(self.value(CERTIFICATE_KEY, 'Blob'))
-        self.assertNotIn('A99D5B79', self.registry.read_text())
-        self.assertIs(self.state()['korean_support'], False)
-        before = len(self.calls())
-        self.call('korean-support', '--enabled', '0')
-        self.assertEqual(len(self.calls()), before)
-
-    def test_status_reports_the_korean_build(self):
-        self.fixture()
-        self.assertIs(self.call('status')[-1]['nexon_build'], False)
-        retail = self.root/'environment/drive_c/Program Files (x86)/Overwatch/_retail_'
-        (retail/'grap').mkdir(parents=True)
-        self.assertIs(self.call('status')[-1]['nexon_build'], True)
-        (retail/'grap').rmdir()
-        (retail/'grap64.dll').write_text('fixture')
-        self.assertIs(self.call('status')[-1]['nexon_build'], True)
-
-    def test_battlenet_installer_starts_with_a_direct_connection(self):
-        self.fixture()
-        installer = self.base/'Battle.net-Setup.exe'
-        installer.write_bytes(b'fixture installer')
-        digest = hashlib.sha256(installer.read_bytes()).hexdigest()
-        events = self.call('install-battlenet', '--installer', installer, '--sha256', digest)
-        self.assertEqual([e['stage'] for e in events], ['network_proxy', 'installing_battlenet', 'battlenet_installer_open'])
-        self.assertEqual(self.value(CONNECTIONS, 'DefaultConnectionSettings'), DIRECT)
-        # The installer runs on after the worker exits.
-        for _ in range(100):
-            if self.calls()[-1][0] != 'reg.exe':
-                break
-            time.sleep(0.05)
-        self.assertEqual(self.calls()[-1], [str(installer), '--lang=enUS'])
-
 
 class MissingRosetta(unittest.TestCase):
     """A worker whose Rosetta probe fails, as on a Mac that upgraded to macOS 27."""

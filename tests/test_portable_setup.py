@@ -22,8 +22,8 @@ from build_portable_setup import build
 class NativeSetup(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.build_temp=tempfile.TemporaryDirectory(prefix='ow2-native-tests-')
-        cls.binary=Path(cls.build_temp.name)/'ow2-setup'
+        cls.build_temp=tempfile.TemporaryDirectory(prefix='steamdriver-native-tests-')
+        cls.binary=Path(cls.build_temp.name)/'steamdriver-setup'
         build(cls.binary,ROOT/'runtime/toolchains/libarchive-3.7.7')
 
     @classmethod
@@ -31,14 +31,17 @@ class NativeSetup(unittest.TestCase):
         cls.build_temp.cleanup()
 
     def setUp(self):
-        self.temp=tempfile.TemporaryDirectory(prefix='ow2-install-tests-')
+        self.temp=tempfile.TemporaryDirectory(prefix='steamdriver-install-tests-')
         self.addCleanup(self.temp.cleanup)
         self.base=Path(self.temp.name).resolve()
-        self.root=self.base/'User Directory With Spaces'/'Overwatch2Mac'
+        self.root=self.base/'User Directory With Spaces'/'SteamDriver Steam'
         self.root.parent.mkdir()
 
     def call(self,command,*args,success=True):
-        r=subprocess.run([str(self.binary),command,'--root',str(self.root),*map(str,args)],capture_output=True,text=True)
+        # The main display's scale decides Retina mode (portable_steam.h mainDisplayIsRetina): a
+        # 2x display unless a test says otherwise, whatever this Mac's display is.
+        env={**os.environ,'SETUP_DISPLAY_SCALE':getattr(self,'display_scale','2')}
+        r=subprocess.run([str(self.binary),command,'--root',str(self.root),*map(str,args)],capture_output=True,text=True,env=env)
         if success:self.assertEqual(r.returncode,0,r.stdout+r.stderr)
         else:self.assertNotEqual(r.returncode,0,r.stdout)
         return [json.loads(line) for line in r.stdout.splitlines()]
@@ -117,7 +120,7 @@ class NativeSetup(unittest.TestCase):
         self.assertEqual((current['active_runtime'],current['previous_runtime']),('v2','v1'))
 
     def test_traversal_absolute_paths_links_and_case_aliases_never_write_outside(self):
-        for name,kind,content in [('../escaped','file',b'bad'),('/tmp/ow2-escaped','file',b'bad'),
+        for name,kind,content in [('../escaped','file',b'bad'),('/tmp/steamdriver-escaped','file',b'bad'),
                                   ('bin/../escaped','file',b'bad'),('BIN/WINE','file',b'bad'),
                                   ('escape','symlink','../../escaped'),('link','hardlink','bin/wine')]:
             with self.subTest(name=name):
@@ -186,6 +189,15 @@ class NativeSetup(unittest.TestCase):
         self.assertEqual(self.call('close-client')[-1]['stage'],'client_closed')
         self.assertEqual((self.root/'server-calls').read_text().splitlines(),['-k','-w'])
 
+    def test_close_for_removal_closes_like_close_client(self):
+        """Remove Own Steam with Keep games closes Steam first (then the app moves the games out)."""
+        self.install()
+        server=self.root/'runtimes/v1/bin/wineserver'
+        server.write_text('#!/bin/sh\nprintf "%s\\n" "$1" >> server-calls\nexit 0\n');server.chmod(0o755)
+        self.assertEqual(self.call('close-for-removal')[-1]['stage'],'client_closed')
+        self.assertEqual((self.root/'server-calls').read_text().splitlines(),['-k','-w'])
+        self.assertTrue(self.root.exists())                     # closing removes nothing
+
     def test_force_quit_waits_for_the_owned_server_to_exit(self):
         self.install()
         server=self.root/'runtimes/v1/bin/wineserver'
@@ -225,10 +237,10 @@ class NativeSetup(unittest.TestCase):
     def test_real_small_filesystem_rejects_install_before_extraction(self):
         image=self.base/'small.sparseimage';mount=self.base/'small-volume'
         subprocess.run(['hdiutil','create','-size','128m','-fs','APFS','-type','SPARSE',
-                        '-volname','OW2 Setup Space Test',str(image)],check=True,capture_output=True)
+                        '-volname','SteamDriver Setup Space Test',str(image)],check=True,capture_output=True)
         subprocess.run(['hdiutil','attach','-nobrowse','-mountpoint',str(mount),str(image)],check=True,capture_output=True)
         try:
-            self.root=mount/'Overwatch2Mac'
+            self.root=mount/'SteamDriver Steam'
             archive,digest=self.archive()
             result=self.call('install-runtime','--archive',archive,'--sha256',digest,'--version','v1',success=False)
             self.assertEqual(result[-1]['code'],'insufficient_disk_space')
@@ -239,18 +251,18 @@ class NativeSetup(unittest.TestCase):
     def volume(self,filesystem,name):
         image=self.base/(name+'.sparseimage');mount=self.base/name
         subprocess.run(['hdiutil','create','-size','128m','-fs',filesystem,'-type','SPARSE',
-                        '-volname','OW2 '+name,str(image)],check=True,capture_output=True)
+                        '-volname','SD '+name,str(image)],check=True,capture_output=True)
         subprocess.run(['hdiutil','attach','-nobrowse','-mountpoint',str(mount),str(image)],check=True,capture_output=True)
         self.addCleanup(subprocess.run,['hdiutil','detach','-force',str(mount)],check=True,capture_output=True)
         return mount
 
     def test_disconnected_drive_is_refused_without_creating_folders(self):
-        self.root=self.base/'Volumes'/'Unplugged SSD'/'Overwatch2Mac'
+        self.root=self.base/'Volumes'/'Unplugged SSD'/'SteamDriver Steam'
         self.assertEqual(self.call('status',success=False)[-1]['code'],'install_location_unavailable')
         self.assertFalse((self.base/'Volumes').exists())
 
     def test_external_apfs_volume_installs_and_uninstalls_to_its_own_trash(self):
-        mount=self.volume('APFS','External APFS');self.root=mount/'Overwatch2Mac'
+        mount=self.volume('APFS','External APFS');self.root=mount/'SteamDriver Steam'
         status=self.call('status')[-1]
         self.assertGreater(status['free_bytes'],0);self.assertTrue((self.root/'.macvolvo-owner').exists())
         (self.root/'environment').mkdir();(self.root/'environment'/'system.reg').write_text('x')
@@ -262,7 +274,7 @@ class NativeSetup(unittest.TestCase):
         for filesystem,name,code in [('ExFAT','ExFAT','unsupported_volume_format'),
                                      ('Case-sensitive APFS','CaseSens','case_sensitive_volume')]:
             with self.subTest(filesystem=filesystem):
-                mount=self.volume(filesystem,name);self.root=mount/'Overwatch2Mac'
+                mount=self.volume(filesystem,name);self.root=mount/'SteamDriver Steam'
                 self.assertEqual(self.call('status',success=False)[-1]['code'],code)
                 self.assertFalse(self.root.exists())
         # An installation that predates the rule is never re-judged or blocked.
@@ -299,7 +311,7 @@ class NativeSetup(unittest.TestCase):
         self.install()
         self.assertEqual(self.call('discard-unused',success=False)[-1]['code'],'location_in_use')
         self.assertEqual(self.call('status')[-1]['state']['active_runtime'],'v1')
-        other=self.base/'Other'/'Overwatch2Mac';other.parent.mkdir();self.root=other
+        other=self.base/'Other'/'SteamDriver Steam';other.parent.mkdir();self.root=other
         self.call('status');(other/'downloads'/'partial.part').write_text('keep')
         self.assertEqual(self.call('discard-unused',success=False)[-1]['code'],'location_in_use')
         self.assertEqual((other/'downloads'/'partial.part').read_text(),'keep')

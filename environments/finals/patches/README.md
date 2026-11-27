@@ -115,7 +115,20 @@ patches above:
   image instead of failing, so the anti-cheat in the Korean build of Overwatch
   no longer crashes the game when it takes a screenshot. No pixels are read;
   without the variable the call fails as before.
-`WINEMAC_INPUT_STATS` writes an input report (off unless set).
+`WINEMAC_INPUT_STATS` writes an input report (off unless set); the notice that per-frame
+present timing is on is trace output on `macfinals_ui`, not an error
+(`wine-winemac-present-timing-trace.patch`).
+
+Controllers in XInput mode (USB interface class 255/93/1: Xbox 360 wired protocol) reach the
+game through winebus.sys's Xbox 360 bus for every vendor, not only Microsoft, and on macOS 15 and
+later too (`wine-winebus-xinput-any-pad.patch`). Such pads are not HID, so macOS and SDL never see
+them; 8BitDo's "normal" mode is one (1000 Hz on its dongle, against 25 Hz in its Nintendo mode,
+see `tests/controller_latency/README.md`). Microsoft's own wired 360 pads stay with macOS's
+GameController framework on 15+, so they aren't listed twice. The bus opens only that interface
+(composite pads keep their keyboard/mouse interfaces), sends the XUSB start-up read and the
+player-1 LED command, and passes on input reports only, with the sticks' Y as the pad sends it
+(up = positive, the convention winebus gamepad reports use). A pad another program holds exclusively
+(macOS Steam takes wired Xbox-protocol pads) is logged as a warning and skipped.
 
 Menus, Battle.net and every other program keep the standard behavior.
 
@@ -123,3 +136,36 @@ Apply each patch once, in this order, first using `git apply --check`.
 Do not combine them with historical candidate patch variants.
 See [build status](../docs/BUILDING.md) and
 [third-party notices](../THIRD_PARTY_NOTICES.md).
+
+`macfinals_pad` (trace class, off by default) timestamps each changed controller report at every
+handoff inside Wine: USB completion in winebus.so, the handoff to hidclass, the new XInput or
+DirectInput state in the game process, and the game's first read of it
+(`wine-pad-latency-trace.patch`; `tests/controller_latency/pad_trace.py` reads the log).
+
+A controller switched on while a game runs is found when the game asks about an empty slot
+(`wine-xinput-hotplug-check.patch`): Unreal Engine checks empty XInput slots once per
+`WM_DEVICECHANGE`, and Wine's broadcast came a few milliseconds before xinput had the new device,
+so the pad was missed until the next device change. xinput now looks for new devices itself when
+the device classes in the registry changed since its last look.
+
+Direct3D 9's adapter driver version comes from the display driver's registry key when it names
+the same GPU (`wine-wined3d-registry-driver-version.patch`, with
+`wine-wined3d-registry-driver-version-types.patch`). wined3d's table only knows old cards and gave
+the RTX 4090 that D3DMetal presents with MetalFX upscaling a GeForce 8 driver (31.0.13.4052), so
+Deadlock reported the driver as out of date, hid DLSS and turned asynchronous shader creation
+off. Now Direct3D 9 agrees with DXGI and the registry (32.0.16.1656). Used only when exactly one
+display adapter is registered and its provider matches the vendor wined3d sees; otherwise
+nothing changes (`tests/windows_probe/dlss_probe.c` prints both).
+
+`wine-wined3d-config-driver-version.patch` adds a `VideoDriverVersion` setting to wined3d (read
+like its other settings: `WINE_D3D_CONFIG`, then `Software\Wine\Direct3D`), which wins over the
+registry and the table. DXMT presenting an NVIDIA GPU registers no driver version, so with DXMT's
+DLSS on, Direct3D 9 still said 31.0.13.4052 and Deadlock never even loaded `nvngx.dll`; the tool
+now sets it to DXMT's own version (32.0.19.9999) in those launches.
+
+`wine-coreaudio-headphone-surround.patch` is headphone surround (`WINE_HEADPHONE_SURROUND=1`, the
+run script's `STEAMDRIVER_SURROUND` and macSteam's Experimental › Headphone surround). A render
+device with one or two channels is offered to Windows programs as 7.1. Each multichannel stream
+then reaches the audio unit as stereo float, every speaker rendered for both ears with a
+spherical-head model (per-ear delay and head-shadow filter, darker rear speakers). It does nothing
+unless set. Details in `docs/SURROUND.md` at the repository root.

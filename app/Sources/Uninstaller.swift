@@ -47,6 +47,7 @@ enum Uninstaller {
         removeRunnerCopies(&notes)
         restoreDeadlock(&notes)
         removeLegacy(&notes)
+        removeControllerSupport(&notes)
         if touchDefaults { resetPermissions(&notes) }
         return notes
     }
@@ -56,6 +57,15 @@ enum Uninstaller {
         if (useTrash && (try? fm.trashItem(at:url,resultingItemURL:nil)) != nil) || (try? fm.removeItem(at:url)) != nil {
             notes.append("removed \(what): \(url.path)")
         } else { notes.append("could not remove \(what): \(url.path)") }
+    }
+
+    /// More controller support (ControllerSupport.swift): its login item, and Steam's environment
+    /// setting, so Steam takes those controllers again from its next start.
+    private static func removeControllerSupport(_ notes:inout [String]) {
+        trash(ControllerSupport.agent,"controller login item",&notes)
+        if touchDefaults,NotProton.tool("/bin/launchctl",["unsetenv",ControllerSupport.variable]) {
+            notes.append("cleared \(ControllerSupport.variable) for apps started from now on")
+        }
     }
 
     /// Steam's libraries (its own folder and every path in libraryfolders.vdf).

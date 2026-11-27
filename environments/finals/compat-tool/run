@@ -26,7 +26,7 @@
 #   WINEMAC_DIRECT_PRESENT=1                    a covering, focused game window presents through a plain
 #                                                overlay window the window server shows directly, instead
 #                                                of compositing it (microstutter test, 2026-11-12)
-#   STEAMDRIVER_GPU_WARNING=1                   always show THE FINALS' "Minimum Hardware Requirements Not
+#   STEAMDRIVER_GPU_WARNING=1                   always show THE FINALS' / ARC Raiders' "Minimum Hardware Requirements Not
 #                                                Met" box (by default it is shown on the first launch only;
 #                                                afterwards Wine answers it OK unseen, as if clicked)
 #   STEAMDRIVER_SHORTCUTS='ctrl+space,cmd+space' macOS system shortcuts that go to the game instead of
@@ -41,6 +41,29 @@
 #   STEAMDRIVER_PERF=1                          per-process performance counters, 10 a second, in
 #                                                <compatdata>/perf/<date>/; read them with
 #                                                tests/finals_bisect/perf_report.py
+#   STEAMDRIVER_BG_THREADS=1                    below-normal threads get a base priority in macOS's
+#                                                background band, leaving the fastest cores to GameThread
+#                                                (wine-server-bg-threads.patch; on trial)
+#   STEAMDRIVER_DX11=dxmt|auto|d3dmetal         DX11 renderer: MacVolvo's DXMT, auto (default: DXMT for
+#                                                games with a DX11 profile, known DX11 games and games
+#                                                detected as DX11, else D3DMetal), or Apple's D3DMetal.
+#                                                DX12 is always D3DMetal (scripts/add_dxmt.py)
+#   STEAMDRIVER_UPSCALE=1|0                     DLSS on Apple's MetalFX through D3DMetal; the game then
+#                                                sees an NVIDIA GPU (scripts/add_nvngx.py). A DX11 game
+#                                                renders with D3DMetal then. Wins over macSteam's
+#                                                profile setting (d3dmetal.conf / dxmt.conf)
+#   STEAMDRIVER_SURROUND=1|0                    headphone surround (docs/SURROUND.md): headphones are offered
+#                                                to the game as 7.1, which Wine renders binaurally. Wins
+#                                                over macSteam's profile setting
+#   STEAMDRIVER_BENCH=1|0                       benchmark recording (docs/BENCHMARKS.md): Apple's Metal HUD
+#                                                log (hidden) and the renderer's per-frame log, so macSteam's
+#                                                benchmark hotkey (Control-Option-B unless changed in its
+#                                                Benchmarks sheet) can measure fps, frame times and
+#                                                latency. Wins over macSteam's Benchmarks setting
+#                                                (SteamDriver/benchmarks/record)
+#   STEAMDRIVER_SETUP=1                         a non-Steam game pointing at a GOG installer (setup_*.exe)
+#                                                runs the installer again instead of the installed game
+#                                                (docs/GOG.md)
 #   STEAMDRIVER_CAPTURE=1                       Metal capture: Control-Option-G saves 150 ms of GPU work
 #                                                to <compatdata>/captures/ (debug runs only; loads
 #                                                Apple's capture layer into the game)
@@ -71,6 +94,13 @@ alert() {
     -e 'end run' "$1" "$2" >/dev/null 2>&1 &
 }
 [[ -n $compat ]] || { print -u2 "steamdriver-finals: STEAM_COMPAT_DATA_PATH is not set"; exit 1; }
+# A game macSteam installed somewhere else (docs/GOG.md, "Install to"): compatdata/<id> is a link
+# to its prefix there. With that disk not connected, say so instead of making an empty prefix.
+if [[ -L $compat && ! -d $compat ]]; then
+  alert "SteamDriver" "This game is installed on a disk that isn't connected ($(/usr/bin/readlink "$compat")). Connect it, then launch the game again."
+  print -u2 "steamdriver-finals: $compat links to $(/usr/bin/readlink "$compat"), which isn't there"
+  exit 1
+fi
 /bin/mkdir -p "$compat"
 log=$compat/steamdriver-run.log
 say() { print -r -- "$(/bin/date '+%Y-%m-%d %H:%M:%S') $*" >> "$log"; }
@@ -120,11 +150,63 @@ export WINELOADER=$engine/bin/wine WINESERVER=$engine/bin/wineserver
 export PATH=$engine/bin:/usr/bin:/bin:/usr/sbin:/sbin
 prefix_steam="$WINEPREFIX/drive_c/Program Files (x86)/Steam"
 
+# macSteam's folder (profiles, key combos, games, benchmarks) and the game's Steam app id (the
+# name of its compatdata folder).
+steamdriver="$HOME/Library/Application Support/SteamDriver"
+# Before the app was renamed (MacVolvo, until 2026-11-24) and has moved its folder over:
+[[ ! -d $steamdriver && -d "$HOME/Library/Application Support/MacVolvo NotProton" ]] &&
+  steamdriver="$HOME/Library/Application Support/MacVolvo NotProton"
+app_id=${compat:t}
+
 # First run: make the prefix (no Gecko or Mono prompts; the game needs neither).
+# Shared runtime (2026-11-26): wineboot builds a prefix once per runtime version, kept as a
+# template (SteamDriver/prefix-templates/<runtime>/); every later new prefix is an APFS clone of
+# it, so it is ready in a moment instead of ~15 s, and the ~400 MB of Windows files it starts
+# with are shared on disk until a game changes them (a full copy on another disk). The template
+# is the prefix exactly as wineboot left it, before anything of this launch touches it; nothing
+# game-specific happens at creation (everything below runs on every launch). A runtime without a
+# template builds its prefix with wineboot and saves that as its template.
+# Own runtime copy: with macSteam's Advanced › Custom runtimes on (SteamDriver/custom-runtimes),
+# a game profile can ask for its own (profiles/app-<id>/own-runtime): its prefix is built with
+# wineboot and never shared, as before.
 if [[ ! -f $WINEPREFIX/system.reg ]]; then
-  say "creating the prefix"
-  WINEDLLOVERRIDES='mscoree,mshtml=' WINEDEBUG=-all "$WINELOADER" wineboot -i >> "$log" 2>&1
-  "$WINESERVER" -w
+  runtime_id=$(/usr/bin/sed -n 's/.*"version": *"\([^"]*\)".*/\1/p' "$engine/runtime.json" 2>/dev/null | head -1)
+  template=$steamdriver/prefix-templates/$runtime_id
+  shared=1
+  [[ -z $runtime_id ]] && shared=0
+  [[ -f $steamdriver/custom-runtimes && -f $steamdriver/profiles/app-$app_id/own-runtime ]] && shared=0
+  if (( shared )) && [[ -f $template/.complete ]]; then
+    /bin/mkdir -p "$WINEPREFIX"
+    # cp -c clones on the same APFS disk; another disk gets a plain copy.
+    if /bin/cp -c -R -p "$template/." "$WINEPREFIX/" 2>/dev/null || { /bin/rm -rf "$WINEPREFIX"; /bin/mkdir -p "$WINEPREFIX"; /bin/cp -R -p "$template/." "$WINEPREFIX/"; }; then
+      /bin/rm -f "$WINEPREFIX/.complete"
+      say "prefix cloned from the shared $runtime_id template"
+    else
+      say "could not copy the $runtime_id template; creating the prefix"
+      /bin/rm -rf "$WINEPREFIX"
+    fi
+  fi
+  if [[ ! -f $WINEPREFIX/system.reg ]]; then
+    if (( shared )); then say "creating the prefix"; else say "creating the prefix (its own runtime copy, not shared)"; fi
+    WINEDLLOVERRIDES='mscoree,mshtml=' WINEDEBUG=-all "$WINELOADER" wineboot -i >> "$log" 2>&1
+    "$WINESERVER" -w
+    # The first prefix of a runtime becomes its template: copied whole, then renamed into place,
+    # under a lock, so two games starting at once can't both write it.
+    if (( shared )) && [[ ! -f $template/.complete && -f $WINEPREFIX/system.reg ]]; then
+      /bin/mkdir -p "${template:h}"
+      [[ -d $template.lock && -n $(/usr/bin/find "$template.lock" -maxdepth 0 -mmin +10 2>/dev/null) ]] && /bin/rmdir "$template.lock" 2>/dev/null
+      if /bin/mkdir "$template.lock" 2>/dev/null; then
+        tmp=$template.new-$$
+        /bin/rm -rf "$tmp" "$template"
+        if /bin/cp -c -R -p "$WINEPREFIX" "$tmp" 2>/dev/null || /bin/cp -R -p "$WINEPREFIX" "$tmp"; then
+          : > "$tmp/.complete"
+          /bin/mv "$tmp" "$template" && say "saved this prefix as the shared $runtime_id template"
+        fi
+        /bin/rm -rf "$tmp"
+        /bin/rmdir "$template.lock" 2>/dev/null
+      fi
+    fi
+  fi
 fi
 
 # NotProton's Steam bridge into the prefix's Steam folder (copies; refreshed when NotProton updates).
@@ -144,17 +226,22 @@ export CX_ACTIVE_GRAPHICS_BACKEND=d3dmetal CX_GRAPHICS_BACKEND=d3dmetal D3DM_ENA
 export WINEESYNC=0
 [[ ${STEAMDRIVER_MSYNC:-1} == 0 ]] && unset WINEMSYNC || export WINEMSYNC=1
 export ROSETTA_ADVERTISE_AVX=$([[ ${STEAMDRIVER_AVX:-1} == 0 ]] && print 0 || print 1)
+user_winedebug=${WINEDEBUG:-}
 export WINEDEBUG=${WINEDEBUG:-err+all,fixme-all,+loaddll}
 # MoltenVK logs outside WINEDEBUG; at its default (info) every Vulkan start dumps its whole device
 # and extension list into the Wine log. 1 = errors only; MVK_CONFIG_LOG_LEVEL=3 brings it back.
 export MVK_CONFIG_LOG_LEVEL=${MVK_CONFIG_LOG_LEVEL:-1}
-# THE FINALS' minimum-spec warning (every start on a Mac GPU): shown on the first launch in this
-# prefix, then answered OK as if clicked. Deleting the marker shows it once more. THE FINALS only
-# (Steam app 2073850): no other game's dialog is answered and no marker is written for it.
+# Embark's minimum-spec warning, "Minimum Hardware Requirements Not Met" (every start on a Mac
+# GPU), in THE FINALS (Steam app 2073850) and ARC Raiders (1808500; with upscaling on the game
+# sees an NVIDIA GPU and likely doesn't show it): shown on the first launch in this prefix, then answered OK as if
+# clicked. Deleting the marker shows it once more. Only these games: no other game's dialog is
+# answered and no marker is written for it.
 finals_app=2073850
+gpu_warning_apps=($finals_app 1808500)
 is_finals=0; [[ ${STEAM_COMPAT_APP_ID:-${compat:t}} == $finals_app ]] && is_finals=1
+has_gpu_warning=0; (( ${gpu_warning_apps[(Ie)${STEAM_COMPAT_APP_ID:-${compat:t}}]} )) && has_gpu_warning=1
 gpu_warning_seen=$compat/steamdriver-gpu-warning-seen
-if (( is_finals )) && [[ ${STEAMDRIVER_GPU_WARNING:-0} == 0 && -f $gpu_warning_seen ]]; then
+if (( has_gpu_warning )) && [[ ${STEAMDRIVER_GPU_WARNING:-0} == 0 && -f $gpu_warning_seen ]]; then
   export WINE_MSGBOX_ACCEPT='Minimum Hardware Requirements Not Met'
 fi
 
@@ -238,11 +325,6 @@ restore_shortcuts() {
 # Each game launched through this tool is recorded in games/<app id> (its name on the first line),
 # so the app can offer it a profile of its own. The app id is the name of Steam's
 # compatdata/<app id> folder; the name comes from Steam's appmanifest next to the game.
-steamdriver="$HOME/Library/Application Support/SteamDriver"
-# Before the app was renamed (MacVolvo, until 2026-11-24) and has moved its folder over:
-[[ ! -d $steamdriver && -d "$HOME/Library/Application Support/MacVolvo NotProton" ]] &&
-  steamdriver="$HOME/Library/Application Support/MacVolvo NotProton"
-app_id=${compat:t}
 if [[ $verb == waitforexitandrun && $app_id == <-> ]]; then
   game_name= install=${STEAM_COMPAT_INSTALL_PATH:-/nonexistent/x/y}
   for manifest in "${install:h:h}/appmanifest_$app_id.acf" "${compat:h:h}/appmanifest_$app_id.acf"; do
@@ -250,6 +332,69 @@ if [[ $verb == waitforexitandrun && $app_id == <-> ]]; then
     game_name=$(/usr/bin/sed -n 's/^[[:space:]]*"name"[[:space:]]*"\(.*\)"$/\1/p' "$manifest" | head -1)
     [[ -n $game_name ]] && break
   done
+  # Non-Steam games (Steam › Add a Non-Steam Game, NotProton lets it pick an .exe): Steam gives
+  # each shortcut an app id with the top bit set and no appmanifest. Like NotProton's own
+  # compat_run.sh, unset SteamAppId for them, so a game sold outside Steam doesn't take the
+  # shortcut's id for a Steam app and fail an ownership check.
+  (( app_id >= 2147483648 )) && unset SteamAppId
+  # Installers as non-Steam games (docs/GOG.md): a shortcut can point at a game's installer
+  # itself, a GOG offline installer (setup_<game>_<version>.exe, anywhere) or any installer
+  # macSteam's "Install a Windows game" added (copied to SteamDriver/installers/<shortcut id>/,
+  # with the game's name in a file "name" beside it). The first launch runs the installer, into
+  # this shortcut's prefix. Once the game is there, a launch starts the game instead, so the
+  # shortcut never needs editing:
+  #   GOG: every GOG installer leaves goggame-<id>.info next to the game, with its name and
+  #     play tasks; the primary play task starts.
+  #   Others: after the installer exits, the program its new Start Menu or Desktop shortcut
+  #     (.lnk) points at is kept in compatdata/<id>/installed-exe and starts from then on.
+  # The installer's file name is kept in compatdata/<id>/installed-from: the installer runs again
+  # when the shortcut points at another one (an update, whose name carries the new version) or
+  # with STEAMDRIVER_SETUP=1.
+  inst= inst_dir= inst_ran=
+  if [[ ${${1:t}:l} == setup_*.exe || $1 == $steamdriver/installers/* ]]; then
+    inst=${1:t} inst_info= inst_exe= inst_args=
+    [[ $1 == $steamdriver/installers/* && -f ${1:h}/name ]] && game_name=$(<${1:h}/name)
+    for f in ${(f)"$(/usr/bin/find "$WINEPREFIX/drive_c" -maxdepth 4 \( -path "$WINEPREFIX/drive_c/windows" -o -path "$WINEPREFIX/drive_c/users" \) -prune -o -name 'goggame-*.info' -print 2>/dev/null)"}; do
+      # The base game's file, not a DLC's (a DLC has its own, with the base game as rootGameId).
+      [[ $(/usr/bin/plutil -extract gameId raw "$f" 2>/dev/null) == $(/usr/bin/plutil -extract rootGameId raw "$f" 2>/dev/null) ]] && { inst_info=$f; break; }
+    done
+    installed_from=$( [[ -f $compat/installed-from ]] && print -r -- "$(<$compat/installed-from)" )
+    if [[ ${STEAMDRIVER_SETUP:-0} != 1 && ( -z $installed_from || $installed_from == $inst ) ]]; then
+      if [[ -n $inst_info ]]; then
+        for (( i = 0; ; i++ )); do
+          task=$(/usr/bin/plutil -extract playTasks.$i.path raw "$inst_info" 2>/dev/null) || break
+          [[ $(/usr/bin/plutil -extract playTasks.$i.isPrimary raw "$inst_info" 2>/dev/null) == true ]] || continue
+          inst_exe=${inst_info:h}/${task//\\//}
+          inst_args=$(/usr/bin/plutil -extract playTasks.$i.arguments raw "$inst_info" 2>/dev/null)
+          wd=$(/usr/bin/plutil -extract playTasks.$i.workingDir raw "$inst_info" 2>/dev/null)
+          inst_dir=${inst_info:h}${wd:+/${wd//\\//}}
+          break
+        done
+        [[ -n $inst_exe ]] && game_name=$(/usr/bin/plutil -extract name raw "$inst_info" 2>/dev/null)
+      elif [[ -n $installed_from && -f $compat/installed-exe ]]; then
+        inst_exe=$(<$compat/installed-exe) inst_dir=${inst_exe:h}
+      fi
+    fi
+    if [[ -n $inst_exe && -f $inst_exe ]]; then
+      set -- "$inst_exe" ${(z)inst_args} "${@:2}"
+      say "installed game: ${game_name:-the game} (from ${installed_from:-$inst}); starting ${inst_exe#$WINEPREFIX/}"
+    else
+      inst_ran=1 inst_dir=
+      [[ -z $game_name ]] && game_name=${${inst:r}#setup_}
+      # Saves and settings kept when macSteam deleted this game before (InstalledGames.swift,
+      # "Keep saves and settings": the old prefix's drive_c/users and user.reg in
+      # SteamDriver/saved-games/<Name>) go back into the new prefix, once, before the installer.
+      kept=$steamdriver/saved-games/${1:h:t}
+      if [[ $1 == $steamdriver/installers/* && -d $kept && ! -f $compat/saves-restored ]]; then
+        "$WINESERVER" -k 2>/dev/null; "$WINESERVER" -w 2>/dev/null   # it writes user.reg when it exits
+        [[ -d $kept/users ]] && /bin/cp -R "$kept/users/." "$WINEPREFIX/drive_c/users/"
+        [[ -f $kept/user.reg ]] && /bin/cp -f "$kept/user.reg" "$WINEPREFIX/user.reg"
+        : > "$compat/saves-restored"
+        say "installer: put back ${game_name:-the game}'s saves and settings kept from before ($kept)"
+      fi
+      say "installer: running $inst; the next launch starts the game it installs"
+    fi
+  fi
   /bin/mkdir -p "$steamdriver/games" &&
     # Line 4, the Direct3D detected at a previous exit (below), stays until a launch sees another.
     known_d3d=$( [[ -f $steamdriver/games/$app_id ]] && /usr/bin/grep -m1 '^direct3d=' "$steamdriver/games/$app_id" )
@@ -266,6 +411,207 @@ if (( ${#shortcuts} )); then
   export WINEMAC_GAME_SHORTCUTS=$STEAMDRIVER_SHORTCUTS WINEMAC_GAME_SHORTCUTS_RECORD=$shortcut_records
 fi
 restore_shortcuts
+
+# MetalFX upscaling through D3DMetal (scripts/add_nvngx.py, runtime macfinals-176 on), as Apple's
+# Read Me describes it: nvngx resolves to Apple's nvngx-on-metalfx, which answers a game's DLSS
+# calls with MetalFX, for Direct3D 12 and 11 (tests/windows_probe/dlss_probe.c starts NGX on
+# both). It works on D3DMetal's own device, so a DX11 game with upscaling renders with D3DMetal
+# for that launch, even when STEAMDRIVER_DX11 asks for DXMT. With it on, D3DMetal reports an
+# NVIDIA GPU (vendor 10de) instead of its AMD one, because games only offer DLSS there. That is
+# Apple's own identity switch, used for performance, not to deceive an anti-cheat; THE FINALS
+# gets it like any game (Rasmus, 2026-11-25; CLAUDE.md, hard boundary 2). Off by default.
+# macSteam's profiles set it: the game's own profile if it has one (DX12: "upscaling = True" in
+# d3dmetal.conf; DX11: "steamdriver.upscaling = True" in dxmt.conf, a key DXMT ignores), else
+# Global DX11 for games last detected as DX11, else Global DX12. A DX11 game's first launch
+# (nothing detected yet) reads Global DX12. The launch option STEAMDRIVER_UPSCALE=1 or 0 wins.
+# The profile files read for upscaling and headphone surround, in this order (the first that exists).
+if [[ -d $steamdriver/profiles/app-$app_id ]]; then
+  profile_confs=("$steamdriver/profiles/app-$app_id/d3dmetal.conf" "$steamdriver/profiles/app-$app_id/dxmt.conf")
+elif [[ ${known_d3d:-} == direct3d=dx11 ]]; then
+  profile_confs=("$steamdriver/profiles/global-dx11/dxmt.conf")
+else
+  profile_confs=("$steamdriver/profiles/global-dx12/d3dmetal.conf")
+fi
+upscale=${STEAMDRIVER_UPSCALE:-} upscale_from="launch option"
+if [[ -z $upscale ]]; then
+  upscale=0
+  for f in $profile_confs; do
+    [[ -f $f ]] || continue
+    key=upscaling; [[ ${f:t} == dxmt.conf ]] && key='steamdriver\.upscaling'
+    /usr/bin/grep -qiE "^[[:space:]]*${key}[[:space:]]*=[[:space:]]*(true|1)[[:space:]]*\$" "$f" &&
+      upscale=1 upscale_from="profile ${f:h:t}"
+    break
+  done
+fi
+if [[ $upscale == 1 && $verb == waitforexitandrun ]]; then
+  if [[ ! -e $engine/lib/wine/x86_64-windows/nvngx.dll || ! -e $engine/lib/wine/x86_64-unix/nvngx.so ]]; then
+    say "upscaling: this runtime has no nvngx link to Apple's MetalFX module (macfinals-176 on); off"; upscale=0
+  elif (( ${$(/usr/bin/sw_vers -productVersion)%%.*} < 26 )); then
+    say "upscaling: D3DMetal's MetalFX needs macOS 26 or later; off"; upscale=0
+  fi
+fi
+
+# Headphone surround (wine-coreaudio-headphone-surround.patch, docs/SURROUND.md): a stereo output
+# (headphones) is offered to the game as 7.1 speakers, and Wine's Core Audio driver renders each
+# speaker for the two ears (spherical-head model) instead of macOS folding 7.1 down to stereo.
+# Experimental: macSteam's Experimental › Headphone surround writes $steamdriver/headphone-surround,
+# and only then does a profile's "surround = True" (d3dmetal.conf) or "steamdriver.surround = True"
+# (dxmt.conf) count, read from the same profile as upscaling. The launch option
+# STEAMDRIVER_SURROUND=1 or 0 wins over both.
+surround=${STEAMDRIVER_SURROUND:-} surround_from="launch option"
+if [[ -z $surround ]]; then
+  surround=0
+  if [[ -f $steamdriver/headphone-surround ]]; then
+    for f in $profile_confs; do
+      [[ -f $f ]] || continue
+      key=surround; [[ ${f:t} == dxmt.conf ]] && key='steamdriver\.surround'
+      /usr/bin/grep -qiE "^[[:space:]]*${key}[[:space:]]*=[[:space:]]*(true|1)[[:space:]]*\$" "$f" &&
+        surround=1 surround_from="profile ${f:h:t}"
+      break
+    done
+  fi
+fi
+if [[ $surround == 1 ]]; then
+  export WINE_HEADPHONE_SURROUND=1
+  [[ $verb == waitforexitandrun ]] && say "headphone surround on (from the $surround_from): stereo outputs appear as 7.1 and are rendered for headphones"
+  # The player's own settings, saved in macSteam's Headphone surround › Settings… (baked filters,
+  # read by the driver from runtime 206 on); without the file, the fitted ones.
+  surround_settings="$HOME/Library/Application Support/SteamDriver/surround-settings.sdsurr"
+  if [[ -f $surround_settings ]]; then
+    export WINE_HEADPHONE_SURROUND_FILTERS=$surround_settings
+    [[ $verb == waitforexitandrun ]] && say "headphone surround: your settings from macSteam"
+  else
+    unset WINE_HEADPHONE_SURROUND_FILTERS
+  fi
+else
+  unset WINE_HEADPHONE_SURROUND WINE_HEADPHONE_SURROUND_FILTERS
+fi
+
+# DX11 renderer (scripts/add_dxmt.py, runtime macfinals-175 on): Apple's D3DMetal (lib/wine's
+# d3d11/dxgi link into the player's toolkit) or MacVolvo's DXMT, the main environment's renderer
+# for CS2 and Deadlock. DX12 is always D3DMetal. STEAMDRIVER_DX11=dxmt uses DXMT, d3dmetal keeps
+# Apple's, and auto (the default) decides per game, below. DXMT's d3d11/dxgi/d3d10core are copied into the prefix and
+# loaded as native (lib/dxmt holds copies without Wine's builtin marker, which Wine never loads
+# as native); winemetal, DXMT's bridge to Metal, loads as a builtin from lib/wine. A launch with
+# D3DMetal takes the copies out again, so Wine's builtins (Apple's) load as before.
+# The default is auto (2026-11-25), so no launch option is needed: DXMT when the game is known to
+# be DX11 — its macSteam game profile is DX11 (profile.json), it is a known DX11 game (CS2,
+# Deadlock; Profiles.knownKinds in the app), or a previous launch was detected as DX11 — else
+# D3DMetal. Source 2 games (Deadlock) need this: on D3DMetal they start Vulkan and crash.
+dx11=${STEAMDRIVER_DX11:-auto}
+if [[ $dx11 == auto ]]; then
+  dx11=d3dmetal dx11_why=
+  known_dx11=(730 1422450)
+  if /usr/bin/grep -qE '"kind"[[:space:]]*:[[:space:]]*"dx11"' "$steamdriver/profiles/app-$app_id/profile.json" 2>/dev/null; then
+    dx11=dxmt dx11_why="its game profile is DX11"
+  elif (( ${known_dx11[(Ie)$app_id]} )); then
+    dx11=dxmt dx11_why="a known DX11 game"
+  elif [[ ${known_d3d:-} == direct3d=dx11 ]]; then
+    dx11=dxmt dx11_why="detected as DX11 at an earlier launch"
+  fi
+  [[ $dx11 == dxmt && $verb == waitforexitandrun ]] && say "DX11 renderer chosen automatically: DXMT ($dx11_why)"
+fi
+# A DX11 game on DXMT keeps DXMT with upscaling when the runtime carries DXMT's own DLSS and
+# NVAPI stand-ins (scripts/add_dxmt_dlss.py, macfinals-184 on): DXMT presents an NVIDIA GPU
+# (DXMT_ENABLE_NVEXT) and its nvngx.dll runs DLSS on MetalFX (docs/METALFX.md). Without them it
+# falls back to D3DMetal, whose (Apple's) DLSS works only on D3DMetal's own device.
+upscale_via=d3dmetal
+if [[ $upscale == 1 && $dx11 == dxmt && $verb == waitforexitandrun ]]; then
+  if [[ -f $engine/lib/dxmt/x86_64-windows/nvngx.dll && -f $engine/lib/dxmt/x86_64-windows/nvapi64.dll ]]; then
+    upscale_via=dxmt
+  else
+    say "DX11 renderer: D3DMetal for this launch (this runtime has no DXMT DLSS stand-in; Apple's DLSS needs D3DMetal)"
+    dx11=d3dmetal
+    # Vulkan off as in DXMT mode (below): Source 2 games pick Vulkan whenever it starts.
+    export WINEDLLOVERRIDES="$WINEDLLOVERRIDES;winevulkan,vulkan-1="
+  fi
+fi
+dxmt_placed=()
+for pair in x86_64:system32 i386:syswow64; do
+  for n in d3d11 dxgi d3d10core; do
+    dxmt_placed+=("${pair%%:*}-windows/$n.dll:$WINEPREFIX/drive_c/windows/${pair##*:}/$n.dll")
+  done
+done
+if [[ $dx11 == dxmt && $verb == waitforexitandrun ]]; then
+  if [[ -f $engine/lib/wine/x86_64-unix/winemetal.so && -d $engine/lib/dxmt ]]; then
+    for p in $dxmt_placed; do
+      src=$engine/lib/dxmt/${p%%:*} dst=${p#*:}
+      /usr/bin/cmp -s "$src" "$dst" || /bin/cp -c -f "$src" "$dst" 2>/dev/null || /bin/cp -f "$src" "$dst" ||
+        { say "could not copy DXMT's ${src:t} into the prefix"; exit 1; }
+    done
+    # Vulkan off too, as on NotProton's runner (winevulkan but no MoltenVK, so Vulkan never
+    # starts there): Source 2 games (Deadlock) pick Vulkan whenever it starts, even with a
+    # working DX11 device, and MoltenVK can't compile their shaders (vkQueueSubmit assert).
+    export WINEDLLOVERRIDES='d3d12,d3d12core,d3d10=b;d3d11,dxgi,d3d10core=n;winemetal=b;winevulkan,vulkan-1,nvapi64,nvngx=;steamclient=n;steamclient64=n;lsteamclient=b'
+    export CX_ACTIVE_GRAPHICS_BACKEND=dxmt CX_GRAPHICS_BACKEND=dxmt
+    # The renderer settings of this game's DX11 profile, else Global DX11 (docs/PROFILES.md).
+    for f in "$steamdriver/profiles/app-$app_id/dxmt.conf" "$steamdriver/profiles/global-dx11/dxmt.conf"; do
+      [[ -f $f ]] && { export DXMT_CONFIG_FILE="Z:${f//\//\\}"; break; }
+    done
+    say "DX11 renderer: DXMT${DXMT_CONFIG_FILE:+ (settings ${DXMT_CONFIG_FILE})}"
+  else
+    say "DX11 renderer: DXMT asked for, but this runtime has none; D3DMetal"
+    dx11=d3dmetal
+  fi
+fi
+if [[ $dx11 != dxmt && $verb == waitforexitandrun ]]; then
+  for p in $dxmt_placed; do
+    src=$engine/lib/dxmt/${p%%:*} dst=${p#*:} builtin=$engine/lib/wine/${p%%:*}
+    # DXMT's copies (byte-identical to the runtime's) were written over Wine's own files, the
+    # builtin copies wineboot puts in system32/syswow64. Put those back, never just delete:
+    # with no file there, Wine doesn't find d3d11/dxgi at all and the game's renderer fails to
+    # load (Deadlock with upscaling, 2026-11-25). A missing one is restored the same way;
+    # anything else in its place stays.
+    if [[ -f $src ]] && /usr/bin/cmp -s "$src" "$dst" || [[ ! -e $dst ]]; then
+      [[ -f $builtin ]] && /bin/cp -f "$builtin" "$dst" && say "${dst:h:t}/${dst:t}: Wine's own copy put back (DXMT's taken out)"
+    fi
+  done
+fi
+
+# MetalFX upscaling on DXMT: DXMT's DLSS and NVAPI stand-ins into system32 as native (copies
+# without Wine's builtin marker, nvngx.dll signed again with SteamDriver's certificate, which
+# NVIDIA's loader in the game requires), DXMT's NVIDIA identity, and NVIDIA's NGXCore key
+# pointing at system32 (D3DMetal writes it itself on the D3DMetal route; DXMT doesn't).
+if [[ $upscale == 1 && $upscale_via == dxmt && $dx11 == dxmt && $verb == waitforexitandrun ]]; then
+  for n in nvngx nvapi64; do
+    src=$engine/lib/dxmt/x86_64-windows/$n.dll dst=$WINEPREFIX/drive_c/windows/system32/$n.dll
+    /usr/bin/cmp -s "$src" "$dst" || /bin/cp -f "$src" "$dst" || say "upscaling: could not put DXMT's $n.dll into system32"
+  done
+  if ! /usr/bin/grep -A4 -i '^\[Software\\\\NVIDIA Corporation\\\\Global\\\\NGXCore\]' "$WINEPREFIX/system.reg" 2>/dev/null |
+       /usr/bin/grep -q -i '"FullPath"="C:\\\\windows\\\\system32"'; then
+    WINEDEBUG=-all "$WINELOADER" reg add 'HKLM\SOFTWARE\NVIDIA Corporation\Global\NGXCore' /v FullPath /t REG_SZ \
+      /d 'C:\Windows\System32' /f >> "$log" 2>&1 && say "upscaling: NVIDIA's NGXCore key set to C:\\Windows\\System32"
+  fi
+  export WINEDLLOVERRIDES=${WINEDLLOVERRIDES/,nvapi64,nvngx=;/'=;'}';nvapi64,nvngx=n' DXMT_ENABLE_NVEXT=1
+  # Direct3D 9 (wined3d) reports the same driver version as DXMT's DXGI (32.0.19.9999 with its
+  # NVIDIA identity): DXMT registers none, and wined3d's table would say 31.0.13.4052, which
+  # Deadlock reads, calls out of date and then never offers DLSS
+  # (wine-wined3d-config-driver-version.patch, macfinals-185 on; ignored by older runtimes).
+  export WINE_D3D_CONFIG=${WINE_D3D_CONFIG:+$WINE_D3D_CONFIG,}VideoDriverVersion=32.0.19.9999
+  say "upscaling: DLSS runs on MetalFX through DXMT's stand-in (DXMT_ENABLE_NVEXT=1, from the $upscale_from; the game sees an NVIDIA GPU, DXMT settings apply)"
+fi
+
+# MetalFX upscaling on D3DMetal, applied (the decision is above the DX11 renderer): Apple's
+# nvngx.dll and nvapi64.dll go into the prefix's system32, both may load, D3DM_ENABLE_METALFX=1.
+if [[ $upscale == 1 && $upscale_via == d3dmetal && $verb == waitforexitandrun ]]; then
+  # Apple's files themselves in system32, not wine.inf's placeholders: a game's NGX loader
+  # checks the signature of <NGXCore FullPath>\nvngx.dll on disk, and only Apple's copy is
+  # signed (Apple Inc.). Wine still loads them as builtins (they carry the builtin marker).
+  # nvapi64.dll is SteamDriver's NVAPI layer since macfinals-182 (scripts/add_nvapi_layer.py:
+  # Apple's NVAPI behind it, with the driver version D3DMetal registers); nvapi64_gptk.dll is the
+  # placeholder that lets Wine find Apple's NVAPI under that name (this Wine only loads a builtin
+  # that has a file in system32, and prefixes made before 182 have none).
+  for n in nvngx nvapi64 nvapi64_gptk; do
+    src=$engine/lib/wine/x86_64-windows/$n.dll dst=$WINEPREFIX/drive_c/windows/system32/$n.dll
+    [[ -f $src ]] || continue
+    /usr/bin/cmp -s "$src" "$dst" || /bin/cp -f "$src" "$dst" || say "upscaling: could not put $n.dll into system32"
+  done
+  export WINEDLLOVERRIDES=${WINEDLLOVERRIDES/,nvapi64,nvngx=;/'=;'}';nvapi64,nvngx=b' D3DM_ENABLE_METALFX=1
+  # The NVAPI layer's channel: which NVAPI functions the game asks for, and which of them
+  # Apple's NVAPI lacks (a handful of lines per launch; only without a WINEDEBUG of the user's).
+  [[ -z $user_winedebug ]] && export WINEDEBUG=$WINEDEBUG,trace+macfinals_nv
+  say "upscaling: DLSS runs on MetalFX (D3DM_ENABLE_METALFX=1, from the $upscale_from; the game sees an NVIDIA GPU)"
+fi
 
 # The in-process Rosetta syscall hook (environments/finals/tests/rosetta_nt). It replaces
 # anything Steam asked to insert: the hook has to be the process's own, and DISABLE_AOT has
@@ -284,10 +630,21 @@ case $verb in
     # The game. Helpers (verb run: Steam's iscriptevaluator.exe with a script path relative to
     # Steam's folder) keep the working directory Steam gave them; see the last case.
     [[ -n ${STEAM_COMPAT_INSTALL_PATH:-} && -d $STEAM_COMPAT_INSTALL_PATH ]] && cd "$STEAM_COMPAT_INSTALL_PATH"
+    # An installed game started instead of its installer runs in its own folder (above).
+    [[ -n ${inst_dir:-} && -d $inst_dir ]] && cd "$inst_dir"
+    # Shortcuts the installer makes from here on tell a non-GOG installer's game (below).
+    [[ -n ${inst_ran:-} ]] && : > "$compat/.installer-started"
     if [[ ${STEAMDRIVER_GAME_MODE:-1} != 0 ]]; then
       export WINE_GAME_MODE='*'
       say "Game Mode apps on"
     fi
+    # Another Wine's driver process (winedevice.exe, any other prefix) can hold a controller open,
+    # and then this game's winebus finds it but can't open it ("Failed Start Device Read Loop").
+    # 2026-11-27: one left over from a removed own Steam kept the 8BitDo pad for hours. Logged only.
+    for p in ${(f)"$(/usr/bin/pgrep -f 'winedevice\.exe' 2>/dev/null)"}; do
+      cwd=${"$(/usr/sbin/lsof -a -p $p -d cwd -Fn 2>/dev/null | /usr/bin/grep '^n')"#n}
+      [[ -n $cwd && $cwd != $WINEPREFIX/* ]] && say "controllers: another Wine's driver process is running (pid $p, in ${cwd%/drive_c/*}); a controller it holds can't reach this game"
+    done
     if [[ ${STEAMDRIVER_PERF:-0} != 0 ]]; then
       perf=$compat/perf/$(/bin/date +%Y%m%d-%H%M%S)
       /bin/mkdir -p "$perf"
@@ -305,14 +662,90 @@ case $verb in
       /bin/mv -f "$wlog" "$wlog.old"
       say "Wine log rotated to steamdriver-wine.log.old"
     fi
+    # WINEDEBUG from the launch options reaches only the game's command, but Steam's install-script
+    # helper (verb run, just before) leaves Wine's session running, and the game would join it: its
+    # driver processes (winedevice.exe: controllers, winebus) would keep the default channels.
+    # End that session first, so every process of this launch logs what was asked for.
+    if [[ -n $user_winedebug ]] && "$WINESERVER" -k 2>/dev/null; then
+      "$WINESERVER" -w
+      say "WINEDEBUG from the launch options: restarted the prefix's Wine session so its drivers log too"
+    fi
     say "launching: $shim $*"
     started=$SECONDS
     wlog_start=$( [[ -f $wlog ]] && /usr/bin/stat -f %z "$wlog" || print 0 )
+    # Benchmark recording (docs/BENCHMARKS.md). The launch option wins; else macSteam's Benchmarks
+    # setting, SteamDriver/benchmarks/record: a line "all" or one line per app id. Recording
+    # writes, per launch, a session folder that macSteam's benchmark hotkey reads:
+    #   Apple's Metal HUD log (MTL_HUD_LOG_ENABLED; every frame's interval and GPU time, in the
+    #     same form on every Wine and renderer) goes to the game's stderr, so into this launch's
+    #     part of steamdriver-wine.log (offset in session.json). The HUD itself stays invisible
+    #     (MTL_HUD_OPACITY=0; it logs only while enabled) unless MTL_HUD_ENABLED was given.
+    #   The renderer's per-frame present log, for the time from a frame's present to the
+    #     display: D3DMetal through the Mac driver (WINEMAC_INPUT_STATS, d3dm-frames-<pid>.csv),
+    #     DXMT its own (DXMT_DISPLAY_LOG, display-<pid>.csv).
+    bench=${STEAMDRIVER_BENCH:-} bench_from="launch option"
+    if [[ -z $bench ]]; then
+      bench=0 bench_from="macSteam's Benchmarks setting"
+      [[ -f $steamdriver/benchmarks/record ]] &&
+        /usr/bin/grep -qxE "all|$app_id" "$steamdriver/benchmarks/record" && bench=1
+    fi
+    if [[ $bench == 1 ]]; then
+      sessions=$steamdriver/benchmarks/sessions
+      session=$sessions/$app_id-$(/bin/date +%Y%m%d-%H%M%S)
+      /bin/mkdir -p "$session"
+      # Sessions hold raw per-frame files; keep the newest 10 (results live in benchmarks/runs).
+      old=("$sessions"/*(N/Om))
+      (( ${#old} > 10 )) && /bin/rm -rf -- "${(@)old[1,-11]}"
+      [[ -z ${MTL_HUD_ENABLED:-} ]] && export MTL_HUD_OPACITY=0
+      export MTL_HUD_ENABLED=1 MTL_HUD_LOG_ENABLED=1
+      if [[ $dx11 == dxmt ]]; then
+        export DXMT_DISPLAY_LOG=$session/display; renderer=dxmt
+      else
+        export WINEMAC_INPUT_STATS=$session/d3dm; renderer=d3dmetal
+      fi
+      runtime_version=$(/usr/bin/sed -n 's/.*"version": *"\([^"]*\)".*/\1/p' "$engine/runtime.json" 2>/dev/null | head -1)
+      json() { local s=${1//\\/\\\\}; s=${s//\"/\\\"}; print -rn -- "\"$s\""; }
+      print -r -- "{\"schema\":1,\"app_id\":$(json $app_id),\"game\":$(json "${game_name:-App $app_id}"),\
+\"started_unix_ms\":$(( $(/bin/date +%s) * 1000 )),\"tool\":$(json "${tool:t}"),\"runtime\":$(json "$runtime_version"),\
+\"renderer\":$(json $renderer),\"direct3d\":$(json "${known_d3d#direct3d=}"),\"upscaling\":$upscale,\
+\"upscaling_via\":$(json $upscale_via),\"surround\":$surround,\"dxmt_config\":$(json "${DXMT_CONFIG_FILE:-}"),\
+\"hud_visible\":$([[ -n ${MTL_HUD_OPACITY:-} ]] && print false || print true),\
+\"wine_log\":$(json "$wlog"),\"wine_log_offset\":$wlog_start,\"script_pid\":$$}" > "$session/session.json"
+      say "benchmark recording on ($bench_from): $session; macSteam's benchmark hotkey starts and stops a run"
+    fi
     "$WINELOADER" "$shim" "$@" >> "$compat/steamdriver-wine.log" 2>&1
     rc=$?
+    [[ $bench == 1 ]] && /bin/date +%s > "$session/ended"
+    # An installer that left its game behind: later launches start the game (above). GOG's
+    # leave goggame-*.info; for others, the program behind a Start Menu or Desktop shortcut the
+    # installer made (the newest that isn't an uninstaller, a readme or a redistributable).
+    if [[ -n ${inst_ran:-} ]]; then
+      if [[ -n $(/usr/bin/find "$WINEPREFIX/drive_c" -maxdepth 4 -name 'goggame-*.info' -print -quit 2>/dev/null) ]]; then
+        print -r -- "$inst" > "$compat/installed-from"
+        say "installer: $inst installed a GOG game; the next launch starts it"
+      else
+        found=
+        for lnk in ${(f)"$(/usr/bin/find "$WINEPREFIX/drive_c" \( -path '*/Start Menu/*' -o -path '*/Desktop/*' \) -name '*.lnk' -newer "$compat/.installer-started" 2>/dev/null)"}; do
+          [[ ${${lnk:t}:l} == *(uninst|unins|readme|manual|help|website|vcredist|directx|redist|support)* ]] && continue
+          # A Windows shortcut carries its target's full path (LinkInfo, ANSI).
+          target=$(/usr/bin/strings -a "$lnk" | /usr/bin/grep -m1 -iE '^[c-z]:\\.*\.exe$')
+          [[ $target == [cC]:\\* ]] || continue
+          exe=$WINEPREFIX/drive_c/${${target#?:\\}//\\//}
+          [[ -f $exe ]] && { found=$exe; break; }
+        done
+        if [[ -n $found ]]; then
+          print -r -- "$found" > "$compat/installed-exe"
+          print -r -- "$inst" > "$compat/installed-from"
+          say "installer: $inst installed ${found#$WINEPREFIX/}; the next launch starts it"
+        else
+          say "installer: $inst exited ($rc) and left no game shortcut or goggame-*.info; the next launch runs it again"
+        fi
+      fi
+      /bin/rm -f "$compat/.installer-started"
+    fi
     say "game exited ($rc); ending the prefix's Wine session"
     # The warning appears at start: a session that lasted past it has shown it.
-    if (( is_finals )) && [[ ! -f $gpu_warning_seen ]] && (( SECONDS - started > 30 )); then
+    if (( has_gpu_warning )) && [[ ! -f $gpu_warning_seen ]] && (( SECONDS - started > 30 )); then
       : > "$gpu_warning_seen"
       say "the minimum-spec warning has been shown once; later launches answer it"
     fi

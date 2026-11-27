@@ -52,3 +52,39 @@ one `NtUserPeekMessage` that never returned, wedged on the winemac event-queue l
 signature stays distinct: PeekMessage *returns* ~2 M times a second (a lost wakeup somewhere),
 so C04 is not covered by C06's fix. If C04 recurs, its counters should be checked for the same
 one-call-never-returns shape first before treating it as the spin again.
+
+**Seen again 2026-11-25 04:09, `macfinals-165`, `STEAMDRIVER_BG_THREADS` off (the A run of the
+thread-band A/B), no counters, `WINEMAC_INPUT_STATS` on.** Leaving the lobby: frames stopped at
+04:09:12 (≈120/s until 04:09:11) while the game was frontmost; Rasmus switched away ~22 s later;
+"Hang detected on GameThread" at 181 s since start (`UECC-Windows-2D1B616541E0267AFF5ADB89A7E498FF_0000`),
+GameThread leaf `win32u!NtUserPeekMessage` right after the stub's `syscall`
+(`win32u+0x152c4` = `NtUserPeekMessage+0x14`). The process used one full core at 04:10:08 (could be
+the spin, or the crash reporter writing its dump). Without counters, spin vs block (C06) is not
+decided. Next occurrence: run with `STEAMDRIVER_PERF=1` so `perf_report.py` shows the
+PeekMessage rate in the frozen seconds.
+
+**Follow-up (2026-11-25, same occurrence — full crash context read):**
+
+- GameThread (ThreadID 464, IsCrashed, `Misc.IsStuck=true`, `StuckThreadId=464`): leaf
+  `NtUserPeekMessage+0x14`, called from a **nested pump at `Discovery-d+0x2eec3d` — the same
+  site as C06's 2026-11-21 capture** (a nested pump inside a game handler, not the outer
+  `+0x6f28fa` pump of C06's 2026-11-15 capture).
+- All 80 other threads parked in normal waits (79 with an ntdll leaf; WindowsRawInputThread in
+  `NtUserGetMessage+0x14` — its normal park, or queued on the user lock as in C06's 11-21
+  capture). **No user-lock holder visible anywhere** (the 11-21 capture had one in
+  `NtUserDestroyWindow`).
+- The game's own crash-context fields: `Platform.AppHasFocus=true` (frontmost throughout — no
+  alt-tab, not AFK; **third trigger: leaving the lobby while focused**), `IsRequestingExit=false`,
+  memory fine (6.3 of 48 GB used, no OOM), `IsRunningOnBattery=true`, `TimeOfCrash` 04:10:15 =
+  **63 s after frames stopped** (the 60 s heartbeat, as in both C06 captures). So the 102 % CPU
+  observed at 04:10:08 was *during* the freeze — **one core still busy**, which fits C04's spin
+  better than C06's block (or an unknown runnable thread).
+- The Wine session ended cleanly (`game exited (0)` 04:11:46): no C05/C17 teardown hang.
+- Classification: **undecided between C04 (spin) and C06 (block).** The stack shape serves both;
+  the caller site matches a C06 capture; the still-busy core leans C04; and the trigger — a level
+  transition (leaving the lobby here, loading into a match on 2026-11-14) — matches C04's two
+  trigger contexts, while C06's were alt-tab and AFK.
+- Next occurrence: `STEAMDRIVER_PERF=1 WINEDEBUG=err+fixme,+macfinals_ui %command%`. The
+  counters decide spin vs block within seconds (PeekMessage rate, GameThread CPU); macdrv's
+  >10 s main-thread-wait ERRs (on by default) name a rendezvous block. The 60 s stuck dump fires
+  at the same moment as the game's watchdog — too late to rely on.

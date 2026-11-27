@@ -35,9 +35,16 @@ import Foundation
         case "settings": out["settings"]=Profiles.settings(a[4]).map { "\($0)" } ?? "none"
         case "edit":
             var s=Profiles.settings(a[4])!
-            s.frameLatency=2;s.frameCap=120;s.lateInput=true;s.shaderThreads=6;s.sharpScaling=true
+            s.frameLatency=2;s.frameCap=120;s.lateInput=true;s.shaderThreads=6;s.sharpScaling=true;s.upscaling=true
             try Profiles.save(a[4],s);out["settings"]="\(Profiles.settings(a[4])!)"
+        case "metal": out["metal"]="\(Profiles.d3dmetalSettings(a[4]))"
+        case "metaledit": try Profiles.saveD3DMetal(a[4],Profiles.D3DMetalSettings(upscaling:a[5]=="on",surround:a.count>6 && a[6]=="surround"));out["metal"]="\(Profiles.d3dmetalSettings(a[4]))"
+        case "surround":
+            var s=Profiles.settings(a[4])!;s.surround=a[5]=="on"
+            try Profiles.save(a[4],s);out["settings"]="\(Profiles.settings(a[4])!)";out["summary"]=Profiles.summary(Profiles.settings(a[4])!)
+        case "experimental": try Surround.setEnabled(a[4]=="on");out["enabled"]=Surround.enabled
         case "reset": try Profiles.resetSettings(a[4],resources:res)
+        case "switch": try Profiles.setKind(a[4],a[5]=="dx12" ? .dx12 : .dx11,resources:res);out["change"]="\(try NotProton.writeRows(resources:res))"
         default: break
         }
     } catch { out["error"]=error.localizedDescription }
@@ -60,7 +67,7 @@ class NotProtonOptions(unittest.TestCase):
         subprocess.run(['xcrun', 'swiftc', '-parse-as-library', str(ROOT / 'app/Sources/NotProton.swift'),
                         str(ROOT / 'app/Sources/NotProtonExtras.swift'), str(ROOT / 'app/Sources/Profiles.swift'), str(ROOT / 'app/Sources/KeyOverrides.swift'),
                         str(ROOT / 'app/Sources/Migration.swift'), str(ROOT / 'app/Sources/Brand.swift'),
-                        str(ROOT / 'app/Sources/InstallLocation.swift'),
+                        str(ROOT / 'app/Sources/InstallLocation.swift'), str(ROOT / 'app/Sources/Surround.swift'),
                         str(folder / 'harness.swift'), '-o', str(cls.tool)], check=True, capture_output=True)
 
     def setUp(self):
@@ -168,7 +175,7 @@ class NotProtonOptions(unittest.TestCase):
             'dxgi.presentPacingTargetUs = 1000\nd3d11.preferredMaxFrameRate = 0\ndxgi.nativeFullscreen = True\n')
         self.run_tool('cs2')
         self.assertEqual(self.run_tool('settings', 'app-730')['settings'],
-                         'Settings(frameLatency: 1, lateInput: true, frameCap: 0, shaderThreads: 4, shaderNormalPriority: false, sharpScaling: false, releaseShaderIR: true)')
+                         'Settings(frameLatency: 1, lateInput: true, frameCap: 0, shaderThreads: 4, shaderNormalPriority: false, sharpScaling: false, releaseShaderIR: true, upscaling: false, surround: false)')
         plugins = self.plugins.read_text()
         self.run_tool('edit', 'app-730')
         text = (self.lib / 'SteamDriver/profiles/app-730/dxmt.conf').read_text()
@@ -177,12 +184,76 @@ class NotProtonOptions(unittest.TestCase):
         self.assertIn('d3d11.preferredMaxFrameRate = 120\n', text)
         self.assertIn('dxgi.nativeFullscreen = True\n', text)
         self.assertIn('dxgi.sharpPresentation = True\n', text)
+        # Upscaling is the SteamDriver tool's key in the same file (compat-tool/run reads it).
+        self.assertIn('steamdriver.upscaling = True\n', text)
         self.assertEqual(text.count('dxgi.maxFrameLatency'), 1)
         # Settings change the file DXMT reads, not Steam's rows.
         self.assertEqual(self.plugins.read_text(), plugins)
         self.run_tool('reset', 'app-730')
         self.assertIn('frameLatency: 1', self.run_tool('settings', 'app-730')['settings'])
         self.assertEqual(self.run_tool('settings', 'global-dx12')['settings'], 'none')
+
+    def test_dx12_profiles_hold_d3dmetal_upscaling(self):
+        self.run_tool('dx12')
+        conf = self.lib / 'SteamDriver/profiles/global-dx12/d3dmetal.conf'
+        # A new DX12 profile starts with upscaling off, in the file the SteamDriver tool reads.
+        self.assertIn('upscaling = False\n', conf.read_text())
+        self.assertEqual(self.run_tool('metal', 'global-dx12')['metal'], 'D3DMetalSettings(upscaling: false, surround: false)')
+        self.assertEqual(self.run_tool('metaledit', 'global-dx12', 'on')['metal'], 'D3DMetalSettings(upscaling: true, surround: false)')
+        self.assertIn('upscaling = True\n', conf.read_text())
+        # A game profile switched DX12 -> DX11 -> DX12 gets its D3DMetal setting back.
+        self.run_tool('game', '1808500', 'ARC Raiders', 'dx12')
+        self.run_tool('metaledit', 'app-1808500', 'on')
+        game = self.lib / 'SteamDriver/profiles/app-1808500'
+        self.run_tool('switch', 'app-1808500', 'dx11')
+        self.assertFalse((game / 'd3dmetal.conf').exists())
+        self.assertTrue((game / 'dxmt.conf').exists())
+        self.run_tool('switch', 'app-1808500', 'dx12')
+        self.assertFalse((game / 'dxmt.conf').exists())
+        self.assertEqual(self.run_tool('metal', 'app-1808500')['metal'], 'D3DMetalSettings(upscaling: true, surround: false)')
+
+    def test_profiles_hold_headphone_surround(self):
+        # DX12: "surround" in d3dmetal.conf, beside upscaling.
+        self.run_tool('dx12')
+        conf = self.lib / 'SteamDriver/profiles/global-dx12/d3dmetal.conf'
+        self.assertIn('surround = False\n', conf.read_text())
+        self.assertEqual(self.run_tool('metaledit', 'global-dx12', 'off', 'surround')['metal'],
+                         'D3DMetalSettings(upscaling: false, surround: true)')
+        self.assertIn('surround = True\n', conf.read_text())
+        # DX11: the SteamDriver tool's own key in dxmt.conf, written only once it is used.
+        self.run_tool('add')
+        self.run_tool('game', '824270', "KovaaK's", 'dx11')
+        dxmt = self.lib / 'SteamDriver/profiles/app-824270/dxmt.conf'
+        self.run_tool('edit', 'app-824270')
+        self.assertNotIn('steamdriver.surround', dxmt.read_text())
+        out = self.run_tool('surround', 'app-824270', 'on')
+        self.assertIn('surround: true', out['settings'])
+        self.assertIn('steamdriver.surround = True\n', dxmt.read_text())
+        # The summary names it only while Experimental > Headphone surround is on.
+        self.assertNotIn('headphone surround', out['summary'])
+        self.assertTrue(self.run_tool('experimental', 'on')['enabled'])
+        self.assertTrue((self.lib / 'SteamDriver/headphone-surround').exists())
+        self.assertIn('headphone surround', self.run_tool('surround', 'app-824270', 'on')['summary'])
+        # Off again keeps the profile's setting; only the switch file goes.
+        self.assertFalse(self.run_tool('experimental', 'off')['enabled'])
+        self.assertIn('steamdriver.surround = True\n', dxmt.read_text())
+        self.run_tool('surround', 'app-824270', 'off')
+        self.assertIn('steamdriver.surround = False\n', dxmt.read_text())
+
+    def test_a_game_profile_switches_direct3d_and_keeps_dx11_settings(self):
+        self.run_tool('add')
+        self.run_tool('game', '824270', "KovaaK's", 'dx11')
+        self.assertIn('PROFILE_APP_824270', self.plugins.read_text())
+        self.run_tool('edit', 'app-824270')
+        edited = self.run_tool('settings', 'app-824270')['settings']
+        self.run_tool('switch', 'app-824270', 'dx12')
+        self.assertIn("app-824270 dx12 KovaaK's", self.run_tool('profiles')['profiles'])
+        self.assertEqual(self.run_tool('settings', 'app-824270')['settings'], 'none')   # DX12 has no renderer settings
+        self.assertNotIn('PROFILE_APP_824270', self.plugins.read_text())                 # no DX11 row for it now
+        self.run_tool('switch', 'app-824270', 'dx11')
+        self.assertIn("app-824270 dx11 KovaaK's", self.run_tool('profiles')['profiles'])
+        self.assertEqual(self.run_tool('settings', 'app-824270')['settings'], edited)    # the DX11 settings came back
+        self.assertIn('PROFILE_APP_824270', self.plugins.read_text())
 
     def test_the_direct3d_the_tool_detected_is_read_per_game(self):
         games = self.lib / 'SteamDriver/games'

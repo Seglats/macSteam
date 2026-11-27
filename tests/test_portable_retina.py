@@ -55,6 +55,27 @@ p.write_text(text)
         self.call('repair-retina')
         self.assertEqual(self.registry.read_text(),original.replace('"N"','"Y"'))
 
+    def test_a_1x_main_display_turns_retina_mode_off(self):
+        """On a 1x main display Wine's Retina mode doubled every display: games drew 4x the pixels."""
+        original='WINE REGISTRY Version 2\n\n[Software\\\\Wine\\\\Mac Driver] 1\n"RetinaMode"="Y"\n"Other"="keep"\n'
+        self.fixture(original)
+        wine=self.root/'runtimes/v1/bin/wine'
+        # A registry tool that sets RetinaMode to whatever it's asked for.
+        wine.write_text(f'#!{sys.executable}\n' + '''import os, sys, re
+from pathlib import Path
+p=Path(os.environ['WINEPREFIX'])/'user.reg'
+assert sys.argv[1:9]==['reg.exe','add',r'HKCU\\Software\\Wine\\Mac Driver','/v','RetinaMode','/t','REG_SZ','/d'], sys.argv
+p.write_text(re.sub(r'"RetinaMode"="[YN]"','"RetinaMode"="'+sys.argv[9]+'"',p.read_text()))
+''')
+        self.display_scale='1'
+        events=self.call('repair-retina')
+        self.assertEqual(events[-1],{**events[-1],'stage':'retina_configured','retina':False})
+        self.assertEqual(self.registry.read_text(),original.replace('"Y"','"N"'))
+        self.assertEqual(self.call('repair-retina'),[])          # matches now: nothing to do
+        self.display_scale='2'                                    # back on a Retina display: on again
+        self.assertEqual(self.call('repair-retina')[-1]['retina'],True)
+        self.assertEqual(self.registry.read_text(),original)
+
     def test_setting_in_another_section_does_not_skip_migration(self):
         self.fixture('[Unrelated]\n"RetinaMode"="Y"\n',no_write=True)
         self.assertEqual(self.call('repair-retina',success=False)[-1]['code'],'retina_configuration_failed')

@@ -19,7 +19,8 @@ class MouseRateCheckAnalysis(unittest.TestCase):
         rate_check.build()
 
     def synthetic(self, *extra):
-        result = subprocess.run([str(rate_check.EXECUTABLE), "--synthetic", *extra], capture_output=True, text=True,
+        # English numbers ("1,000") whatever this Mac's region: the verdicts are checked as text.
+        result = subprocess.run([str(rate_check.EXECUTABLE), "--synthetic", *extra, "-AppleLocale", "en_US"], capture_output=True, text=True,
                                 check=True, timeout=60)
         return json.loads(result.stdout)
 

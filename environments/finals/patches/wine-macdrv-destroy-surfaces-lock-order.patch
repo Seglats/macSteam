@@ -1,0 +1,53 @@
+From: MacFinals
+Subject: [PATCH] winemac: release D3DMetal client surfaces after dropping win_data_mutex (C06)
+
+The GameThread hang "Hang detected on GameThread" (crashes/C06) is a lock-order deadlock,
+caught with the stuck dump's lock-holder lines on 2026-11-25 09:01:
+
+  lock: macdrv win_data lock held by tid 031c for 10.1 s; taken at macdrv_DestroyWindow
+  ui wait: tid 014c waiting for the macdrv win_data lock; tid 031c
+
+- A worker destroying a window that has D3DMetal client surfaces (CW HACK 22435) holds
+  win_data_mutex for all of macdrv_DestroyWindow and releases the surfaces there; the last
+  release (client_surface_release) takes win32u's surfaces_lock.
+- The GameThread, handling CLIENT_SURFACE_PRESENTED in its message pump, holds surfaces_lock
+  in client_surface_present and calls macdrv_client_surface_present, which takes
+  win_data_mutex.
+
+Every other path (present, update, detach, D3DMetal's get_win_data hook) takes surfaces_lock
+first, so macdrv_DestroyWindow now takes the surface array out of the window data and releases
+it after win_data_mutex is dropped and the data is gone from win_datas.
+
+--- a/dlls/winemac.drv/window.c
++++ b/dlls/winemac.drv/window.c
+@@ -1390,6 +1390,7 @@
+ void macdrv_DestroyWindow(HWND hwnd)
+ {
+     struct macdrv_win_data *data;
++    CFMutableArrayRef d3dmetal_client_surfaces;
+ 
+     TRACE("%p\n", hwnd);
+ 
+@@ -1401,11 +1402,21 @@
+     destroy_cocoa_window(data);
+ 
+     /* CW HACK 22435 */
+-    if (data->d3dmetal_client_surfaces) CFRelease(data->d3dmetal_client_surfaces);
++    d3dmetal_client_surfaces = data->d3dmetal_client_surfaces;
++    data->d3dmetal_client_surfaces = NULL;
+ 
+     CFDictionaryRemoveValue(win_datas, hwnd);
+     release_win_data(data);
+     free(data);
++
++    /* C06: released only after win_data_mutex is dropped. The last release of a client surface
++     * takes win32u's surfaces_lock (client_surface_release), and every other path takes the two
++     * the other way round - client_surface_present / _update / the surface's detach hold
++     * surfaces_lock and then call get_win_data. Releasing under win_data_mutex deadlocked a
++     * worker destroying a D3DMetal window against the GameThread presenting from its message
++     * pump (crashes/C06, 2026-11-25 09:01). The window's data is gone from win_datas by now,
++     * so the detach's get_win_data finds nothing to update. */
++    if (d3dmetal_client_surfaces) CFRelease(d3dmetal_client_surfaces);
+ }
+ 
+ 

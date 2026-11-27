@@ -28,7 +28,8 @@ An Apple Development identity is not a substitute.
 3. Package with `scripts/build_release_dmg.py` using the same identity and
    notary profile. It checks the app's signature/staple and notarizes the DMG.
 4. Upload `MacVolvo-1.1.dmg`, `MacVolvo-1.1.dmg.sha256` and the validation JSON to a new v1.1 draft release.
-5. Recheck install, Steam/game launch, return from a full match, and known issues.
+5. Recheck install, Steam/game launch, return from a full match, and known issues. Run the
+   games in [`RELEASE-TEST-GAMES.md`](RELEASE-TEST-GAMES.md).
    Record incomplete gameplay validation and known issues in the release notes.
 6. Publish the release as latest. Keep `<!-- minimum-macos: 26.5 -->` in its body.
    The normal app's update check ignores prereleases; GPTK4 remains separate.

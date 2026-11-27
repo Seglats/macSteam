@@ -1,0 +1,505 @@
+--- a/dlls/winecoreaudio.drv/coreaudio.c
++++ b/dlls/winecoreaudio.drv/coreaudio.c
+@@ -63,162 +63,211 @@
+ #include "winnls.h"
+ #include "winreg.h"
+ #include "winternl.h"
+ #include "mmdeviceapi.h"
+ #include "initguid.h"
+ #include "audioclient.h"
+ #include "wine/debug.h"
+ #include "wine/unixlib.h"
+ 
+ #include "unixlib.h"
+ #include "coreaudio_cocoa.h"
+ 
+ #if !defined(MAC_OS_VERSION_12_0) || MAC_OS_X_VERSION_MAX_ALLOWED < MAC_OS_VERSION_12_0
+ #define kAudioObjectPropertyElementMain kAudioObjectPropertyElementMaster
+ #endif
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(coreaudio);
+ WINE_DECLARE_DEBUG_CHANNEL(winediag);
+ 
+ struct coreaudio_stream
+ {
+     os_unfair_lock lock;
+     AudioComponentInstance unit;
+     AudioConverterRef converter;
+     AudioStreamBasicDescription dev_desc; /* audio unit format, not necessarily the same as fmt */
+     AudioDeviceID dev_id;
+ 
+     EDataFlow flow;
+     DWORD flags;
+     AUDCLNT_SHAREMODE share;
+     HANDLE event;
+ 
+     BOOL playing, please_quit;
+     REFERENCE_TIME period;
+     UINT32 period_frames;
+     UINT32 bufsize_frames, resamp_bufsize_frames;
+     UINT32 lcl_offs_frames, held_frames, wri_offs_frames, tmp_buffer_frames;
+     UINT32 cap_bufsize_frames, cap_offs_frames, cap_held_frames;
+     UINT32 wrap_bufsize_frames;
+     UINT64 written_frames;
+     INT32 getbuf_last;
+     WAVEFORMATEX *fmt;
+     BYTE *local_buffer, *cap_buffer, *wrap_buffer, *resamp_buffer, *tmp_buffer;
+     struct binaural *binaural;
+ };
+ 
+ /* Headphone surround (WINE_HEADPHONE_SURROUND=1): a stereo output device is offered to
+  * Windows programs as 7.1, and each speaker channel of a multichannel stream is rendered for
+  * the two ears through measured head responses: MIT's KEMAR (Bill Gardner and Keith Martin,
+  * MIT Media Lab, 1994), reshaped with settings fitted to a reference headphone renderer
+  * (SteamDriver's scripts/surround_fit and docs/SURROUND.md). surround_ir.h holds each speaker
+  * position's finished filter per ear at 48 kHz, resampled to the stream's rate; a short, quiet
+  * reverb tail (a four-line feedback delay network) follows. The audio unit then gets plain
+  * stereo float, so macOS does no downmix of its own. Off unless set. */
+ #include "surround_ir.h"
+ 
+ #define BIN_MAX_CHANNELS 18
+ #define BIN_MAX_TAPS (SURROUND_IR_TAPS * 4 + 8)  /* the filters at up to 192 kHz */
+ #define BIN_HIST 2048           /* input history per channel (power of two): a filter and the tail's start */
+ #define BIN_FDN 4
+ 
+ struct binaural_chan
+ {
+     BOOL lfe;
+     enum surround_pos pos;
+     float gain;
+ };
+ 
+ struct binaural
+ {
+     UINT channels, bytes;
+     BOOL is_float;
+     UINT pos;
+     int taps, tail_delay;
+     struct binaural_chan ch[BIN_MAX_CHANNELS];
+     float *ir[SURROUND_POSITIONS][2];       /* reversed, at the stream's rate; NULL when unused */
+     float hist[BIN_MAX_CHANNELS][2 * BIN_HIST]; /* each sample written twice, so reads never wrap */
+     float *fdn[BIN_FDN];
+     int fdn_len[BIN_FDN], fdn_pos[BIN_FDN];
+     float fdn_damp[BIN_FDN], fdn_g, fdn_k;
++    float tail_level;
+ };
+ 
++/* Settings baked by macSteam (Experimental › Headphone surround › Settings…, its live preview's
++ * Save): WINE_HEADPHONE_SURROUND_FILTERS names the file, which SteamDriver's run script passes on
++ * when there is one. Same filters, gains and tail as surround_ir.h, from the player's own knobs:
++ * "SDSURR1\0", rate, taps, positions, a gain per position, the LFE gain, the tail (level, time,
++ * damping, start), then each position's filters per ear. Read when a stream starts; anything
++ * unexpected (size, rate, taps, a value that isn't finite) and the built-in fitted filters play. */
++struct surround_baked
++{
++    float gain[SURROUND_POSITIONS], lfe, tail, tail_rt, tail_lp, tail_ms;
++    float ir[SURROUND_POSITIONS][2][SURROUND_IR_TAPS];
++};
++
++static struct surround_baked *surround_baked_load(void)
++{
++    const char *path = getenv("WINE_HEADPHONE_SURROUND_FILTERS");
++    struct surround_baked *s;
++    char magic[8];
++    unsigned int head[3], i, n;
++    FILE *f;
++    long size;
++    const float *v;
++
++    if(!path || !*path || !(f = fopen(path, "rb"))) return NULL;
++    fseek(f, 0, SEEK_END);
++    size = ftell(f);
++    fseek(f, 0, SEEK_SET);
++    if(size != (long)(sizeof(magic) + sizeof(head) + sizeof(struct surround_baked)) ||
++       fread(magic, 1, sizeof(magic), f) != sizeof(magic) || memcmp(magic, "SDSURR1", 8) ||
++       fread(head, sizeof(head[0]), 3, f) != 3 ||
++       head[0] != SURROUND_IR_RATE || head[1] != SURROUND_IR_TAPS || head[2] != SURROUND_POSITIONS ||
++       !(s = malloc(sizeof(*s)))){
++        WARN("headphone surround: %s isn't a settings file for this driver; the fitted filters play\n", path);
++        fclose(f);
++        return NULL;
++    }
++    n = fread(s, sizeof(*s), 1, f);
++    fclose(f);
++    for(i = 0, v = (const float *)s; n == 1 && i < sizeof(*s) / sizeof(float); i++)
++        if(!isfinite(v[i])) n = 0;
++    if(n != 1 || s->tail_rt <= 0 || s->tail_ms < 0){
++        WARN("headphone surround: %s couldn't be read; the fitted filters play\n", path);
++        free(s);
++        return NULL;
++    }
++    TRACE("headphone surround: settings from %s\n", path);
++    return s;
++}
++
+ static BOOL headphone_surround(void)
+ {
+     static int on = -1;
+     if(on < 0){
+         const char *env = getenv("WINE_HEADPHONE_SURROUND");
+         on = env && *env && *env != '0';
+         TRACE("headphone surround %s\n", on ? "on" : "off");
+     }
+     return on;
+ }
+ 
+ static const REFERENCE_TIME def_period = 100000;
+ static const REFERENCE_TIME min_period = 50000;
+ 
+ static ULONG_PTR zero_bits = 0;
+ 
+ static NTSTATUS unix_not_implemented(void *args)
+ {
+     return STATUS_SUCCESS;
+ }
+ 
+ static HRESULT osstatus_to_hresult(OSStatus sc)
+ {
+     switch(sc){
+     case kAudioFormatUnsupportedDataFormatError:
+     case kAudioFormatUnknownFormatError:
+     case kAudioDeviceUnsupportedFormatError:
+         return AUDCLNT_E_UNSUPPORTED_FORMAT;
+     case kAudioHardwareBadDeviceError:
+         return AUDCLNT_E_DEVICE_INVALIDATED;
+     }
+     return E_FAIL;
+ }
+ 
+ static struct coreaudio_stream *handle_get_stream(stream_handle h)
+ {
+     return (struct coreaudio_stream *)(UINT_PTR)h;
+ }
+ 
+ /* copied from kernelbase */
+ static int muldiv( int a, int b, int c )
+ {
+     LONGLONG ret;
+ 
+     if (!c) return -1;
+ 
+     /* We want to deal with a positive divisor to simplify the logic. */
+     if (c < 0)
+     {
+         a = -a;
+         c = -c;
+     }
+ 
+     /* If the result is positive, we "add" to round. else, we subtract to round. */
+     if ((a < 0 && b < 0) || (a >= 0 && b >= 0))
+         ret = (((LONGLONG)a * b) + (c / 2)) / c;
+     else
+         ret = (((LONGLONG)a * b) - (c / 2)) / c;
+ 
+     if (ret > 2147483647 || ret < -2147483647) return -1;
+     return ret;
+ }
+ 
+ static AudioObjectPropertyScope get_scope(EDataFlow flow)
+ {
+     return (flow == eRender) ? kAudioDevicePropertyScopeOutput : kAudioDevicePropertyScopeInput;
+ }
+ 
+ static BOOL device_has_channels(AudioDeviceID device, EDataFlow flow)
+ {
+     AudioObjectPropertyAddress addr;
+     AudioBufferList *buffers;
+     BOOL ret = FALSE;
+     OSStatus sc;
+     UInt32 size;
+     int i;
+ 
+     addr.mSelector = kAudioDevicePropertyStreamConfiguration;
+     addr.mScope = get_scope(flow);
+     addr.mElement = 0;
+@@ -283,277 +332,281 @@
+     *is_float = fmt->wFormatTag == WAVE_FORMAT_IEEE_FLOAT ||
+                 (ext && IsEqualGUID(&fmtex->SubFormat, &KSDATAFORMAT_SUBTYPE_IEEE_FLOAT));
+     if(*is_float) return fmt->wBitsPerSample == 32 ? 4 : 0;
+     if(fmt->wFormatTag != WAVE_FORMAT_PCM && !(ext && IsEqualGUID(&fmtex->SubFormat, &KSDATAFORMAT_SUBTYPE_PCM)))
+         return 0;
+     switch(fmt->wBitsPerSample){
+     case 16: return 2;
+     case 24: return 3;
+     case 32: return 4;
+     }
+     return 0;
+ }
+ 
+ /* Whether a render stream in this format on this device is played as headphone surround. */
+ static BOOL binaural_wanted(EDataFlow flow, AudioDeviceID device, const WAVEFORMATEX *fmt)
+ {
+     BOOL is_float;
+     UINT dev_channels;
+ 
+     if(flow != eRender || !headphone_surround()) return FALSE;
+     if(fmt->nChannels <= 2 || fmt->nChannels > BIN_MAX_CHANNELS) return FALSE;
+     if(!binaural_bytes(fmt, &is_float) || fmt->nBlockAlign != fmt->nChannels * binaural_bytes(fmt, &is_float))
+         return FALSE;
+     dev_channels = device_channel_count(device, flow);
+     return dev_channels > 0 && dev_channels <= 2;
+ }
+ 
+ static enum surround_pos binaural_position(DWORD bit, DWORD mask)
+ {
+     BOOL sides = (mask & (SPEAKER_SIDE_LEFT | SPEAKER_SIDE_RIGHT)) != 0;
+     BOOL backs = (mask & (SPEAKER_BACK_LEFT | SPEAKER_BACK_RIGHT)) != 0;
+ 
+     /* with only one pair of surrounds (5.1), they sit at 110 degrees */
+     switch(bit){
+     case SPEAKER_FRONT_LEFT: case SPEAKER_TOP_FRONT_LEFT: return SURROUND_FL;
+     case SPEAKER_FRONT_RIGHT: case SPEAKER_TOP_FRONT_RIGHT: return SURROUND_FR;
+     case SPEAKER_FRONT_LEFT_OF_CENTER: return SURROUND_FLC;
+     case SPEAKER_FRONT_RIGHT_OF_CENTER: return SURROUND_FRC;
+     case SPEAKER_BACK_LEFT: case SPEAKER_TOP_BACK_LEFT: return sides ? SURROUND_BL : SURROUND_S5L;
+     case SPEAKER_BACK_RIGHT: case SPEAKER_TOP_BACK_RIGHT: return sides ? SURROUND_BR : SURROUND_S5R;
+     case SPEAKER_BACK_CENTER: case SPEAKER_TOP_BACK_CENTER: return SURROUND_BC;
+     case SPEAKER_SIDE_LEFT: return backs ? SURROUND_SL : SURROUND_S5L;
+     case SPEAKER_SIDE_RIGHT: return backs ? SURROUND_SR : SURROUND_S5R;
+     }
+     return SURROUND_C;   /* front center, top center, top front center, unlisted channels */
+ }
+ 
+ /* A 48 kHz filter at the stream's rate (windowed sinc, band-limited below 48 kHz), reversed. */
+ static void binaural_resample(const float *h, float *out, int taps, float rate)
+ {
+     float ratio = SURROUND_IR_RATE / rate, fc = rate < SURROUND_IR_RATE ? rate / SURROUND_IR_RATE : 1.0f;
+     int n, k;
+ 
+     for(n = 0; n < taps; n++){
+         float t = n * ratio, sum = 0;
+         if(ratio == 1.0f) sum = n < SURROUND_IR_TAPS ? h[n] : 0;
+         else for(k = 0; k < SURROUND_IR_TAPS; k++){
+             float x = fc * (t - k);
+             if(fabsf(x) >= 16) continue;
+             sum += h[k] * (x == 0 ? 1.0f : sinf((float)M_PI * x) / ((float)M_PI * x)) * (0.5f + 0.5f * cosf((float)M_PI * x / 16))
+                    * ratio * fc;
+         }
+         out[taps - 1 - n] = sum;
+     }
+ }
+ 
+ static void binaural_free(struct binaural *b)
+ {
+     int i, e;
+ 
+     if(!b) return;
+     for(i = 0; i < SURROUND_POSITIONS; i++)
+         for(e = 0; e < 2; e++) free(b->ir[i][e]);
+     for(i = 0; i < BIN_FDN; i++) free(b->fdn[i]);
+     free(b);
+ }
+ 
+ static struct binaural *binaural_create(const WAVEFORMATEX *fmt)
+ {
+     static const float fdn_ms[BIN_FDN] = {29.1f, 37.4f, 41.7f, 48.0f};
++    struct surround_baked *baked = surround_baked_load();
+     struct binaural *b;
+     DWORD mask, bit = 1;
+     float rate = fmt->nSamplesPerSec;
+     UINT c, e, i;
+ 
+-    if(!(b = calloc(1, sizeof(*b)))) return NULL;
++    if(!(b = calloc(1, sizeof(*b)))){ free(baked); return NULL; }
+     b->channels = fmt->nChannels;
+     b->bytes = binaural_bytes(fmt, &b->is_float);
+     b->taps = (int)ceilf(SURROUND_IR_TAPS * rate / SURROUND_IR_RATE);
+     if(b->taps > BIN_MAX_TAPS) b->taps = BIN_MAX_TAPS;
+     mask = fmt->wFormatTag == WAVE_FORMAT_EXTENSIBLE ? ((const WAVEFORMATEXTENSIBLE *)fmt)->dwChannelMask
+                                                        : get_channel_mask(fmt->nChannels);
+ 
+     for(c = 0; c < b->channels; c++){
+         struct binaural_chan *ch = &b->ch[c];
+         DWORD this_bit = 0;
+ 
+         /* Windows orders a stream's channels by ascending speaker bit. */
+         while(bit && !(mask & bit)) bit <<= 1;
+         if(bit){ this_bit = bit; bit <<= 1; }
+ 
+         if(this_bit == SPEAKER_LOW_FREQUENCY){
+             ch->lfe = TRUE;
+-            ch->gain = SURROUND_LFE_GAIN;
++            ch->gain = baked ? baked->lfe : SURROUND_LFE_GAIN;
+             continue;
+         }
+         ch->pos = binaural_position(this_bit, mask);
+-        ch->gain = surround_gain[ch->pos];
++        ch->gain = baked ? baked->gain[ch->pos] : surround_gain[ch->pos];
+         for(e = 0; e < 2; e++){
+             if(b->ir[ch->pos][e]) continue;
+             if(!(b->ir[ch->pos][e] = malloc(b->taps * sizeof(float)))) goto fail;
+-            binaural_resample(surround_ir[ch->pos][e], b->ir[ch->pos][e], b->taps, rate);
++            binaural_resample(baked ? baked->ir[ch->pos][e] : surround_ir[ch->pos][e], b->ir[ch->pos][e], b->taps, rate);
+         }
+         TRACE("channel %u: speaker 0x%x at position %u, %d taps\n", c, (unsigned int)this_bit, ch->pos, b->taps);
+     }
+ 
+-    b->tail_delay = (int)(SURROUND_TAIL_MS / 1000 * rate);
++    b->tail_level = baked ? baked->tail : SURROUND_TAIL;
++    b->tail_delay = (int)((baked ? baked->tail_ms : SURROUND_TAIL_MS) / 1000 * rate);
+     if(b->tail_delay > BIN_HIST - 1) b->tail_delay = BIN_HIST - 1;
+     for(i = 0; i < BIN_FDN; i++){
+         b->fdn_len[i] = (int)(fdn_ms[i] * rate / 1000);
+         if(!(b->fdn[i] = calloc(b->fdn_len[i], sizeof(float)))) goto fail;
+     }
+     /* lines and reverb time scale together, so the gain per pass stays the same */
+-    b->fdn_g = powf(10, -3.0f * 0.040f / SURROUND_TAIL_RT);
+-    b->fdn_k = 1 - expf(-2 * (float)M_PI * SURROUND_TAIL_LP / rate);
++    b->fdn_g = powf(10, -3.0f * 0.040f / (baked ? baked->tail_rt : SURROUND_TAIL_RT));
++    b->fdn_k = 1 - expf(-2 * (float)M_PI * (baked ? baked->tail_lp : SURROUND_TAIL_LP) / rate);
++    free(baked);
+     return b;
+ 
+ fail:
++    free(baked);
+     binaural_free(b);
+     return NULL;
+ }
+ 
+ static float binaural_sample(const struct binaural *b, const BYTE *frame, UINT c)
+ {
+     switch(b->bytes){
+     case 2: return ((const INT16 *)frame)[c] / 32768.0f;
+     case 3:
+     {
+         const BYTE *s = frame + 3 * c;
+         return (INT32)(((UINT32)s[0] << 8) | ((UINT32)s[1] << 16) | ((UINT32)s[2] << 24)) / 2147483648.0f;
+     }
+     case 4: return b->is_float ? ((const float *)frame)[c] : ((const INT32 *)frame)[c] / 2147483648.0f;
+     }
+     return 0;
+ }
+ 
+ /* One frame of the stream (NULL: silence) to one stereo float frame. */
+ static void binaural_frame(struct binaural *b, const BYTE *frame, float *out)
+ {
+     float mono = 0, y[BIN_FDN], sum = 0;
+     UINT c, i;
+     int k;
+ 
+     out[0] = out[1] = 0;
+     b->pos = (b->pos + 1) & (BIN_HIST - 1);
+     for(c = 0; c < b->channels; c++){
+         struct binaural_chan *ch = &b->ch[c];
+         float v = frame ? binaural_sample(b, frame, c) * ch->gain : 0;
+         float l0 = 0, l1 = 0, l2 = 0, l3 = 0, r0 = 0, r1 = 0, r2 = 0, r3 = 0;
+         const float *x, *h0, *h1;
+ 
+         if(ch->lfe){
+             out[0] += v;
+             out[1] += v;
+             continue;
+         }
+         b->hist[c][b->pos] = b->hist[c][b->pos + BIN_HIST] = v;
+         /* the filters are stored reversed: both run forward over the last taps samples */
+         x = b->hist[c] + b->pos + BIN_HIST - (b->taps - 1);
+         h0 = b->ir[ch->pos][0];
+         h1 = b->ir[ch->pos][1];
+         for(k = 0; k + 3 < b->taps; k += 4){
+             l0 += h0[k] * x[k]; l1 += h0[k + 1] * x[k + 1]; l2 += h0[k + 2] * x[k + 2]; l3 += h0[k + 3] * x[k + 3];
+             r0 += h1[k] * x[k]; r1 += h1[k + 1] * x[k + 1]; r2 += h1[k + 2] * x[k + 2]; r3 += h1[k + 3] * x[k + 3];
+         }
+         for(; k < b->taps; k++){
+             l0 += h0[k] * x[k];
+             r0 += h1[k] * x[k];
+         }
+         out[0] += (l0 + l1) + (l2 + l3);
+         out[1] += (r0 + r1) + (r2 + r3);
+         mono += b->hist[c][b->pos + BIN_HIST - b->tail_delay];
+     }
+ 
+     /* tail: Householder feedback matrix, damped, decorrelated left and right outputs */
+     for(i = 0; i < BIN_FDN; i++){
+         y[i] = b->fdn[i][b->fdn_pos[i]];
+         b->fdn_damp[i] += b->fdn_k * (y[i] - b->fdn_damp[i]);
+         if(fabsf(b->fdn_damp[i]) < 1e-20f) b->fdn_damp[i] = 0;   /* no denormals once quiet */
+         sum += b->fdn_damp[i];
+     }
+     for(i = 0; i < BIN_FDN; i++){
+         b->fdn[i][b->fdn_pos[i]] = b->fdn_g * (b->fdn_damp[i] - 0.5f * sum) + 0.12f * mono;
+         if(++b->fdn_pos[i] == b->fdn_len[i]) b->fdn_pos[i] = 0;
+     }
+-    out[0] += 0.10f * SURROUND_TAIL * (y[0] - y[2] + 0.5f * y[1]);
+-    out[1] += 0.10f * SURROUND_TAIL * (y[1] - y[3] + 0.5f * y[2]);
++    out[0] += 0.10f * b->tail_level * (y[0] - y[2] + 0.5f * y[1]);
++    out[1] += 0.10f * b->tail_level * (y[1] - y[3] + 0.5f * y[2]);
+ }
+ 
+ static NTSTATUS unix_process_attach(void *args)
+ {
+ #ifdef _WIN64
+     if (NtCurrentTeb()->WowTebOffset)
+     {
+         SYSTEM_BASIC_INFORMATION info;
+ 
+         NtQuerySystemInformation(SystemEmulationBasicInformation, &info, sizeof(info), NULL);
+         zero_bits = (ULONG_PTR)info.HighestUserAddress | 0x7fffffff;
+     }
+ #endif
+     return STATUS_SUCCESS;
+ }
+ 
+ static NTSTATUS unix_main_loop(void *args)
+ {
+     struct main_loop_params *params = args;
+     NtSetEvent(params->event, NULL);
+     return STATUS_SUCCESS;
+ }
+ 
+ static NTSTATUS unix_get_endpoint_ids(void *args)
+ {
+     struct get_endpoint_ids_params *params = args;
+     unsigned int num_devices, i, needed, offset;
+     AudioDeviceID *devices, default_id;
+     AudioObjectPropertyAddress addr;
+     struct endpoint *endpoint;
+     UInt32 devsize, size;
+     struct endpoint_info
+     {
+         CFStringRef name;
+         CFStringRef uid;
+         AudioDeviceID id;
+     } *info;
+     OSStatus sc;
+     UniChar *ptr;
+ 
+     params->num = 0;
+     params->default_idx = 0;
+ 
+     addr.mScope = kAudioObjectPropertyScopeGlobal;
+     addr.mElement = kAudioObjectPropertyElementMain;
+     if(params->flow == eRender) addr.mSelector = kAudioHardwarePropertyDefaultOutputDevice;
+     else if(params->flow == eCapture) addr.mSelector = kAudioHardwarePropertyDefaultInputDevice;
+     else{
+         params->result = E_INVALIDARG;
+         return STATUS_SUCCESS;
+     }
+ 
+     size = sizeof(default_id);
+     sc = AudioObjectGetPropertyData(kAudioObjectSystemObject, &addr, 0, NULL, &size, &default_id);
+     if(sc != noErr){
+         WARN("Getting _DefaultInputDevice property failed: %x\n", (int)sc);
+         default_id = -1;
+     }
+ 
+     addr.mSelector = kAudioHardwarePropertyDevices;
+     sc = AudioObjectGetPropertyDataSize(kAudioObjectSystemObject, &addr, 0, NULL, &devsize);
+     if(sc != noErr){
+         WARN("Getting _Devices property size failed: %x\n", (int)sc);
+         params->result = osstatus_to_hresult(sc);
+         return STATUS_SUCCESS;
+     }
+ 
+     num_devices = devsize / sizeof(AudioDeviceID);
+     devices = malloc(devsize);
+     info = malloc(num_devices * sizeof(*info));
+     if(!devices || !info){
+         free(info);
+         free(devices);
+         params->result = E_OUTOFMEMORY;
+         return STATUS_SUCCESS;
+     }
+ 
+     sc = AudioObjectGetPropertyData(kAudioObjectSystemObject, &addr, 0, NULL, &devsize, devices);
+     if(sc != noErr){
+         WARN("Getting _Devices property failed: %x\n", (int)sc);

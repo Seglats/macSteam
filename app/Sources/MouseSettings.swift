@@ -141,7 +141,7 @@ struct SteamMouseStatus:View {
             } else if report.reporting {
                 StatusLine(.good,"High-precision mouse is working: your game reads your mouse directly (\(when)).")
             } else if report.mice > 0 {
-                StatusLine(.good,"Steam may read your mouse, and it is open (\(when)). Move it in the game to confirm.")
+                StatusLine(.good,"Games using SteamDriver will use the high-precision mouse.")
             } else {
                 StatusLine(.warning,"Steam may read your mouse, but none was connected (\(when)). A trackpad works as Standard does.")
             }

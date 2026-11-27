@@ -26,8 +26,24 @@ in macOS Steam, through NotProton's own extension points. It replaces nothing of
 - **MacVolvo renderer**: MacVolvo's DXMT (Direct3D 11 to Metal), or Apple's D3DMetal from your own
   Game Porting Toolkit.
 - **Profiles**: Global DX11, Global DX12 and per-game profiles with renderer settings and key combo overrides ([docs/PROFILES.md](docs/PROFILES.md)).
+- **More controller support** (experimental, bottom of the app): controllers in Xbox mode
+  (XInput), such as 8BitDo pads in their normal mode, reach SteamDriver games directly at their
+  full rate (1,000 updates a second for the 8BitDo Ultimate 2). macOS has no driver for them and
+  macOS Steam keeps them for itself, so the switch tells Steam to leave the listed controllers
+  alone (`SDL_HIDAPI_IGNORE_DEVICES`, set at login) and restarts it. While it's on, those
+  controllers don't work in Steam's menus or Mac games. Microsoft's Xbox controllers aren't
+  listed and stay with Steam. Details: `environments/finals/tests/controller_latency/README.md`.
 
 Details: [docs/NOTPROTON.md](docs/NOTPROTON.md).
+
+**Input latency in Counter-Strike 2**, end to end (from the input to the change on screen),
+measured by filming at 240 fps:
+
+| Input | CrossOver | SteamDriver |
+|---|---|---|
+| Mouse | 35 ms | 20 ms |
+| Keyboard | 32 ms | 25 ms |
+| Controller | about 40 ms | about 20 ms (rougher: in the video it's harder to see exactly when a controller button press happened) |
 
 ### For games that need more: a Wine environment of their own
 

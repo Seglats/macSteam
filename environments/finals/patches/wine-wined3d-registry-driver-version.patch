@@ -1,0 +1,98 @@
+From: MacFinals
+Subject: [PATCH] wined3d: report the display driver's registered driver version
+
+Deadlock (Source 2) reads the driver version through Direct3D 9's adapter identifier, which
+comes from wined3d's table. That table only knows old cards: an NVIDIA RTX 4090 (what D3DMetal
+presents with MetalFX upscaling on, vendor 10de, device 2684) falls back to a GeForce 8 driver,
+build 13.4052, reported as 31.0.13.4052. Deadlock's console on 2026-11-25:
+
+  [Client] Graphics driver is out of date. Vendor 10de, 'AMD Compatibility Mode',
+  version 31.0.13.4052 < 32.0.15.8108
+  Disable asynchronous shader creation because of an old driver that might crash.
+
+and DLSS is not offered, although NGX reports it available. DXGI and the display class key
+(written by win32u, replaced by D3DMetal with 32.0.16.1656) already report the current
+version, so only Direct3D 9 disagreed.
+
+wined3d now takes the DriverVersion from the display class key when exactly one display
+adapter is registered and its ProviderName matches the vendor wined3d sees (NVIDIA, Advanced
+Micro Devices, Intel). Anything else keeps the table, so behaviour only changes where the
+registry names the same GPU's driver.
+
+--- a/dlls/wined3d/directx.c	2026-11-25 13:31:22
++++ b/dlls/wined3d/directx.c	2026-11-25 13:31:45
+@@ -737,7 +737,65 @@
+         len = min(strlen(src), dst_size - 1);
+         memcpy(dst, src, len);
+         memset(&dst[len], 0, dst_size - len);
++    }
++}
++
++/* MacFinals: the driver version the display driver registered for the GPU, from its display
++ * class key (win32u writes it; D3DMetal replaces it with the version of the GPU it presents).
++ * The table below only knows old cards, so a newer card gets a 2010-era version and games
++ * report the driver as out of date and turn features off (Deadlock: 31.0.13.4052 < its
++ * minimum, DLSS hidden, asynchronous shader creation off), while DXGI and the registry report
++ * the current one. Used only when exactly one display adapter is registered and its provider
++ * matches VENDOR, so the version belongs to this GPU; otherwise the table stays. */
++static BOOL registry_driver_version(enum wined3d_pci_vendor vendor, DWORD *high, DWORD *low)
++{
++    static const WCHAR class_key[] = L"System\\CurrentControlSet\\Control\\Class\\"
++            L"{4d36e968-e325-11ce-bfc1-08002be10318}";
++    const WCHAR *provider_prefix;
++    WCHAR name[16], provider[128], version[64];
++    unsigned int a, b, c, d, adapters = 0;
++    HKEY class, adapter;
++    DWORD size, i;
++    BOOL found = FALSE;
++
++    switch (vendor)
++    {
++        case HW_VENDOR_NVIDIA: provider_prefix = L"NVIDIA"; break;
++        case HW_VENDOR_AMD:    provider_prefix = L"Advanced Micro Devices"; break;
++        case HW_VENDOR_INTEL:  provider_prefix = L"Intel"; break;
++        default: return FALSE;
++    }
++    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, class_key, 0, KEY_READ, &class))
++        return FALSE;
++    for (i = 0; !RegEnumKeyW(class, i, name, ARRAY_SIZE(name)); ++i)
++    {
++        if (RegOpenKeyExW(class, name, 0, KEY_READ, &adapter))
++            continue;
++        size = sizeof(version);
++        if (!RegQueryValueExW(adapter, L"DriverVersion", NULL, NULL, (BYTE *)version, &size))
++        {
++            ++adapters;
++            size = sizeof(provider);
++            if (!RegQueryValueExW(adapter, L"ProviderName", NULL, NULL, (BYTE *)provider, &size)
++                    && !wcsncmp(provider, provider_prefix, wcslen(provider_prefix))
++                    && swscanf(version, L"%u.%u.%u.%u", &a, &b, &c, &d) == 4
++                    && a <= 0xffff && b <= 0xffff && c <= 0xffff && d <= 0xffff)
++            {
++                *high = MAKEDWORD_VERSION(a, b);
++                *low = MAKEDWORD_VERSION(c, d);
++                found = TRUE;
++            }
++        }
++        RegCloseKey(adapter);
++    }
++    RegCloseKey(class);
++    if (found && adapters == 1)
++    {
++        TRACE("Driver version %u.%u.%u.%u from the display driver's registry key.\n",
++                HIWORD(*high), LOWORD(*high), HIWORD(*low), LOWORD(*low));
++        return TRUE;
+     }
++    return FALSE;
+ }
+ 
+ bool wined3d_driver_info_init(struct wined3d_driver_info *driver_info,
+@@ -921,6 +979,8 @@
+         driver_info->name = version_info->driver_name;
+         driver_info->version_high = MAKEDWORD_VERSION(driver_os_version, driver_feature_level);
+         driver_info->version_low = MAKEDWORD_VERSION(version_info->subversion, version_info->build);
++        if (driver_model == DRIVER_MODEL_NT6X)
++            registry_driver_version(driver_info->vendor, &driver_info->version_high, &driver_info->version_low);
+ 
+         return true;
+     }

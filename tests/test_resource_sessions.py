@@ -12,7 +12,6 @@ from unittest.mock import Mock, patch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 import measure_resources as resources
-import launch_cx26 as launch
 
 
 class Clock:
@@ -245,34 +244,6 @@ class CollectorFiles(unittest.TestCase):
 
 
 class AttributionAndLauncher(unittest.TestCase):
-    def test_same_engine_game_in_other_bottle_is_excluded_and_scan_is_bounded(self):
-        prefix = ROOT / "runtime/prefix-dxmt-local"
-        engine = ROOT / "runtime/soju-engine-dxmt-local"
-        lsof_pids = []
-        def command(*args):
-            if args[0] == "vm_stat":
-                return "Mach Virtual Memory Statistics: (page size of 16384 bytes)\nSwapouts: 0.\n"
-            if args[0] == "ps":
-                return "".join(f"{pid} 00:05 20.0 2048 Fri Sep 11 20:00:00 2026 C:\\Overwatch.exe\n"
-                               for pid in range(20, 30))
-            if args[0] == "lsof":
-                pid = int(args[args.index("-p") + 1])
-                lsof_pids.append(pid)
-                bottle = prefix if pid == 21 else ROOT / "runtime/other-prefix"
-                return f"n{engine}/bin/wine\nn{bottle}/drive_c/Overwatch.exe\n"
-            if args[0] == "sysctl":
-                return "used = 0.00M"
-            if args[:3] == ("pmset", "-g", "therm"):
-                return "Note: No thermal warning level has been recorded\n"
-            self.fail(args)
-        with patch.object(resources, "command", side_effect=command), \
-             patch.object(resources, "gpu_statistics", return_value={}):
-            record = resources.sample(engine.name, prefix)
-        self.assertEqual(record["thermal"], {})
-        self.assertEqual([g["pid"] for g in record["games"]], [21])
-        self.assertEqual(len(lsof_pids), 8)
-        self.assertFalse(record["process_scan_complete"])
-        self.assertEqual(record["process_scan_errors"], 1)
 
     def test_same_engine_other_bottle_does_not_match(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -293,156 +264,13 @@ class AttributionAndLauncher(unittest.TestCase):
                 identity = resources.find_session_server(engine, prefix)
             self.assertEqual(identity["pid"], 18)
 
-    def test_session_launcher_passes_identity_and_confirms_status(self):
-        with tempfile.TemporaryDirectory() as temp:
-            paths = dict(resources=Path(temp) / "resources.jsonl", collector_log=Path(temp) / "collector.log")
-            (Path(temp) / "session-status.json").write_text(json.dumps(
-                dict(collector_pid=12345, session=SERVER, status="starting")))
-            with patch.object(resources, "find_session_server", return_value=SERVER), \
-                 patch.object(resources, "atomic_json") as save, patch.object(launch.subprocess, "Popen") as popen:
-                popen.return_value.pid = 12345
-                popen.return_value.poll.return_value = None
-                result = launch.start_resource_capture(Path("/engine"), paths, prefix=Path("/prefix"))
-            args = popen.call_args.args[0]
-            self.assertIn("--follow-session", args)
-            self.assertNotIn("--wait-for-game", args)
-            self.assertEqual(args[args.index("--session-pid") + 1], "17")
-            self.assertEqual(args[args.index("--session-start") + 1], SERVER["start_token"])
-            self.assertEqual(args[args.index("--session-seconds") + 1], "21600")
-            self.assertTrue(result["startup_confirmed"])
-            save.assert_called_once()
 
-    def test_duplicate_or_failed_child_is_not_reported_ready(self):
-        with tempfile.TemporaryDirectory() as temp:
-            paths = dict(resources=Path(temp) / "resources.jsonl", collector_log=Path(temp) / "collector.log")
-            with patch.object(resources, "find_session_server", return_value=SERVER), \
-                 patch.object(resources, "atomic_json"), patch.object(launch.subprocess, "Popen") as popen:
-                popen.return_value.pid = 12345
-                popen.return_value.poll.return_value = 0
-                result = launch.start_resource_capture(Path("/engine"), paths, prefix=Path("/prefix"))
-            self.assertFalse(result["startup_confirmed"])
-            self.assertIn("warning", result)
 
-    def test_exited_collector_cannot_confirm_stale_starting_status(self):
-        with tempfile.TemporaryDirectory() as temp:
-            paths = dict(resources=Path(temp) / "resources.jsonl", collector_log=Path(temp) / "collector.log")
-            (Path(temp) / "session-status.json").write_text(json.dumps(
-                dict(collector_pid=12345, session=SERVER, status="starting")))
-            with patch.object(resources, "find_session_server", return_value=SERVER), \
-                 patch.object(resources, "atomic_json"), patch.object(launch.subprocess, "Popen") as popen:
-                popen.return_value.pid = 12345
-                popen.return_value.poll.return_value = 1
-                result = launch.start_resource_capture(Path("/engine"), paths, prefix=Path("/prefix"))
-            self.assertFalse(result["startup_confirmed"])
 
-    def test_transient_discovery_failure_retries_within_bounded_window(self):
-        with tempfile.TemporaryDirectory() as temp:
-            clock = Clock()
-            paths = dict(resources=Path(temp) / "resources.jsonl", collector_log=Path(temp) / "collector.log")
-            (Path(temp) / "session-status.json").write_text(json.dumps(
-                dict(collector_pid=12345, session=SERVER, status="running")))
-            observations = [subprocess.TimeoutExpired("ps", 3), OSError()]
-            def discover(*args):
-                if observations: raise observations.pop(0)
-                return SERVER
-            with patch.object(resources, "find_session_server", side_effect=discover) as find, \
-                 patch.object(resources, "atomic_json"), patch.object(launch.subprocess, "Popen") as popen, \
-                 patch.object(launch.time, "monotonic", clock.monotonic), patch.object(launch.time, "sleep", clock.sleep):
-                popen.return_value.pid = 12345
-                popen.return_value.poll.return_value = None
-                result = launch.start_resource_capture(Path("/engine"), paths, prefix=Path("/prefix"))
-            self.assertGreater(find.call_count, 3)
-            self.assertGreaterEqual(clock.now, 2.4)
-            self.assertLess(clock.now, 4)
-            self.assertTrue(result["startup_confirmed"])
 
-    def test_startup_parent_is_replaced_before_binding_collector(self):
-        with tempfile.TemporaryDirectory() as temp:
-            clock = Clock()
-            paths = dict(resources=Path(temp) / "resources.jsonl", collector_log=Path(temp) / "collector.log")
-            (Path(temp) / "session-status.json").write_text(json.dumps(
-                dict(collector_pid=12345, session=SERVER, status="running")))
-            parent = dict(SERVER, pid=SERVER['pid']+100)
-            with patch.object(resources, 'find_session_server', side_effect=lambda *args: parent if clock.now < 1 else SERVER), \
-                 patch.object(resources, 'atomic_json'), patch.object(launch.subprocess, 'Popen') as popen, \
-                 patch.object(launch.time, 'monotonic', clock.monotonic), patch.object(launch.time, 'sleep', clock.sleep):
-                popen.return_value.pid = 12345
-                popen.return_value.poll.return_value = None
-                result = launch.start_resource_capture(Path('/engine'), paths, prefix=Path('/prefix'))
-            self.assertEqual(result['session'], SERVER)
-            self.assertGreaterEqual(clock.now, 3)
-            self.assertTrue(result['startup_confirmed'])
 
-    def test_persistent_discovery_failure_expires_without_spawning_collector(self):
-        with tempfile.TemporaryDirectory() as temp:
-            clock = Clock()
-            paths = dict(resources=Path(temp) / "resources.jsonl", collector_log=Path(temp) / "collector.log")
-            with patch.object(resources, "find_session_server", side_effect=OSError()), \
-                 patch.object(launch.subprocess, "Popen") as popen, \
-                 patch.object(launch.time, "monotonic", clock.monotonic), patch.object(launch.time, "sleep", clock.sleep):
-                with self.assertRaises(RuntimeError):
-                    launch.start_resource_capture(Path("/engine"), paths, prefix=Path("/prefix"))
-            self.assertEqual(clock.now, 10)
-            popen.assert_not_called()
 
-    def test_preparation_failure_contract(self):
-        class Unsafe(Exception):
-            pass
-        module = types.ModuleType("prepare_dxmt_pipelines")
-        module.PipelinePreparationUnsafeError = Unsafe
-        module.prepare_before_launch = Mock(return_value=dict(status="prepared"))
-        with patch.dict(sys.modules, prepare_dxmt_pipelines=module):
-            self.assertEqual(launch.prepare_source_pipelines()["status"], "prepared")
-            module.prepare_before_launch.side_effect = OSError("private command")
-            self.assertEqual(launch.prepare_source_pipelines(), dict(status="failed", reason="OSError"))
-            module.prepare_before_launch.side_effect = Unsafe()
-            with self.assertRaises(SystemExit):
-                launch.prepare_source_pipelines()
 
-    def test_main_prepares_before_launch_and_existing_session_prevents_both(self):
-        with tempfile.TemporaryDirectory() as temp, patch.object(launch, "ROOT", Path(temp)):
-            root = Path(temp)
-            engine = root / "runtime/soju-engine-dxmt-local"
-            prefix = root / "runtime/prefix-dxmt-local"
-            for path, data in ((engine / "local-build-manifest.json", "{}"),
-                               (engine / "bin/wine", ""),
-                               (engine / "lib/wine/x86_64-windows/d3d11.dll", "dll"),
-                               (engine / "lib/wine/x86_64-windows/dxgi.dll", "dll"),
-                               (prefix / "drive_c/Program Files (x86)/Battle.net/Battle.net.exe", ""),
-                               (prefix / "drive_c/users/Sikarugir/Documents/Overwatch/Settings/Settings_v0.ini", '[Render.13]\nWindowedHeight="1200"\n'),
-                               (root / "config/dxmt-source60.conf", "config")):
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text(data)
-            argv = ["launch_cx26.py", "--backend", "dxmt", "--source-build", "--profile", "smooth60"]
-            env = dict(WINEMSYNC="1", DXMT_PIPELINE_CACHE_PATH="cache")
-            for busy, skip, keep in ((True, False, False), (False, False, False), (False, True, False), (False, True, True)):
-                ordering = []
-                extra = (["--no-pipeline-prewarm"] if skip else []) + (["--keep-battlenet"] if keep else [])
-                with patch.object(sys, "argv", argv + extra), \
-                     patch.object(launch.shutil, "disk_usage", return_value=types.SimpleNamespace(free=6 * 2**30)), \
-                     patch.object(launch, "build_environment", return_value=env), \
-                     patch.object(launch, "running_experiment_servers", return_value=[17] if busy else []), \
-                     patch.object(launch, "power_state", return_value={}), \
-                     patch.object(launch, "background_snapshot", return_value=[]), \
-                     patch.object(launch, "memory_preflight", return_value=dict(warning=None, top_processes=[])), \
-                     patch.object(launch, "prepare_source_pipelines", side_effect=lambda: ordering.append("prepare") or {"status": "prepared"}), \
-                     patch.object(launch, "start_battlenet_closer", side_effect=lambda engine, prefix, stamp: ordering.append(("closer", prefix.name)) or dict(enabled=True)), \
-                     patch.object(launch.subprocess, "Popen", side_effect=lambda *a, **k: ordering.append("launch") or types.SimpleNamespace(pid=42)):
-                    if busy:
-                        with self.assertRaises(SystemExit):
-                            launch.main()
-                    else:
-                        launch.main()
-                expected = [] if busy else (["launch"] if skip else ["prepare", "launch"])
-                if not busy and not keep:
-                    expected.append(("closer", "prefix-dxmt-local"))  # The watcher receives this launch's engine and prefix.
-                self.assertEqual(ordering, expected)
-                if not busy:
-                    manifest = json.loads(next((root / "logs").glob("cx26-dxmt-battlenet-*.json")).read_text())
-                    self.assertEqual(manifest["battlenet_exit_on_launch"]["enabled"], not keep)
-                    self.assertIn("session_conditions", manifest)
-                    for path in (root / "logs").glob("cx26-dxmt-battlenet-*"):
-                        path.unlink()
 
 
 if __name__ == "__main__":

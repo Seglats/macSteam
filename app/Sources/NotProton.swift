@@ -89,7 +89,11 @@ enum NotProton {
         if tools.isEmpty { return .unsupported(builds:Self.tools().map(\.build)) }
         return isAdded ? .added(tools) : .available(tools)
     }
+    /// Tests: the answer steamRunning gives instead of looking (nil: look). A test must never ask
+    /// the Mac's real Steam to quit.
+    nonisolated(unsafe) static var steamRunningForTests:Bool?
     static var steamRunning:Bool {
+        if let steamRunningForTests { return steamRunningForTests }
         let task=Process();task.executableURL=URL(fileURLWithPath:"/usr/bin/pgrep");task.arguments=["-x","steam_osx"]
         task.standardOutput=FileHandle.nullDevice;task.standardError=FileHandle.nullDevice
         guard (try? task.run()) != nil else { return false }

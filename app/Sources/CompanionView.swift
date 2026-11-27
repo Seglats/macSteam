@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import UniformTypeIdentifiers
 
 /// The main window: macSteam for NotProton (NotProton.swift). Like NotProton's own app it installs,
 /// updates and checks, and launches nothing. macSteam is an extra option in each game's
@@ -9,6 +10,7 @@ import AppKit
 struct CompanionView:View {
     @Bindable var model:AppModel
     @State private var advanced=false
+    @State private var experimental=false
     @State private var confirmRemove=false
     @State private var confirmWindowsSteam=false
     @State private var choosingGame=false
@@ -28,7 +30,10 @@ struct CompanionView:View {
                         profilesPanel
                         mousePanel
                         keyOverridesPanel
+                        benchmarksPanel
                         advancedPanel
+                        experimentalPanel
+                        InstallGamePanel(model:model)
                     }.frame(maxWidth:LauncherStyle.contentWidth).padding(.top,34)
                     Spacer(minLength:28)
                     VersionStatus(model:model).padding(.bottom,12)
@@ -51,19 +56,7 @@ struct CompanionView:View {
         }
         .background { LauncherBackground() }
         .font(LauncherStyle.font(14)).tint(.primary)
-        .sheet(item:$model.sheet) { sheet in
-            switch sheet {
-            case .help: HelpSheet(model:model)
-            case .about: AboutSheet(model:model)
-            case .uninstall: UninstallSheet(model:model).interactiveDismissDisabled(model.uninstall == .working)
-            case .update: UpdateSheet(model:model).interactiveDismissDisabled(model.update == .installing)
-                .onDisappear { model.updateSheetClosed() }
-            case .whatsNew: WhatsNewSheet()
-            case .settings: SettingsSheet(model:model)
-            case .keyOverrides: KeyOverridesSheet(model:model)
-            case .profileSettings: ProfileSettingsSheet(model:model)
-            }
-        }
+        .sheet(item:$model.sheet) { sheetView($0) }
         .alert("Remove macSteam from Steam?",isPresented:$confirmRemove) {
             Button("Cancel",role:.cancel) {}
             Button("Remove",role:.destructive,action:model.removeFromNotProton)
@@ -83,6 +76,25 @@ struct CompanionView:View {
                 try? await Task.sleep(for:.seconds(4))
                 model.checkNotProton()
             }
+        }
+    }
+
+    @ViewBuilder private func sheetView(_ sheet:AppModel.Sheet)->some View {
+        switch sheet {
+        case .help: HelpSheet(model:model)
+        case .about: AboutSheet(model:model)
+        case .uninstall: UninstallSheet(model:model).interactiveDismissDisabled(model.uninstall == .working)
+        case .removeOwnSteam: RemoveOwnSteamSheet(model:model).interactiveDismissDisabled(model.ownSteamRemoval != .idle)
+        case .surroundSettings: SurroundSettingsSheet(model:model)
+        case .update: UpdateSheet(model:model).interactiveDismissDisabled(model.update == .installing)
+            .onDisappear { model.updateSheetClosed() }
+        case .whatsNew: WhatsNewSheet()
+        case .settings: SettingsSheet(model:model)
+        case .keyOverrides: KeyOverridesSheet(model:model)
+        case .profileSettings: ProfileSettingsSheet(model:model)
+        case .controllerCheck: ControllerCheckSheet(model:model)
+        case .benchmarks: BenchmarksSheet(model:model)
+        case .installedGames: InstalledGamesSheet(model:model)
         }
     }
 
@@ -238,7 +250,7 @@ struct CompanionView:View {
                 }
                 StatusLine(.good,"SteamDriver DXMT: included with \(Brand.name). Use it with DXMT as the graphics backend.")
                 gptkStatus
-                Button { model.showGPTKFolder() } label: { Label("Show Folder",systemImage:"folder") }
+                Button { model.showGPTKFolder() } label: { Label("Show GPTK Folder",systemImage:"folder") }
                     .buttonStyle(.bordered).hoverGrow().buttonBorderShape(.capsule).controlSize(.small)
                     .help("Open the folder Apple’s files go in")
             }
@@ -265,7 +277,11 @@ struct CompanionView:View {
                             Text(profileDetail(profile)).font(LauncherStyle.font(12)).foregroundStyle(.secondary).fixedSize(horizontal:false,vertical:true)
                         }
                         Spacer(minLength:12)
-                        if profile.kind == .dx11 {
+                        if let app=profile.appID,let seen=Profiles.detected(app),seen != profile.kind {
+                            Button("Switch to \(seen.title)") { model.switchProfile(profile,to:seen) }
+                                .buttonStyle(.bordered).hoverGrow().buttonBorderShape(.capsule).controlSize(.small)
+                                .help("Make this a \(seen.title) profile; DX11 settings are kept for switching back")
+                        } else {
                             Button("Settings…") { model.editProfile(profile) }.buttonStyle(.borderless).hoverGrow().font(LauncherStyle.font(12,.medium))
                         }
                         Button { model.removeProfile(profile) } label: { Image(systemName:"minus.circle.fill").foregroundStyle(.secondary) }
@@ -293,10 +309,11 @@ struct CompanionView:View {
     private func profileDetail(_ p:Profiles.Profile)->String {
         // A game whose last launch through SteamDriver loaded the other Direct3D.
         if let app=p.appID,let seen=Profiles.detected(app),seen != p.kind {
-            return "Its last launch used \(seen.title), so this \(p.kind.title) profile doesn’t apply. Remove it and add a \(seen.title) profile."
+            return "Its last launch used \(seen.title), so this \(p.kind.title) profile doesn’t apply. If the game runs as \(seen.title) now, switch the profile."
         }
         if p.kind == .dx12 {
-            return (p.isGlobal ? "Every DX12 game. " : "")+"No settings for D3DMetal yet; MetalFX upscaling will go here."
+            let summary=Profiles.d3dmetalSummary(Profiles.d3dmetalSettings(p.id))
+            return (p.isGlobal ? "Every DX12 game on the SteamDriver tool without its own profile. " : "")+"\(summary). Read by the SteamDriver tool at launch; no row in Steam."
         }
         let row=p.isGlobal ? "\u{201C}SteamDriver DX11 profile\u{201D}" : "\u{201C}SteamDriver profile: \(p.name)\u{201D}"
         let settings=Profiles.settings(p.id).map { Profiles.summary($0).prefix(1).uppercased()+Profiles.summary($0).dropFirst() } ?? "No settings file"
@@ -332,6 +349,149 @@ struct CompanionView:View {
         return KeyOverrides.blurb+(count==0 ? "" : " \(count) set up now.")
     }
 
+    /// Advanced › Custom runtimes (Runtimes.swift).
+    private var customRuntimesRow:some View {
+        HStack(alignment:.center,spacing:12) {
+            VStack(alignment:.leading,spacing:2) {
+                Text("Custom runtimes").font(LauncherStyle.font(13,.semibold))
+                let shared=Runtimes.sharedTemplates()
+                Text("SteamDriver games share one Wine setup per runtime: a new game’s prefix is a copy of it, ready at once and sharing its disk space\(shared.isEmpty ? "" : " (now: "+shared.joined(separator:", ")+")"). Turn this on to give a game its own copy instead, in its game profile’s Settings.")
+                    .font(LauncherStyle.font(12)).foregroundStyle(.secondary).fixedSize(horizontal:false,vertical:true)
+            }
+            Spacer(minLength:12)
+            Toggle("",isOn:Binding(get:{ model.customRuntimes },set:{ model.setCustomRuntimes($0) }))
+                .labelsHidden().toggleStyle(.switch).hoverGrow().tint(LauncherStyle.accent)
+                .help("Let game profiles have their own runtime copy")
+        }
+    }
+
+    // MARK: Benchmarks (BenchmarksSheet)
+    private var benchmarksPanel:some View {
+        LauncherPanel(inset:16) {
+            HStack(alignment:.center,spacing:12) {
+                VStack(alignment:.leading,spacing:2) {
+                    Text("Benchmarks").font(LauncherStyle.font(14,.semibold))
+                    Text(benchmarksSummary).font(LauncherStyle.font(12)).foregroundStyle(.secondary).fixedSize(horizontal:false,vertical:true)
+                    if !model.benchStatus.isEmpty {
+                        Text(model.benchStatus).font(LauncherStyle.font(12,.medium)).fixedSize(horizontal:false,vertical:true)
+                    }
+                }
+                Spacer(minLength:12)
+                Button("Benchmarks…") { model.sheet = .benchmarks }.buttonStyle(.bordered).hoverGrow().buttonBorderShape(.capsule)
+            }
+        }
+    }
+    private var benchmarksSummary:String {
+        let recording:String
+        switch model.benchRecord {
+        case .off: recording="Recording is off."
+        case .all: recording="Recording in every SteamDriver game; \(KeyOverrides.caps(model.benchHotkey).joined()) starts and stops a run."
+        case .games(let ids): recording="Recording in \(ids.count) game\(ids.count==1 ? "" : "s"); \(KeyOverrides.caps(model.benchHotkey).joined()) starts and stops a run."
+        }
+        let runs=model.benchRuns.count
+        return "fps, frame times and latency of a stretch of play. "+recording+(runs==0 ? "" : " \(runs) run\(runs==1 ? "" : "s") saved.")
+    }
+
+    // MARK: Experimental (ControllerSupport.swift)
+    /// The experimental features, listed by name until opened (like Advanced).
+    private static let experimentalItems=["More controller support","Headphone surround"]
+    /// Experimental › Headphone surround (Surround.swift): unlocks the setting in profiles.
+    private var surroundRow:some View {
+        VStack(alignment:.leading,spacing:10) {
+        HStack(alignment:.top,spacing:12) {
+            VStack(alignment:.leading,spacing:4) {
+                Text("Headphone surround").font(LauncherStyle.font(13,.semibold))
+                Text("Turns a game’s 5.1 or 7.1 surround sound into 3D sound for headphones, so you can hear where things are, behind you too. Stereo sound stays as it is, so the game must play surround: most do once your headphones appear as 7.1; set a game’s own audio option to 7.1 or surround if it has one, not Stereo or Headphones. Wine’s audio driver does it, in SteamDriver games only.")
+                    .font(LauncherStyle.font(12)).foregroundStyle(.secondary).fixedSize(horizontal:false,vertical:true)
+                Text(model.surroundOn ? "Turn it on per profile: Global DX11, Global DX12 or a game profile, under Settings…. It applies from the game’s next launch."
+                                      : "When it’s on, profiles get a Headphone surround setting.")
+                    .font(LauncherStyle.font(12)).foregroundStyle(.secondary).fixedSize(horizontal:false,vertical:true)
+            }
+            Spacer(minLength:12)
+            VStack(alignment:.trailing,spacing:8) {
+                Toggle("",isOn:Binding(get:{ model.surroundOn },set:{ model.setSurround($0) }))
+                    .labelsHidden().toggleStyle(.switch).hoverGrow().tint(LauncherStyle.accent)
+                    .help("Show the Headphone surround setting in profiles")
+                Button("Settings…") { model.sheet = .surroundSettings }
+                    .buttonStyle(.bordered).hoverGrow().buttonBorderShape(.capsule).controlSize(.small)
+                    .help("Listen and tune: speaker positions, tilt, width, room and tone, with a live test; Save to use them in games")
+            }
+        }
+        }
+    }
+    private var experimentalPanel:some View {
+        LauncherPanel(inset:16) {
+            VStack(alignment:.leading,spacing:10) {
+                Button { withAnimation(reduceMotion ? nil : .easeOut(duration:0.15)) { experimental.toggle() } } label: {
+                    HStack(spacing:6) {
+                        Text("Experimental").font(LauncherStyle.font(14,.semibold))
+                        Image(systemName:"chevron.down").font(.system(size:10,weight:.semibold)).rotationEffect(.degrees(experimental ? 180 : 0))
+                        Spacer(minLength:0)
+                    }.contentShape(Rectangle())
+                }.buttonStyle(.plain).hoverGrow()
+                if !experimental {
+                    Text(Self.experimentalItems.joined(separator:" · ")).font(LauncherStyle.font(12)).foregroundStyle(.secondary)
+                } else {
+                    HStack(alignment:.top,spacing:12) {
+                        VStack(alignment:.leading,spacing:4) {
+                            Text("More controller support").font(LauncherStyle.font(13,.semibold))
+                            Text("Adds XInput support for controllers that offer it, which work as XInput controllers on Windows and Linux but not on a Mac. Steam would otherwise keep these controllers for itself, so games couldn’t see them.")
+                                .font(LauncherStyle.font(12)).foregroundStyle(.secondary).fixedSize(horizontal:false,vertical:true)
+                            Text("While it’s on, these controllers work in your games but not in Steam’s own menus or Big Picture. Microsoft Xbox controllers aren’t affected. Steam restarts to apply a change.")
+                                .font(LauncherStyle.font(12)).foregroundStyle(.secondary).fixedSize(horizontal:false,vertical:true)
+                        }
+                        Spacer(minLength:12)
+                        VStack(alignment:.trailing,spacing:10) {
+                            Toggle("",isOn:Binding(get:{ model.controllerSupportOn },set:{ model.setControllerSupport($0) }))
+                                .labelsHidden().toggleStyle(.switch).hoverGrow().tint(LauncherStyle.accent)
+                                .help("Hand XInput controllers to SteamDriver games instead of Steam")
+                            Button("Controller Problems…") { model.sheet = .controllerCheck }
+                                .buttonStyle(.bordered).hoverGrow().buttonBorderShape(.capsule)
+                                .help("A guided check of how your controller reaches games, with a report for adding support")
+                        }
+                    }
+                    controllerStatus
+                    Text("Tested so far: 8BitDo Ultimate 2.").font(LauncherStyle.font(11)).foregroundStyle(.tertiary)
+                    Divider().padding(.vertical,4)
+                    surroundRow
+                }
+            }
+        }
+    }
+    @ViewBuilder private var controllerStatus:some View {
+        let saved=model.controllerPads
+        let new=model.connectedPads.filter { pad in !saved.contains { $0.id == pad.id } }
+        if model.controllerSupportOn {
+            Text("For games: "+saved.map(\.name).joined(separator:", ")+".")
+                .font(LauncherStyle.font(12,.medium)).fixedSize(horizontal:false,vertical:true)
+            let wanted=ControllerSupport.value(saved)
+            if !model.steamRunningNow {
+                Text("Applies when Steam starts.").font(LauncherStyle.font(12)).foregroundStyle(.secondary)
+            } else if model.steamControllerValue == wanted {
+                Label("Active: Steam started with it.",systemImage:"checkmark.circle.fill")
+                    .font(LauncherStyle.font(12)).foregroundStyle(.green)
+            } else {
+                HStack(spacing:10) {
+                    Text("Steam is still using the old setting.").font(LauncherStyle.font(12)).foregroundStyle(.orange)
+                    Spacer(minLength:8)
+                    Button("Restart Steam",action:model.restartSteam).buttonStyle(.bordered).hoverGrow()
+                        .buttonBorderShape(.capsule).disabled(model.restartingSteam)
+                }
+            }
+            if !new.isEmpty {
+                HStack(spacing:10) {
+                    Text("Also connected: "+new.map(\.name).joined(separator:", ")+".")
+                        .font(LauncherStyle.font(12)).foregroundStyle(.secondary).fixedSize(horizontal:false,vertical:true)
+                    Spacer(minLength:8)
+                    Button("Add",action:model.addConnectedControllers).buttonStyle(.bordered).hoverGrow().buttonBorderShape(.capsule)
+                }
+            }
+        } else if !model.connectedPads.isEmpty {
+            Text("Connected now: "+model.connectedPads.map(\.name).joined(separator:", ")+".")
+                .font(LauncherStyle.font(12)).foregroundStyle(.secondary).fixedSize(horizontal:false,vertical:true)
+        }
+    }
+
     // MARK: Advanced
     private var advancedPanel:some View {
         LauncherPanel(inset:16) {
@@ -351,8 +511,13 @@ struct CompanionView:View {
                                 .font(LauncherStyle.font(12)).foregroundStyle(.secondary).fixedSize(horizontal:false,vertical:true)
                         }
                         Spacer(minLength:12)
+                        if model.ownSteamExists {
+                            Button("Remove…") { model.sheet = .removeOwnSteam }.buttonStyle(.borderless).hoverGrow().foregroundStyle(.red).disabled(model.busy)
+                                .help("Remove \(Brand.name)’s own Steam; its games can move to the Steam app")
+                        }
                         Button("Open…") { confirmWindowsSteam=true }.buttonStyle(.bordered).hoverGrow().buttonBorderShape(.capsule).disabled(model.busy)
                     }
+                    customRuntimesRow
                 }
             }
         }

@@ -1,0 +1,1336 @@
+--- a/dlls/winecoreaudio.drv/coreaudio.c
++++ b/dlls/winecoreaudio.drv/coreaudio.c
+@@ -51,144 +51,152 @@
+ #include <os/lock.h>
+ 
+ #undef LoadResource
+ #undef CompareString
+ #undef GetCurrentThread
+ #undef GetCurrentProcess
+ #undef _CDECL
+ 
+ #include "ntstatus.h"
+ #define WIN32_NO_STATUS
+ #include "windef.h"
+ #include "winbase.h"
+ #include "winnls.h"
+ #include "winreg.h"
+ #include "winternl.h"
+ #include "mmdeviceapi.h"
+ #include "initguid.h"
+ #include "audioclient.h"
+ #include "wine/debug.h"
+ #include "wine/unixlib.h"
+ 
+ #include "unixlib.h"
+ #include "coreaudio_cocoa.h"
+ 
+ #if !defined(MAC_OS_VERSION_12_0) || MAC_OS_X_VERSION_MAX_ALLOWED < MAC_OS_VERSION_12_0
+ #define kAudioObjectPropertyElementMain kAudioObjectPropertyElementMaster
+ #endif
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(coreaudio);
+ WINE_DECLARE_DEBUG_CHANNEL(winediag);
+ 
+ struct coreaudio_stream
+ {
+     os_unfair_lock lock;
+     AudioComponentInstance unit;
+     AudioConverterRef converter;
+     AudioStreamBasicDescription dev_desc; /* audio unit format, not necessarily the same as fmt */
+     AudioDeviceID dev_id;
+ 
+     EDataFlow flow;
+     DWORD flags;
+     AUDCLNT_SHAREMODE share;
+     HANDLE event;
+ 
+     BOOL playing, please_quit;
+     REFERENCE_TIME period;
+     UINT32 period_frames;
+     UINT32 bufsize_frames, resamp_bufsize_frames;
+     UINT32 lcl_offs_frames, held_frames, wri_offs_frames, tmp_buffer_frames;
+     UINT32 cap_bufsize_frames, cap_offs_frames, cap_held_frames;
+     UINT32 wrap_bufsize_frames;
+     UINT64 written_frames;
+     INT32 getbuf_last;
+     WAVEFORMATEX *fmt;
+     BYTE *local_buffer, *cap_buffer, *wrap_buffer, *resamp_buffer, *tmp_buffer;
+     struct binaural *binaural;
+ };
+ 
+ /* Headphone surround (WINE_HEADPHONE_SURROUND=1): a stereo output device is offered to
+  * Windows programs as 7.1, and each speaker channel of a multichannel stream is rendered for
+- * the two ears with a spherical-head model (C. P. Brown and R. O. Duda, "A structural model
+- * for binaural sound synthesis", 1998): an interaural time delay and a one-pole/one-zero head
+- * shadow filter per ear, plus a darker tone for speakers behind the listener. The audio unit
+- * then gets plain stereo float, so macOS does no downmix of its own. Off unless set. */
+-#define BIN_HIST 256            /* input history per channel; covers the delay up to 192 kHz */
++ * the two ears through measured head responses: MIT's KEMAR (Bill Gardner and Keith Martin,
++ * MIT Media Lab, 1994), reshaped with settings fitted to a reference headphone renderer
++ * (SteamDriver's scripts/surround_fit and docs/SURROUND.md). surround_ir.h holds each speaker
++ * position's finished filter per ear at 48 kHz, resampled to the stream's rate; a short, quiet
++ * reverb tail (a four-line feedback delay network) follows. The audio unit then gets plain
++ * stereo float, so macOS does no downmix of its own. Off unless set. */
++#include "surround_ir.h"
++
+ #define BIN_MAX_CHANNELS 18
++#define BIN_MAX_TAPS (SURROUND_IR_TAPS * 4 + 8)  /* the filters at up to 192 kHz */
++#define BIN_HIST 2048           /* input history per channel (power of two): a filter and the tail's start */
++#define BIN_FDN 4
+ 
+ struct binaural_chan
+ {
+-    BOOL lfe, rear;
++    BOOL lfe;
++    enum surround_pos pos;
+     float gain;
+-    float delay[2];             /* samples, per ear (0 left, 1 right) */
+-    float b0[2], b1[2], a1[2];  /* head shadow filter per ear */
+-    float x1[2], y1[2], lp[2];
+ };
+ 
+ struct binaural
+ {
+     UINT channels, bytes;
+     BOOL is_float;
+-    float rear_k;
+     UINT pos;
++    int taps, tail_delay;
+     struct binaural_chan ch[BIN_MAX_CHANNELS];
+-    float hist[BIN_MAX_CHANNELS][BIN_HIST];
++    float *ir[SURROUND_POSITIONS][2];       /* reversed, at the stream's rate; NULL when unused */
++    float hist[BIN_MAX_CHANNELS][2 * BIN_HIST]; /* each sample written twice, so reads never wrap */
++    float *fdn[BIN_FDN];
++    int fdn_len[BIN_FDN], fdn_pos[BIN_FDN];
++    float fdn_damp[BIN_FDN], fdn_g, fdn_k;
+ };
+ 
+ static BOOL headphone_surround(void)
+ {
+     static int on = -1;
+     if(on < 0){
+         const char *env = getenv("WINE_HEADPHONE_SURROUND");
+         on = env && *env && *env != '0';
+         TRACE("headphone surround %s\n", on ? "on" : "off");
+     }
+     return on;
+ }
+ 
+ static const REFERENCE_TIME def_period = 100000;
+ static const REFERENCE_TIME min_period = 50000;
+ 
+ static ULONG_PTR zero_bits = 0;
+ 
+ static NTSTATUS unix_not_implemented(void *args)
+ {
+     return STATUS_SUCCESS;
+ }
+ 
+ static HRESULT osstatus_to_hresult(OSStatus sc)
+ {
+     switch(sc){
+     case kAudioFormatUnsupportedDataFormatError:
+     case kAudioFormatUnknownFormatError:
+     case kAudioDeviceUnsupportedFormatError:
+         return AUDCLNT_E_UNSUPPORTED_FORMAT;
+     case kAudioHardwareBadDeviceError:
+         return AUDCLNT_E_DEVICE_INVALIDATED;
+     }
+     return E_FAIL;
+ }
+ 
+ static struct coreaudio_stream *handle_get_stream(stream_handle h)
+ {
+     return (struct coreaudio_stream *)(UINT_PTR)h;
+ }
+ 
+ /* copied from kernelbase */
+ static int muldiv( int a, int b, int c )
+ {
+     LONGLONG ret;
+ 
+     if (!c) return -1;
+ 
+     /* We want to deal with a positive divisor to simplify the logic. */
+     if (c < 0)
+     {
+         a = -a;
+         c = -c;
+     }
+ 
+     /* If the result is positive, we "add" to round. else, we subtract to round. */
+     if ((a < 0 && b < 0) || (a >= 0 && b >= 0))
+         ret = (((LONGLONG)a * b) + (c / 2)) / c;
+     else
+         ret = (((LONGLONG)a * b) - (c / 2)) / c;
+@@ -242,238 +250,290 @@
+     free(buffers);
+     return ret;
+ }
+ 
+ static UINT device_channel_count(AudioDeviceID device, EDataFlow flow)
+ {
+     AudioObjectPropertyAddress addr;
+     AudioBufferList *buffers;
+     UInt32 size;
+     UINT ret = 0;
+     int i;
+ 
+     addr.mSelector = kAudioDevicePropertyStreamConfiguration;
+     addr.mScope = get_scope(flow);
+     addr.mElement = 0;
+ 
+     if(AudioObjectGetPropertyDataSize(device, &addr, 0, NULL, &size) != noErr) return 0;
+     if(!(buffers = malloc(size))) return 0;
+     if(AudioObjectGetPropertyData(device, &addr, 0, NULL, &size, buffers) == noErr)
+         for(i = 0; i < buffers->mNumberBuffers; i++)
+             ret += buffers->mBuffers[i].mNumberChannels;
+     free(buffers);
+     return ret;
+ }
+ 
+ static DWORD get_channel_mask(unsigned int channels);
+ 
+ /* Sample size in bytes for the formats headphone surround reads, 0 for others. */
+ static UINT binaural_bytes(const WAVEFORMATEX *fmt, BOOL *is_float)
+ {
+     const WAVEFORMATEXTENSIBLE *fmtex = (const WAVEFORMATEXTENSIBLE *)fmt;
+     BOOL ext = fmt->wFormatTag == WAVE_FORMAT_EXTENSIBLE;
+ 
+     *is_float = fmt->wFormatTag == WAVE_FORMAT_IEEE_FLOAT ||
+                 (ext && IsEqualGUID(&fmtex->SubFormat, &KSDATAFORMAT_SUBTYPE_IEEE_FLOAT));
+     if(*is_float) return fmt->wBitsPerSample == 32 ? 4 : 0;
+     if(fmt->wFormatTag != WAVE_FORMAT_PCM && !(ext && IsEqualGUID(&fmtex->SubFormat, &KSDATAFORMAT_SUBTYPE_PCM)))
+         return 0;
+     switch(fmt->wBitsPerSample){
+     case 16: return 2;
+     case 24: return 3;
+     case 32: return 4;
+     }
+     return 0;
+ }
+ 
+ /* Whether a render stream in this format on this device is played as headphone surround. */
+ static BOOL binaural_wanted(EDataFlow flow, AudioDeviceID device, const WAVEFORMATEX *fmt)
+ {
+     BOOL is_float;
+     UINT dev_channels;
+ 
+     if(flow != eRender || !headphone_surround()) return FALSE;
+     if(fmt->nChannels <= 2 || fmt->nChannels > BIN_MAX_CHANNELS) return FALSE;
+     if(!binaural_bytes(fmt, &is_float) || fmt->nBlockAlign != fmt->nChannels * binaural_bytes(fmt, &is_float))
+         return FALSE;
+     dev_channels = device_channel_count(device, flow);
+     return dev_channels > 0 && dev_channels <= 2;
+ }
+ 
+-static float binaural_azimuth(DWORD bit, DWORD mask)
++static enum surround_pos binaural_position(DWORD bit, DWORD mask)
+ {
+     BOOL sides = (mask & (SPEAKER_SIDE_LEFT | SPEAKER_SIDE_RIGHT)) != 0;
+     BOOL backs = (mask & (SPEAKER_BACK_LEFT | SPEAKER_BACK_RIGHT)) != 0;
+ 
++    /* with only one pair of surrounds (5.1), they sit at 110 degrees */
+     switch(bit){
+-    case SPEAKER_FRONT_LEFT: case SPEAKER_TOP_FRONT_LEFT: return -30;
+-    case SPEAKER_FRONT_RIGHT: case SPEAKER_TOP_FRONT_RIGHT: return 30;
+-    case SPEAKER_FRONT_LEFT_OF_CENTER: return -15;
+-    case SPEAKER_FRONT_RIGHT_OF_CENTER: return 15;
+-    case SPEAKER_BACK_LEFT: case SPEAKER_TOP_BACK_LEFT: return sides ? -150 : -110;
+-    case SPEAKER_BACK_RIGHT: case SPEAKER_TOP_BACK_RIGHT: return sides ? 150 : 110;
+-    case SPEAKER_BACK_CENTER: case SPEAKER_TOP_BACK_CENTER: return 180;
+-    case SPEAKER_SIDE_LEFT: return backs ? -90 : -110;
+-    case SPEAKER_SIDE_RIGHT: return backs ? 90 : 110;
++    case SPEAKER_FRONT_LEFT: case SPEAKER_TOP_FRONT_LEFT: return SURROUND_FL;
++    case SPEAKER_FRONT_RIGHT: case SPEAKER_TOP_FRONT_RIGHT: return SURROUND_FR;
++    case SPEAKER_FRONT_LEFT_OF_CENTER: return SURROUND_FLC;
++    case SPEAKER_FRONT_RIGHT_OF_CENTER: return SURROUND_FRC;
++    case SPEAKER_BACK_LEFT: case SPEAKER_TOP_BACK_LEFT: return sides ? SURROUND_BL : SURROUND_S5L;
++    case SPEAKER_BACK_RIGHT: case SPEAKER_TOP_BACK_RIGHT: return sides ? SURROUND_BR : SURROUND_S5R;
++    case SPEAKER_BACK_CENTER: case SPEAKER_TOP_BACK_CENTER: return SURROUND_BC;
++    case SPEAKER_SIDE_LEFT: return backs ? SURROUND_SL : SURROUND_S5L;
++    case SPEAKER_SIDE_RIGHT: return backs ? SURROUND_SR : SURROUND_S5R;
+     }
+-    return 0;   /* front center, top center, top front center, unlisted channels */
++    return SURROUND_C;   /* front center, top center, top front center, unlisted channels */
+ }
+ 
++/* A 48 kHz filter at the stream's rate (windowed sinc, band-limited below 48 kHz), reversed. */
++static void binaural_resample(const float *h, float *out, int taps, float rate)
++{
++    float ratio = SURROUND_IR_RATE / rate, fc = rate < SURROUND_IR_RATE ? rate / SURROUND_IR_RATE : 1.0f;
++    int n, k;
++
++    for(n = 0; n < taps; n++){
++        float t = n * ratio, sum = 0;
++        if(ratio == 1.0f) sum = n < SURROUND_IR_TAPS ? h[n] : 0;
++        else for(k = 0; k < SURROUND_IR_TAPS; k++){
++            float x = fc * (t - k);
++            if(fabsf(x) >= 16) continue;
++            sum += h[k] * (x == 0 ? 1.0f : sinf((float)M_PI * x) / ((float)M_PI * x)) * (0.5f + 0.5f * cosf((float)M_PI * x / 16))
++                   * ratio * fc;
++        }
++        out[taps - 1 - n] = sum;
++    }
++}
++
++static void binaural_free(struct binaural *b)
++{
++    int i, e;
++
++    if(!b) return;
++    for(i = 0; i < SURROUND_POSITIONS; i++)
++        for(e = 0; e < 2; e++) free(b->ir[i][e]);
++    for(i = 0; i < BIN_FDN; i++) free(b->fdn[i]);
++    free(b);
++}
++
+ static struct binaural *binaural_create(const WAVEFORMATEX *fmt)
+ {
+-    static const float head = 0.0875f, sound = 343.0f; /* head radius (m), speed of sound (m/s) */
++    static const float fdn_ms[BIN_FDN] = {29.1f, 37.4f, 41.7f, 48.0f};
+     struct binaural *b;
+     DWORD mask, bit = 1;
+-    float fs = fmt->nSamplesPerSec, K = 2 * fs, beta = 2 * sound / head;
+-    UINT c, e;
++    float rate = fmt->nSamplesPerSec;
++    UINT c, e, i;
+ 
+     if(!(b = calloc(1, sizeof(*b)))) return NULL;
+     b->channels = fmt->nChannels;
+     b->bytes = binaural_bytes(fmt, &b->is_float);
+-    b->rear_k = 1 - expf(-2 * M_PI * 3000 / fs);
++    b->taps = (int)ceilf(SURROUND_IR_TAPS * rate / SURROUND_IR_RATE);
++    if(b->taps > BIN_MAX_TAPS) b->taps = BIN_MAX_TAPS;
+     mask = fmt->wFormatTag == WAVE_FORMAT_EXTENSIBLE ? ((const WAVEFORMATEXTENSIBLE *)fmt)->dwChannelMask
+                                                        : get_channel_mask(fmt->nChannels);
+ 
+     for(c = 0; c < b->channels; c++){
+         struct binaural_chan *ch = &b->ch[c];
+         DWORD this_bit = 0;
+-        float az;
+ 
+         /* Windows orders a stream's channels by ascending speaker bit. */
+         while(bit && !(mask & bit)) bit <<= 1;
+         if(bit){ this_bit = bit; bit <<= 1; }
+ 
+         if(this_bit == SPEAKER_LOW_FREQUENCY){
+             ch->lfe = TRUE;
+-            ch->gain = 0.5f;
++            ch->gain = SURROUND_LFE_GAIN;
+             continue;
+         }
+-        az = binaural_azimuth(this_bit, mask);
+-        ch->rear = fabsf(az) > 90;
+-        ch->gain = 0.7f;
+-        for(e = 0; e < 2; e++){
+-            /* angle between the source and this ear (left ear at -90, right at +90 degrees) */
+-            float theta = fabsf(remainderf(az - (e ? 90.0f : -90.0f), 360.0f));
+-            float rad = theta * (float)M_PI / 180;
+-            float alpha = 1.05f + 0.95f * cosf(theta / 150 * (float)M_PI);
+-            float t = rad < M_PI / 2 ? -cosf(rad) : rad - (float)M_PI / 2;
+-
+-            ch->delay[e] = (1 + t) * head / sound * fs;
+-            if(ch->delay[e] > BIN_HIST - 2) ch->delay[e] = BIN_HIST - 2;
+-            ch->b0[e] = (alpha * K + beta) / (K + beta);
+-            ch->b1[e] = (beta - alpha * K) / (K + beta);
+-            ch->a1[e] = (beta - K) / (K + beta);
++        ch->pos = binaural_position(this_bit, mask);
++        ch->gain = surround_gain[ch->pos];
++        for(e = 0; e < 2; e++){
++            if(b->ir[ch->pos][e]) continue;
++            if(!(b->ir[ch->pos][e] = malloc(b->taps * sizeof(float)))) goto fail;
++            binaural_resample(surround_ir[ch->pos][e], b->ir[ch->pos][e], b->taps, rate);
+         }
+-        TRACE("channel %u: speaker 0x%x at %.0f degrees, delay %.1f/%.1f samples\n",
+-              c, (unsigned int)this_bit, az, ch->delay[0], ch->delay[1]);
++        TRACE("channel %u: speaker 0x%x at position %u, %d taps\n", c, (unsigned int)this_bit, ch->pos, b->taps);
+     }
++
++    b->tail_delay = (int)(SURROUND_TAIL_MS / 1000 * rate);
++    if(b->tail_delay > BIN_HIST - 1) b->tail_delay = BIN_HIST - 1;
++    for(i = 0; i < BIN_FDN; i++){
++        b->fdn_len[i] = (int)(fdn_ms[i] * rate / 1000);
++        if(!(b->fdn[i] = calloc(b->fdn_len[i], sizeof(float)))) goto fail;
++    }
++    /* lines and reverb time scale together, so the gain per pass stays the same */
++    b->fdn_g = powf(10, -3.0f * 0.040f / SURROUND_TAIL_RT);
++    b->fdn_k = 1 - expf(-2 * (float)M_PI * SURROUND_TAIL_LP / rate);
+     return b;
++
++fail:
++    binaural_free(b);
++    return NULL;
+ }
+ 
+ static float binaural_sample(const struct binaural *b, const BYTE *frame, UINT c)
+ {
+     switch(b->bytes){
+     case 2: return ((const INT16 *)frame)[c] / 32768.0f;
+     case 3:
+     {
+         const BYTE *s = frame + 3 * c;
+         return (INT32)(((UINT32)s[0] << 8) | ((UINT32)s[1] << 16) | ((UINT32)s[2] << 24)) / 2147483648.0f;
+     }
+     case 4: return b->is_float ? ((const float *)frame)[c] : ((const INT32 *)frame)[c] / 2147483648.0f;
+     }
+     return 0;
+ }
+ 
+ /* One frame of the stream (NULL: silence) to one stereo float frame. */
+ static void binaural_frame(struct binaural *b, const BYTE *frame, float *out)
+ {
+-    UINT c, e;
++    float mono = 0, y[BIN_FDN], sum = 0;
++    UINT c, i;
++    int k;
+ 
+     out[0] = out[1] = 0;
+     b->pos = (b->pos + 1) & (BIN_HIST - 1);
+     for(c = 0; c < b->channels; c++){
+         struct binaural_chan *ch = &b->ch[c];
+-        float x = frame ? binaural_sample(b, frame, c) : 0;
++        float v = frame ? binaural_sample(b, frame, c) * ch->gain : 0;
++        float l0 = 0, l1 = 0, l2 = 0, l3 = 0, r0 = 0, r1 = 0, r2 = 0, r3 = 0;
++        const float *x, *h0, *h1;
+ 
+-        b->hist[c][b->pos] = x;
+         if(ch->lfe){
+-            out[0] += x * ch->gain;
+-            out[1] += x * ch->gain;
++            out[0] += v;
++            out[1] += v;
+             continue;
+         }
+-        for(e = 0; e < 2; e++){
+-            UINT d = (UINT)ch->delay[e];
+-            float frac = ch->delay[e] - d;
+-            float s0 = b->hist[c][(b->pos - d) & (BIN_HIST - 1)];
+-            float s1 = b->hist[c][(b->pos - d - 1) & (BIN_HIST - 1)];
+-            float s = s0 + (s1 - s0) * frac;
+-            float y = ch->b0[e] * s + ch->b1[e] * ch->x1[e] - ch->a1[e] * ch->y1[e];
+-
+-            ch->x1[e] = s;
+-            ch->y1[e] = y;
+-            if(ch->rear){
+-                ch->lp[e] += b->rear_k * (y - ch->lp[e]);
+-                y = ch->lp[e] + 0.5f * (y - ch->lp[e]);
+-            }
+-            out[e] += y * ch->gain;
++        b->hist[c][b->pos] = b->hist[c][b->pos + BIN_HIST] = v;
++        /* the filters are stored reversed: both run forward over the last taps samples */
++        x = b->hist[c] + b->pos + BIN_HIST - (b->taps - 1);
++        h0 = b->ir[ch->pos][0];
++        h1 = b->ir[ch->pos][1];
++        for(k = 0; k + 3 < b->taps; k += 4){
++            l0 += h0[k] * x[k]; l1 += h0[k + 1] * x[k + 1]; l2 += h0[k + 2] * x[k + 2]; l3 += h0[k + 3] * x[k + 3];
++            r0 += h1[k] * x[k]; r1 += h1[k + 1] * x[k + 1]; r2 += h1[k + 2] * x[k + 2]; r3 += h1[k + 3] * x[k + 3];
++        }
++        for(; k < b->taps; k++){
++            l0 += h0[k] * x[k];
++            r0 += h1[k] * x[k];
+         }
++        out[0] += (l0 + l1) + (l2 + l3);
++        out[1] += (r0 + r1) + (r2 + r3);
++        mono += b->hist[c][b->pos + BIN_HIST - b->tail_delay];
+     }
++
++    /* tail: Householder feedback matrix, damped, decorrelated left and right outputs */
++    for(i = 0; i < BIN_FDN; i++){
++        y[i] = b->fdn[i][b->fdn_pos[i]];
++        b->fdn_damp[i] += b->fdn_k * (y[i] - b->fdn_damp[i]);
++        if(fabsf(b->fdn_damp[i]) < 1e-20f) b->fdn_damp[i] = 0;   /* no denormals once quiet */
++        sum += b->fdn_damp[i];
++    }
++    for(i = 0; i < BIN_FDN; i++){
++        b->fdn[i][b->fdn_pos[i]] = b->fdn_g * (b->fdn_damp[i] - 0.5f * sum) + 0.12f * mono;
++        if(++b->fdn_pos[i] == b->fdn_len[i]) b->fdn_pos[i] = 0;
++    }
++    out[0] += 0.10f * SURROUND_TAIL * (y[0] - y[2] + 0.5f * y[1]);
++    out[1] += 0.10f * SURROUND_TAIL * (y[1] - y[3] + 0.5f * y[2]);
+ }
+ 
+ static NTSTATUS unix_process_attach(void *args)
+ {
+ #ifdef _WIN64
+     if (NtCurrentTeb()->WowTebOffset)
+     {
+         SYSTEM_BASIC_INFORMATION info;
+ 
+         NtQuerySystemInformation(SystemEmulationBasicInformation, &info, sizeof(info), NULL);
+         zero_bits = (ULONG_PTR)info.HighestUserAddress | 0x7fffffff;
+     }
+ #endif
+     return STATUS_SUCCESS;
+ }
+ 
+ static NTSTATUS unix_main_loop(void *args)
+ {
+     struct main_loop_params *params = args;
+     NtSetEvent(params->event, NULL);
+     return STATUS_SUCCESS;
+ }
+ 
+ static NTSTATUS unix_get_endpoint_ids(void *args)
+ {
+     struct get_endpoint_ids_params *params = args;
+     unsigned int num_devices, i, needed, offset;
+     AudioDeviceID *devices, default_id;
+     AudioObjectPropertyAddress addr;
+     struct endpoint *endpoint;
+     UInt32 devsize, size;
+     struct endpoint_info
+     {
+         CFStringRef name;
+         CFStringRef uid;
+         AudioDeviceID id;
+     } *info;
+     OSStatus sc;
+     UniChar *ptr;
+ 
+     params->num = 0;
+     params->default_idx = 0;
+ 
+     addr.mScope = kAudioObjectPropertyScopeGlobal;
+     addr.mElement = kAudioObjectPropertyElementMain;
+     if(params->flow == eRender) addr.mSelector = kAudioHardwarePropertyDefaultOutputDevice;
+     else if(params->flow == eCapture) addr.mSelector = kAudioHardwarePropertyDefaultInputDevice;
+     else{
+         params->result = E_INVALIDARG;
+         return STATUS_SUCCESS;
+     }
+ 
+     size = sizeof(default_id);
+     sc = AudioObjectGetPropertyData(kAudioObjectSystemObject, &addr, 0, NULL, &size, &default_id);
+     if(sc != noErr){
+         WARN("Getting _DefaultInputDevice property failed: %x\n", (int)sc);
+         default_id = -1;
+     }
+ 
+     addr.mSelector = kAudioHardwarePropertyDevices;
+@@ -1026,163 +1086,163 @@
+         input.inputProc = ca_render_cb;
+         sc = AudioUnitSetProperty(stream->unit, kAudioUnitProperty_SetRenderCallback,
+                                   kAudioUnitScope_Input, 0, &input, sizeof(input));
+     }
+     if(sc != noErr){
+         WARN("Couldn't set callback: %x\n", (int)sc);
+         params->result = osstatus_to_hresult(sc);
+         goto end;
+     }
+ 
+     if (stream->flow == eCapture) {
+         /* On 10.14 and later:
+          * Check the audio capture/microphone authorization status, and explicitly
+          * request it if the user hasn't previously granted or denied permission.
+          */
+         int authstatus = CoreAudio_get_capture_authorization_status();
+         TRACE("Audio capture authorization status: %d\n", authstatus);
+ 
+         if (authstatus == NOT_DETERMINED)
+             authstatus = CoreAudio_request_capture_authorization();
+ 
+         if (authstatus == 0)
+             ERR_(winediag)("Microphone/audio capture permission was denied. "
+                            "This can be enabled under Security & Privacy in System Preferences.\n");
+     }
+ 
+     sc = AudioUnitInitialize(stream->unit);
+     if(sc != noErr){
+         WARN("Couldn't initialize: %x\n", (int)sc);
+         params->result = osstatus_to_hresult(sc);
+         goto end;
+     }
+ 
+     /* we play audio continuously because AudioOutputUnitStart sometimes takes
+      * a while to return */
+     sc = AudioOutputUnitStart(stream->unit);
+     if(sc != noErr){
+         WARN("Unit failed to start: %x\n", (int)sc);
+         params->result = osstatus_to_hresult(sc);
+         goto end;
+     }
+ 
+     size = stream->bufsize_frames * stream->fmt->nBlockAlign;
+     if(NtAllocateVirtualMemory(GetCurrentProcess(), (void **)&stream->local_buffer, zero_bits,
+                                &size, MEM_COMMIT, PAGE_READWRITE)){
+         params->result = E_OUTOFMEMORY;
+         goto end;
+     }
+     silence_buffer(stream, stream->local_buffer, stream->bufsize_frames);
+ 
+     if(stream->flow == eCapture){
+         stream->cap_bufsize_frames = muldiv(params->duration, stream->dev_desc.mSampleRate, 10000000);
+         stream->cap_buffer = malloc(stream->cap_bufsize_frames * stream->fmt->nBlockAlign);
+     }
+     params->result = S_OK;
+ 
+ end:
+     if(FAILED(params->result)){
+         if(stream->converter) AudioConverterDispose(stream->converter);
+         if(stream->unit) AudioComponentInstanceDispose(stream->unit);
+-        free(stream->binaural);
++        binaural_free(stream->binaural);
+         free(stream->fmt);
+         free(stream);
+     } else {
+         *params->channel_count = params->fmt->nChannels;
+         *params->stream = (stream_handle)(UINT_PTR)stream;
+     }
+ 
+     return STATUS_SUCCESS;
+ }
+ 
+ static NTSTATUS unix_release_stream( void *args )
+ {
+     struct release_stream_params *params = args;
+     struct coreaudio_stream *stream = handle_get_stream(params->stream);
+     SIZE_T size;
+ 
+     if(params->timer_thread){
+         stream->please_quit = TRUE;
+         NtWaitForSingleObject(params->timer_thread, FALSE, NULL);
+         NtClose(params->timer_thread);
+     }
+ 
+     if(stream->unit){
+         AudioOutputUnitStop(stream->unit);
+         AudioComponentInstanceDispose(stream->unit);
+     }
+ 
+     if(stream->converter) AudioConverterDispose(stream->converter);
+     free(stream->resamp_buffer);
+     free(stream->wrap_buffer);
+     free(stream->cap_buffer);
+     if(stream->local_buffer){
+         size = 0;
+         NtFreeVirtualMemory(GetCurrentProcess(), (void **)&stream->local_buffer,
+                             &size, MEM_RELEASE);
+     }
+     if(stream->tmp_buffer){
+         size = 0;
+         NtFreeVirtualMemory(GetCurrentProcess(), (void **)&stream->tmp_buffer,
+                             &size, MEM_RELEASE);
+     }
+-    free(stream->binaural);
++    binaural_free(stream->binaural);
+     free(stream->fmt);
+     free(stream);
+     params->result = S_OK;
+     return STATUS_SUCCESS;
+ }
+ 
+ static UINT ca_channel_layout_to_channel_mask(const AudioChannelLayout *layout)
+ {
+     int i;
+     UINT mask = 0;
+ 
+     for (i = 0; i < layout->mNumberChannelDescriptions; ++i) {
+         switch (layout->mChannelDescriptions[i].mChannelLabel) {
+             default: FIXME("Unhandled channel 0x%x\n",
+                            (unsigned int)layout->mChannelDescriptions[i].mChannelLabel); break;
+             case kAudioChannelLabel_Unknown: break;
+             case kAudioChannelLabel_Left: mask |= SPEAKER_FRONT_LEFT; break;
+             case kAudioChannelLabel_Mono:
+             case kAudioChannelLabel_Center: mask |= SPEAKER_FRONT_CENTER; break;
+             case kAudioChannelLabel_Right: mask |= SPEAKER_FRONT_RIGHT; break;
+             case kAudioChannelLabel_LeftSurround: mask |= SPEAKER_BACK_LEFT; break;
+             case kAudioChannelLabel_CenterSurround: mask |= SPEAKER_BACK_CENTER; break;
+             case kAudioChannelLabel_RightSurround: mask |= SPEAKER_BACK_RIGHT; break;
+             case kAudioChannelLabel_LFEScreen: mask |= SPEAKER_LOW_FREQUENCY; break;
+             case kAudioChannelLabel_LeftSurroundDirect: mask |= SPEAKER_SIDE_LEFT; break;
+             case kAudioChannelLabel_RightSurroundDirect: mask |= SPEAKER_SIDE_RIGHT; break;
+             case kAudioChannelLabel_TopCenterSurround: mask |= SPEAKER_TOP_CENTER; break;
+             case kAudioChannelLabel_VerticalHeightLeft: mask |= SPEAKER_TOP_FRONT_LEFT; break;
+             case kAudioChannelLabel_VerticalHeightCenter: mask |= SPEAKER_TOP_FRONT_CENTER; break;
+             case kAudioChannelLabel_VerticalHeightRight: mask |= SPEAKER_TOP_FRONT_RIGHT; break;
+             case kAudioChannelLabel_TopBackLeft: mask |= SPEAKER_TOP_BACK_LEFT; break;
+             case kAudioChannelLabel_TopBackCenter: mask |= SPEAKER_TOP_BACK_CENTER; break;
+             case kAudioChannelLabel_TopBackRight: mask |= SPEAKER_TOP_BACK_RIGHT; break;
+             case kAudioChannelLabel_LeftCenter: mask |= SPEAKER_FRONT_LEFT_OF_CENTER; break;
+             case kAudioChannelLabel_RightCenter: mask |= SPEAKER_FRONT_RIGHT_OF_CENTER; break;
+         }
+     }
+ 
+     return mask;
+ }
+ 
+ /* For most hardware on Windows, users must choose a configuration with an even
+  * number of channels (stereo, quad, 5.1, 7.1). Users can then disable
+  * channels, but those channels are still reported to applications from
+  * GetMixFormat! Some applications behave badly if given an odd number of
+  * channels (e.g. 2.1).  Here, we find the nearest configuration that Windows
+  * would report for a given channel layout. */
+ static void convert_channel_layout(const AudioChannelLayout *ca_layout, WAVEFORMATEXTENSIBLE *fmt)
+ {
+     UINT ca_mask = ca_channel_layout_to_channel_mask(ca_layout);
+ 
+     TRACE("Got channel mask for CA: 0x%x\n", ca_mask);
+ 
+     if (ca_layout->mNumberChannelDescriptions == 1)
+     {
+         fmt->Format.nChannels = 1;
+         fmt->dwChannelMask = ca_mask;
+         return;
+     }
+ 
+--- /dev/null
++++ b/dlls/winecoreaudio.drv/surround_ir.h
+@@ -0,0 +1,656 @@
++/* Headphone surround's speaker filters: generated by scripts/surround_fit/render2 bake, do not edit.
++ * Head: mit-mit_kemar_normal_pinna.head (MIT Media Lab KEMAR, Bill Gardner and Keith Martin, 1994: free to use with credit).
++ * Settings fitted to Dolby Atmos for Headphones on a 5-minute stress test (docs/SURROUND.md):
++ *   itd=0.980094 ild=0.747875 ild_lo=0.834084 ild_hi=1.0258 contrast=0.434911 smooth=0.9529 xover=18.1179 eq=0.663981 lo_g=-3.53549 lo_f=171.974 hi_g=-9.11723 hi_f=5578.91 front=42.6106 side=85.3018 back=136.767 el_front=-17.9653 el_side=17.3703 el_back=3.02427 g_side=0.136804 g_back=-0.535721 d_side=0 d_back=0 early=0 tail=0.716398 room_lp=1033.36 tail_lp=6271.11 rt=0.43569 tail_ms=5.04038
++ * Each position: a minimum-phase response per ear placed at its onset, 48 kHz. */
++
++#define SURROUND_IR_RATE 48000
++#define SURROUND_IR_TAPS 304
++enum surround_pos { SURROUND_C, SURROUND_FLC, SURROUND_FRC, SURROUND_FL, SURROUND_FR, SURROUND_SL, SURROUND_SR,
++                    SURROUND_S5L, SURROUND_S5R, SURROUND_BL, SURROUND_BR, SURROUND_BC, SURROUND_POSITIONS };
++/* the speaker's level before its filter (the fitted gain of its group) */
++static const float surround_gain[SURROUND_POSITIONS] = {0.5, 0.5, 0.5, 0.5, 0.5, 0.507937, 0.507937, 0.488649, 0.488649, 0.470093, 0.470093, 0.470093};
++#define SURROUND_LFE_GAIN 0.25f
++/* reverb tail: level, time to fall 60 dB (s), damping (Hz), start after the direct sound (ms) */
++#define SURROUND_TAIL 0.716398f
++#define SURROUND_TAIL_RT 0.43569f
++#define SURROUND_TAIL_LP 6271.11f
++#define SURROUND_TAIL_MS 5.04038f
++static const float surround_ir[SURROUND_POSITIONS][2][SURROUND_IR_TAPS] = {
++    /* C: 0.0 degrees, elevation -18.0 */
++    {{0.325139,0.174818,0.0883143,0.0785457,0.0784562,0.046444,0.0310847,0.0245029,0.00845795,0.0168218,0.011574,-0.00823862,
++      -0.0141385,0.0129664,0.0109267,0.0067456,-0.00184731,-0.00705574,-0.0107323,-0.00315611,-0.00739476,-0.00620639,9.61316e-05,0.000898993,
++      -0.0012404,-0.00255437,-0.00229428,-0.00237287,0.000368078,-0.00478161,-0.00613534,-0.00252124,-0.00525342,-0.00618901,-0.00585777,-0.00522498,
++      -0.00522195,-0.00405946,-0.00717344,-0.00711399,-0.00425931,-0.00507172,-0.00527726,-0.0034364,-0.00447739,-0.00418661,-0.00327568,-0.00330611,
++      -0.00308476,-0.00150164,-0.00266323,-0.00218876,-0.000968752,-0.00199585,-0.00218498,-0.000960992,-0.00215828,-0.00245713,-0.00150599,-0.0023488,
++      -0.00300063,-0.00133158,-0.00227364,-0.00214403,-0.00201835,-0.00242656,-0.00277344,-0.00130733,-0.00232827,-0.00243691,-0.00116857,-0.00181869,
++      -0.00230195,-0.000662644,-0.0020662,-0.00179138,-0.00104008,-0.00148653,-0.00246342,-0.00128172,-0.00203537,-0.00246476,-0.00106651,-0.00220492,
++      -0.00193714,-0.00151351,-0.0018691,-0.00263716,-0.00152971,-0.00177092,-0.00192547,-0.000665454,-0.00141394,-0.00148149,-0.00108455,-0.00119805,
++      -0.00196715,-0.000855172,-0.00154378,-0.00167388,-0.00112129,-0.00133535,-0.00197585,-0.000869979,-0.00132038,-0.00146166,-0.000828841,-0.0010403,
++      -0.00145198,-0.000785841,-0.00129267,-0.00158974,-0.000645839,-0.000979062,-0.000753838,-0.000268039,-0.000796099,-0.00119516,-0.000628681,-0.000699502,
++      -0.00125976,-0.000248122,-0.00131289,-0.000903042,-0.000934223,-0.000979485,-0.00167757,-0.000571618,-0.00114606,-0.000951995,-0.000242282,-0.000691776,
++      -0.000983568,-0.000641873,-0.000611776,-0.00099679,-0.0003945,-0.00108352,-0.000922043,-0.000238744,-0.000465728,-0.000744408,-0.000269576,-0.000671705,
++      -0.0009194,-0.000267969,-0.000962942,-0.000954947,-0.000476673,-0.000466444,-0.00112037,-0.000278564,-0.000705336,-0.000920973,-0.000648498,-0.000831405,
++      -0.00124901,-0.000884606,-0.00103629,-0.00146044,-0.000481841,-0.0007011,-0.000921344,-0.000400488,-0.000602324,-0.00102317,-0.000111218,4.24286e-06,
++      -0.000602697,0.000222361,-9.03725e-06,-0.000253205,-0.000168292,-0.000279639,-0.000585473,-3.85093e-06,-0.000265009,-0.000495677,0.000241808,-0.000236629,
++      -0.000592254,-0.000192282,-0.000168897,-0.000329121,0.000194911,-0.000201435,-0.000619257,-0.000281767,-0.00060274,-0.000715156,6.23421e-05,-0.000244615,
++      -0.000522079,2.00666e-05,-0.000433635,-0.000349667,-7.08954e-05,-0.000137554,-0.000355486,0.000245903,-0.000200649,-0.000203591,4.8212e-05,0.00028148,
++      -2.49475e-05,0.000359317,-0.000333179,-0.000756685,-0.000246509,-0.000389982,-0.000594212,-0.000175479,-0.000564342,-0.000918692,-0.000343825,-0.000382593,
++      -0.000645518,-4.30067e-05,-0.000319998,-0.000359888,-0.000503162,-0.000571185,-0.00106172,-0.000371597,-0.000677231,-0.00109775,-0.000559867,-0.000381354,
++      -0.000891393,-0.0005699,-0.00047596,-0.000822072,-0.000353554,-0.000451918,-0.000732759,-0.000473846,-0.000735486,-0.000831935,-0.000458518,-0.000296704,
++      -0.000551286,0.000112109,-0.00039012,-0.000535259,-4.11229e-05,-0.000169517,-0.000701123,-2.30764e-05,-5.55427e-05,-0.000459078,-0.00037773,-7.20413e-05,
++      -0.000418155,1.86783e-05,-8.71691e-05,-0.000360171,3.70353e-12,-2.01658e-12,-7.43916e-13,-2.70886e-12,4.20649e-12,5.4907e-14,6.99223e-13,0,
++      0,0,0,0,0,0,0,0,0,0,0,0,
++      0,0,0,0,0,0,0,0,0,0,0,0,
++      0,0,0,0,0,0,0,0,0,0,0,0,
++      0,0,0,0},
++     {0.325139,0.174818,0.0883143,0.0785457,0.0784562,0.046444,0.0310847,0.0245029,0.00845795,0.0168218,0.011574,-0.00823862,
++      -0.0141385,0.0129664,0.0109267,0.0067456,-0.00184731,-0.00705574,-0.0107323,-0.00315611,-0.00739476,-0.00620639,9.61316e-05,0.000898993,
++      -0.0012404,-0.00255437,-0.00229428,-0.00237287,0.000368078,-0.00478161,-0.00613534,-0.00252124,-0.00525342,-0.00618901,-0.00585777,-0.00522498,
++      -0.00522195,-0.00405946,-0.00717344,-0.00711399,-0.00425931,-0.00507172,-0.00527726,-0.0034364,-0.00447739,-0.00418661,-0.00327568,-0.00330611,
++      -0.00308476,-0.00150164,-0.00266323,-0.00218876,-0.000968752,-0.00199585,-0.00218498,-0.000960992,-0.00215828,-0.00245713,-0.00150599,-0.0023488,
++      -0.00300063,-0.00133158,-0.00227364,-0.00214403,-0.00201835,-0.00242656,-0.00277344,-0.00130733,-0.00232827,-0.00243691,-0.00116857,-0.00181869,
++      -0.00230195,-0.000662644,-0.0020662,-0.00179138,-0.00104008,-0.00148653,-0.00246342,-0.00128172,-0.00203537,-0.00246476,-0.00106651,-0.00220492,
++      -0.00193714,-0.00151351,-0.0018691,-0.00263716,-0.00152971,-0.00177092,-0.00192547,-0.000665454,-0.00141394,-0.00148149,-0.00108455,-0.00119805,
++      -0.00196715,-0.000855172,-0.00154378,-0.00167388,-0.00112129,-0.00133535,-0.00197585,-0.000869979,-0.00132038,-0.00146166,-0.000828841,-0.0010403,
++      -0.00145198,-0.000785841,-0.00129267,-0.00158974,-0.000645839,-0.000979062,-0.000753838,-0.000268039,-0.000796099,-0.00119516,-0.000628681,-0.000699502,
++      -0.00125976,-0.000248122,-0.00131289,-0.000903042,-0.000934223,-0.000979485,-0.00167757,-0.000571618,-0.00114606,-0.000951995,-0.000242282,-0.000691776,
++      -0.000983568,-0.000641873,-0.000611776,-0.00099679,-0.0003945,-0.00108352,-0.000922043,-0.000238744,-0.000465728,-0.000744408,-0.000269576,-0.000671705,
++      -0.0009194,-0.000267969,-0.000962942,-0.000954947,-0.000476673,-0.000466444,-0.00112037,-0.000278564,-0.000705336,-0.000920973,-0.000648498,-0.000831405,
++      -0.00124901,-0.000884606,-0.00103629,-0.00146044,-0.000481841,-0.0007011,-0.000921344,-0.000400488,-0.000602324,-0.00102317,-0.000111218,4.24286e-06,
++      -0.000602697,0.000222361,-9.03725e-06,-0.000253205,-0.000168292,-0.000279639,-0.000585473,-3.85093e-06,-0.000265009,-0.000495677,0.000241808,-0.000236629,
++      -0.000592254,-0.000192282,-0.000168897,-0.000329121,0.000194911,-0.000201435,-0.000619257,-0.000281767,-0.00060274,-0.000715156,6.23421e-05,-0.000244615,
++      -0.000522079,2.00666e-05,-0.000433635,-0.000349667,-7.08954e-05,-0.000137554,-0.000355486,0.000245903,-0.000200649,-0.000203591,4.8212e-05,0.00028148,
++      -2.49475e-05,0.000359317,-0.000333179,-0.000756685,-0.000246509,-0.000389982,-0.000594212,-0.000175479,-0.000564342,-0.000918692,-0.000343825,-0.000382593,
++      -0.000645518,-4.30067e-05,-0.000319998,-0.000359888,-0.000503162,-0.000571185,-0.00106172,-0.000371597,-0.000677231,-0.00109775,-0.000559867,-0.000381354,
++      -0.000891393,-0.0005699,-0.00047596,-0.000822072,-0.000353554,-0.000451918,-0.000732759,-0.000473846,-0.000735486,-0.000831935,-0.000458518,-0.000296704,
++      -0.000551286,0.000112109,-0.00039012,-0.000535259,-4.11229e-05,-0.000169517,-0.000701123,-2.30764e-05,-5.55427e-05,-0.000459078,-0.00037773,-7.20413e-05,
++      -0.000418155,1.86783e-05,-8.71691e-05,-0.000360171,3.70353e-12,-2.01658e-12,-7.43916e-13,-2.70886e-12,4.20649e-12,5.4907e-14,6.99223e-13,0,
++      0,0,0,0,0,0,0,0,0,0,0,0,
++      0,0,0,0,0,0,0,0,0,0,0,0,
++      0,0,0,0,0,0,0,0,0,0,0,0,
++      0,0,0,0}},
++    /* FLC: -21.3 degrees, elevation -18.0 */
++    {{0.507391,0.253247,0.0522554,0.0313227,0.0620926,0.0399201,0.0225256,0.0206401,0.00452788,0.0160088,0.0116349,-0.0187616,
++      -0.0175766,0.0265551,0.0205997,0.000172761,-0.012886,-0.0120652,-0.0138525,-0.00512562,-0.00972716,-0.00487236,0.00268486,0.00199739,
++      -0.00638475,-0.00856485,-0.00613136,-0.00483488,-0.00161608,-0.00673387,-0.00828385,-0.00324447,-0.00768719,-0.00951137,-0.00823583,-0.00695975,
++      -0.00626689,-0.00398273,-0.00699641,-0.00723641,-0.00296821,-0.00479835,-0.00491096,-0.0025627,-0.00511344,-0.00459549,-0.00227918,-0.00182547,
++      -0.00201381,-7.4664e-05,-0.00228926,-0.00114906,0.000299778,-0.0018097,-0.00217727,5.95657e-05,-0.00181362,-0.00207642,-7.04272e-05,-0.000852453,
++      -0.00215578,-0.000401912,-0.00189178,-0.00164803,-0.00122976,-0.00181488,-0.00215621,0.000418347,-0.000813457,-0.00152679,0.000264578,-0.000405318,
++      -0.0014423,0.000872251,-0.00133995,-0.000894825,0.000449941,-6.91548e-05,-0.0018467,0.000121081,-0.000792373,-0.00161721,0.000210025,-0.00143793,
++      -0.000803949,-1.87268e-05,-0.000778783,-0.00191389,-7.76137e-05,-0.00037958,-0.000671641,0.000959805,-0.000216006,-0.000424184,9.61958e-05,-0.000225016,
++      -0.00112455,0.000659351,-0.000304864,-0.000650894,0.000172611,-2.12857e-05,-0.00109688,0.000467711,-0.00012083,-0.000211488,0.000757583,0.000405772,
++      -0.000395829,0.000718196,7.44909e-05,-0.000560502,0.000934003,0.00056593,0.000779593,0.00140643,0.000489744,-0.000176661,0.000871821,0.000843866,
++      -0.000303329,0.00130118,-0.000221394,0.000314541,0.000235714,0.000238176,-0.000513521,0.00133667,0.000415173,0.000400554,0.00160195,0.000873727,
++      0.000340599,0.000714752,0.000945952,0.000521265,0.00151484,0.000465669,0.000602633,0.00181154,0.00131843,0.000578599,0.00110665,0.000639957,
++      0.000329862,0.00131605,0.000514345,0.000654798,0.00142899,0.00116317,2.84747e-05,0.00130966,0.000661419,0.000354978,0.000738689,0.000599464,
++      -0.000110141,0.000569515,0.000242166,-0.000261915,0.00122974,0.000780794,7.33066e-05,0.0010249,0.000965187,0.000352906,0.00167241,0.00187023,
++      0.00103971,0.00221155,0.00183684,0.00116936,0.00143755,0.00135244,0.000987756,0.001714,0.00139824,0.000963732,0.00204227,0.0012582,
++      0.000526368,0.00126333,0.00132804,0.0011109,0.00183148,0.00146251,0.000674442,0.00119491,0.000625599,0.000481749,0.00175482,0.00119786,
++      0.000606986,0.00140233,0.000822689,0.000904517,0.00155996,0.00142197,0.00121731,0.00205317,0.00124649,0.00109661,0.00153377,0.00177849,
++      0.00127037,0.00190742,0.00073882,0.000118505,0.00104241,0.0010192,0.000597153,0.00128423,0.000595454,0.000130846,0.00101933,0.00101418,
++      0.000391095,0.00140862,0.00110452,0.000850341,0.000585881,0.000628779,6.78493e-06,0.00107587,0.000679774,-0.000198054,0.000551757,0.000884022,
++      -4.35264e-06,0.000475402,0.000733284,0.000251558,0.00100333,0.000837503,0.000356054,0.00075961,0.000444591,0.000327299,0.000978859,0.00114899,
++      0.000693429,0.00169178,0.000782859,0.000465446,0.00127998,0.00118802,0.000337595,0.00139591,0.00122061,0.000462525,0.000496442,0.00106985,
++      0.000639398,0.0012243,0.00102823,0.000517411,2.36302e-12,1.74924e-11,-4.3424e-12,-6.56345e-12,-8.22853e-12,-1.8502e-12,-1.00449e-12,0,
++      0,0,0,0,0,0,0,0,0,0,0,0,
++      0,0,0,0,0,0,0,0,0,0,0,0,
++      0,0,0,0,0,0,0,0,0,0,0,0,
++      0,0,0,0},
++     {-1.96611e-05,0.000402384,-0.0011565,0.00250247,-0.00464282,0.00836847,-0.0163028,0.0484232,0.184682,0.108492,0.0994428,0.0841408,
++      0.0723944,0.0466391,0.0390086,0.0273642,0.0180799,0.0203445,0.0109037,-0.00229982,-0.00312985,0.00658491,0.0055462,0.00608102,
++      -0.000835152,-0.00654502,-0.0075136,-0.00460123,-0.00703016,-0.00464936,-0.00147522,-0.000445435,3.49745e-05,6.05825e-05,-4.88605e-05,0.000660231,
++      0.00159098,-0.00182158,-0.00170943,-0.00064426,-0.0020276,-0.00240493,-0.00281762,-0.00349104,-0.00403851,-0.00426677,-0.00652164,-0.00622468,
++      -0.00530002,-0.00604506,-0.00582723,-0.00511682,-0.00540882,-0.00499931,-0.00468288,-0.00497063,-0.00440757,-0.0036358,-0.00399299,-0.0033496,
++      -0.0028822,-0.00325471,-0.00292968,-0.0026634,-0.00339116,-0.00328769,-0.00310684,-0.00375856,-0.00356005,-0.00291846,-0.00318959,-0.00288745,
++      -0.0030241,-0.0034066,-0.00328902,-0.00291393,-0.00355948,-0.00321932,-0.00273337,-0.00325663,-0.00294028,-0.00248203,-0.00311781,-0.00271086,
++      -0.00255059,-0.00307187,-0.00327605,-0.00282789,-0.00349415,-0.00320863,-0.00283025,-0.00340168,-0.0030995,-0.00302392,-0.00338533,-0.00352743,
++      -0.00303779,-0.00342663,-0.0031,-0.00258962,-0.00292132,-0.00276156,-0.00258333,-0.0028398,-0.00292585,-0.0024902,-0.00291959,-0.00273668,
++      -0.00244962,-0.00271913,-0.00276593,-0.00232465,-0.00264425,-0.00256479,-0.00235353,-0.00261986,-0.00264077,-0.00239425,-0.00278405,-0.00266595,
++      -0.00231313,-0.00246277,-0.00214733,-0.00198101,-0.00229775,-0.00235783,-0.00205611,-0.00232006,-0.00220454,-0.00191528,-0.00233824,-0.00205587,
++      -0.00207101,-0.00232575,-0.00250301,-0.00213038,-0.00253377,-0.0021582,-0.00192296,-0.00218133,-0.00219647,-0.00198858,-0.00217068,-0.00218661,
++      -0.00206104,-0.00247395,-0.00220548,-0.00194564,-0.00213236,-0.00206258,-0.00179941,-0.00208067,-0.00200546,-0.00186393,-0.00225845,-0.00215795,
++      -0.00190482,-0.00207959,-0.00215842,-0.0017379,-0.00200542,-0.00198516,-0.00184811,-0.00204894,-0.00216862,-0.00196573,-0.00217658,-0.00218231,
++      -0.00169265,-0.00187074,-0.00183807,-0.0016612,-0.00191729,-0.00200373,-0.00154885,-0.00174207,-0.00187248,-0.00152324,-0.00170111,-0.00171427,
++      -0.00167116,-0.00179602,-0.00180924,-0.00147051,-0.0016563,-0.0015201,-0.00118441,-0.001454,-0.00147273,-0.00125711,-0.00130605,-0.00124892,
++      -0.00100813,-0.00134296,-0.00145641,-0.00136845,-0.00162652,-0.00151261,-0.00113456,-0.00136123,-0.00131337,-0.00119105,-0.00145441,-0.00135418,
++      -0.00125584,-0.00139417,-0.00137736,-0.00118767,-0.00139927,-0.00127321,-0.00106314,-0.000981563,-0.000999774,-0.000899182,-0.00132269,-0.00134132,
++      -0.0011659,-0.00132422,-0.0012595,-0.00109557,-0.00135434,-0.00142948,-0.00119302,-0.0013371,-0.00128901,-0.00116995,-0.00134078,-0.00133907,
++      -0.00138612,-0.00157776,-0.00171424,-0.00138366,-0.00159326,-0.00159634,-0.00126863,-0.00130332,-0.0014598,-0.00123487,-0.00133191,-0.00139281,
++      -0.00109168,-0.00119172,-0.0012287,-0.00115221,-0.00136789,-0.00138348,-0.00115844,-0.00116717,-0.00110999,-0.000813389,-0.00106563,-0.00099688,
++      -0.000771697,-0.000944529,-0.00102164,-0.000718186,-0.000754882,-0.000839877,-0.000694776,-0.000651893,-0.000747417,-0.000490371,-0.000687984,-0.000497737,
++      8.43113e-05,-3.82869e-05,2.0471e-05,-1.11177e-05,5.26559e-06,-2.082e-06,3.44164e-07,0,0,0,0,0,
++      0,0,0,0,0,0,0,0,0,0,0,0,
++      0,0,0,0,0,0,0,0,0,0,0,0,
++      0,0,0,0}},
++    /* FRC: 21.3 degrees, elevation -18.0 */
++    {{-1.96618e-05,0.000402389,-0.00115651,0.0025025,-0.00464286,0.00836856,-0.016303,0.0484238,0.184682,0.108492,0.0994428,0.0841407,
++      0.0723943,0.046639,0.0390086,0.0273641,0.0180799,0.0203444,0.0109036,-0.00229989,-0.00312982,0.00658491,0.0055462,0.00608101,
++      -0.00083518,-0.00654506,-0.00751359,-0.00460124,-0.00703018,-0.00464935,-0.00147522,-0.000445445,3.49605e-05,6.05738e-05,-4.88703e-05,0.000660229,
++      0.00159096,-0.0018216,-0.00170943,-0.000644272,-0.00202761,-0.00240494,-0.00281762,-0.00349105,-0.00403852,-0.00426679,-0.00652165,-0.00622468,
++      -0.00530003,-0.00604508,-0.00582723,-0.00511682,-0.00540883,-0.00499932,-0.00468289,-0.00497064,-0.00440757,-0.00363581,-0.003993,-0.00334961,
++      -0.00288221,-0.00325472,-0.00292968,-0.0026634,-0.00339117,-0.0032877,-0.00310684,-0.00375857,-0.00356005,-0.00291846,-0.0031896,-0.00288746,
++      -0.00302411,-0.00340661,-0.00328903,-0.00291393,-0.00355949,-0.00321932,-0.00273338,-0.00325664,-0.00294029,-0.00248204,-0.00311782,-0.00271088,
++      -0.0025506,-0.00307188,-0.00327606,-0.0028279,-0.00349416,-0.00320864,-0.00283026,-0.00340169,-0.00309951,-0.00302393,-0.00338533,-0.00352744,
++      -0.0030378,-0.00342663,-0.00310001,-0.00258963,-0.00292133,-0.00276157,-0.00258333,-0.0028398,-0.00292587,-0.00249021,-0.0029196,-0.00273669,
++      -0.00244963,-0.00271913,-0.00276593,-0.00232465,-0.00264425,-0.0025648,-0.00235353,-0.00261986,-0.00264076,-0.00239425,-0.00278405,-0.00266595,
++      -0.00231313,-0.00246277,-0.00214733,-0.00198101,-0.00229776,-0.00235783,-0.00205611,-0.00232006,-0.00220455,-0.00191529,-0.00233825,-0.00205587,
++      -0.00207101,-0.00232576,-0.002503,-0.00213038,-0.00253378,-0.00215821,-0.00192297,-0.00218133,-0.00219647,-0.00198858,-0.00217068,-0.00218661,
++      -0.00206105,-0.00247395,-0.00220548,-0.00194565,-0.00213237,-0.00206258,-0.00179941,-0.00208068,-0.00200546,-0.00186393,-0.00225845,-0.00215796,
++      -0.00190482,-0.00207959,-0.00215842,-0.0017379,-0.00200542,-0.00198516,-0.00184811,-0.00204894,-0.00216862,-0.00196573,-0.00217659,-0.00218231,
++      -0.00169266,-0.00187075,-0.00183807,-0.0016612,-0.00191729,-0.00200373,-0.00154885,-0.00174207,-0.00187248,-0.00152323,-0.00170111,-0.00171427,
++      -0.00167116,-0.00179602,-0.00180924,-0.00147051,-0.00165631,-0.00152011,-0.00118441,-0.001454,-0.00147274,-0.00125711,-0.00130605,-0.00124894,
++      -0.00100815,-0.00134296,-0.00145641,-0.00136846,-0.00162652,-0.00151261,-0.00113456,-0.00136124,-0.00131337,-0.00119106,-0.00145442,-0.00135419,
++      -0.00125584,-0.00139418,-0.00137737,-0.00118768,-0.00139927,-0.00127321,-0.00106314,-0.000981564,-0.000999773,-0.000899185,-0.00132269,-0.00134132,
++      -0.0011659,-0.00132422,-0.0012595,-0.00109557,-0.00135435,-0.00142948,-0.00119303,-0.00133711,-0.00128901,-0.00116995,-0.00134078,-0.00133907,
++      -0.00138612,-0.00157776,-0.00171424,-0.00138367,-0.00159326,-0.00159634,-0.00126863,-0.00130332,-0.0014598,-0.00123487,-0.00133192,-0.00139281,
++      -0.00109168,-0.00119172,-0.0012287,-0.00115221,-0.00136789,-0.00138348,-0.00115844,-0.00116717,-0.00110998,-0.000813389,-0.00106562,-0.000996881,
++      -0.000771702,-0.000944536,-0.00102165,-0.000718189,-0.00075489,-0.000839879,-0.000694777,-0.000651895,-0.000747417,-0.000490371,-0.000687982,-0.00049773,
++      8.43107e-05,-3.82867e-05,2.04709e-05,-1.11177e-05,5.26556e-06,-2.08199e-06,3.4416e-07,0,0,0,0,0,
++      0,0,0,0,0,0,0,0,0,0,0,0,
++      0,0,0,0,0,0,0,0,0,0,0,0,
++      0,0,0,0},
++     {0.507391,0.253247,0.0522553,0.0313228,0.0620926,0.0399201,0.0225256,0.0206401,0.00452789,0.0160088,0.0116349,-0.0187616,
++      -0.0175766,0.0265551,0.0205997,0.000172783,-0.0128859,-0.0120652,-0.0138524,-0.0051256,-0.00972714,-0.00487234,0.00268487,0.0019974,
++      -0.00638472,-0.00856484,-0.00613134,-0.00483487,-0.00161607,-0.00673386,-0.00828385,-0.00324446,-0.00768717,-0.00951136,-0.00823582,-0.00695973,
++      -0.00626688,-0.00398272,-0.0069964,-0.00723638,-0.00296821,-0.00479834,-0.00491095,-0.00256268,-0.00511343,-0.00459549,-0.00227916,-0.00182545,
++      -0.00201379,-7.46492e-05,-0.00228924,-0.00114904,0.000299797,-0.00180969,-0.00217726,5.95806e-05,-0.00181361,-0.0020764,-7.04111e-05,-0.000852441,
++      -0.00215576,-0.000401896,-0.00189177,-0.00164802,-0.00122973,-0.00181486,-0.0021562,0.000418363,-0.000813443,-0.00152678,0.000264593,-0.000405304,
++      -0.00144229,0.000872261,-0.00133994,-0.000894814,0.000449956,-6.91444e-05,-0.00184669,0.000121098,-0.000792351,-0.0016172,0.000210044,-0.00143791,
++      -0.000803935,-1.87087e-05,-0.000778776,-0.00191387,-7.76106e-05,-0.000379571,-0.000671632,0.000959813,-0.000215994,-0.000424172,9.62138e-05,-0.000225002,
++      -0.00112452,0.000659365,-0.000304853,-0.000650882,0.000172626,-2.12719e-05,-0.00109687,0.000467726,-0.000120809,-0.000211475,0.000757594,0.00040578,
++      -0.000395809,0.000718208,7.45098e-05,-0.00056049,0.000934017,0.000565948,0.000779604,0.00140645,0.000489742,-0.000176651,0.000871832,0.000843882,
++      -0.000303305,0.00130119,-0.000221377,0.000314559,0.000235728,0.000238186,-0.00051351,0.00133668,0.000415219,0.000400558,0.00160196,0.000873738,
++      0.000340609,0.000714754,0.000945959,0.000521278,0.00151485,0.000465683,0.000602645,0.00181156,0.00131844,0.000578609,0.00110666,0.000639969,
++      0.000329889,0.00131606,0.00051436,0.00065481,0.00142901,0.00116319,2.84845e-05,0.00130968,0.000661438,0.000354997,0.00073871,0.000599478,
++      -0.00011013,0.000569527,0.000242179,-0.0002619,0.00122975,0.000780808,7.33187e-05,0.00102491,0.000965203,0.000352914,0.00167243,0.00187024,
++      0.00103973,0.00221156,0.00183685,0.00116938,0.00143756,0.00135246,0.000987764,0.001714,0.00139826,0.000963745,0.00204228,0.00125821,
++      0.000526383,0.00126335,0.00132806,0.0011109,0.0018315,0.00146253,0.000674454,0.00119492,0.000625614,0.000481763,0.00175483,0.00119787,
++      0.000606986,0.00140233,0.000822696,0.000904532,0.00155998,0.00142198,0.00121733,0.00205318,0.00124651,0.00109663,0.00153379,0.0017785,
++      0.00127039,0.00190744,0.000738837,0.000118521,0.0010424,0.00101921,0.000597171,0.00128424,0.000595474,0.000130859,0.00101935,0.0010142,
++      0.00039112,0.00140864,0.00110453,0.000850359,0.000585899,0.000628793,6.79866e-06,0.00107588,0.000679773,-0.000198048,0.000551773,0.000884035,
++      -4.33735e-06,0.000475407,0.000733297,0.000251577,0.00100336,0.00083752,0.000356068,0.000759633,0.000444598,0.000327314,0.000978879,0.00114901,
++      0.000693451,0.0016918,0.000782872,0.000465467,0.00128,0.00118804,0.000337606,0.00139593,0.00122063,0.00046254,0.000496456,0.00106986,
++      0.000639419,0.00122432,0.00102824,0.000517431,2.36288e-12,1.74928e-11,-4.34249e-12,-6.56342e-12,-8.2288e-12,-1.85022e-12,-1.00452e-12,0,
++      0,0,0,0,0,0,0,0,0,0,0,0,
++      0,0,0,0,0,0,0,0,0,0,0,0,
++      0,0,0,0,0,0,0,0,0,0,0,0,
++      0,0,0,0}},
++    /* FL: -42.6 degrees, elevation -18.0 */
++    {{0.639968,0.335862,0.0551234,-0.0302338,0.0116521,0.031739,0.0186425,0.0292933,0.00359183,0.0115199,0.00949121,-0.0149866,
++      -0.00245399,0.0388779,0.0145552,-0.0182283,-0.0237559,-0.0214433,-0.0209339,-0.0137829,-0.0136906,-0.0084108,0.00041532,-0.00599549,
++      -0.012077,-0.0149936,-0.011862,-0.00923691,0.000159659,-0.00593237,-0.0102202,-0.00496377,-0.00811773,-0.007618,-0.00874906,-0.0100616,
++      -0.00909254,-0.00362652,-0.00761649,-0.00838031,-0.00226451,-0.00369437,-0.00614866,-0.0051763,-0.00734464,-0.00558873,-0.00272909,-0.00272701,
++      -0.00285332,-8.43945e-05,-0.00313179,-0.00335675,-0.00118707,-0.00260771,-0.00349276,-0.00168521,-0.00328889,-0.00258012,-0.000149233,-0.0013439,
++      -0.00317714,-0.000625199,-0.00218536,-0.00207144,-0.00178679,-0.00165712,-0.00182834,0.000703188,-0.000879043,-0.00142187,0.000726139,-0.000535157,
++      -0.00199212,0.000719125,-0.00119809,-0.000537619,0.000709968,0.000208055,-0.00165309,0.000299298,-0.00082235,-0.00177615,0.00044058,-0.00158207,
++      -0.000758546,5.74963e-05,-0.000769211,-0.00213574,-0.000261768,-0.000545252,-0.000981688,0.00108333,-0.00044914,-0.000742707,-0.000108783,-0.000290674,
++      -0.00159272,0.000434543,-0.000583796,-0.000942103,0.000265147,-5.97438e-05,-0.00141603,0.000365497,-0.000334229,-0.00044402,0.000797918,0.000172664,
++      -0.000916079,0.000263503,-0.00051069,-0.0011955,0.000759133,0.000368682,0.000718811,0.00146864,0.000387395,-0.000628809,0.000567347,0.00057029,
++      -0.000629401,0.00137719,-0.000498151,-0.000234241,-0.000180667,3.13449e-05,-0.000797242,0.000964883,6.97869e-05,1.57541e-06,0.00162445,0.000719616,
++      0.000135791,0.00052677,0.0011076,0.000465121,0.00152133,0.000595286,0.000299264,0.00167363,0.00107099,0.000225639,0.00078665,0.000445882,
++      -9.59374e-05,0.00114658,0.000390008,0.000895857,0.00148322,0.00108397,-9.22953e-05,0.000955843,0.000165634,9.74269e-05,0.000587191,0.000343038,
++      -0.000572871,0.000362752,0.000219022,-0.000246926,0.00119018,0.0007677,-0.000280564,0.000717842,0.000502548,0.000166305,0.00154867,0.00184767,
++      0.000481177,0.00199526,0.00148534,0.000721468,0.000678535,0.000700873,0.000613384,0.00168853,0.0012301,0.000762553,0.0022475,0.00113215,
++      0.000116948,0.000845169,0.00117019,0.000868473,0.00157765,0.00112852,0.000550115,0.000972153,-0.000101044,-0.000475134,0.0013867,0.000948815,
++      0.000116563,0.000806902,6.0377e-05,0.000321935,0.00111205,0.00111558,0.000720213,0.00159237,0.000490139,0.000510682,0.000910001,0.00133221,
++      0.000565543,0.00127723,-4.57916e-05,-0.000658459,0.000336429,0.0004459,0.000164847,0.00112412,0.000372079,-0.000296178,0.000437466,0.000225728,
++      -0.000436095,0.000878428,0.000551322,0.0001407,-0.000299453,-6.93769e-05,-0.000837114,0.000394802,-0.000187757,-0.000990815,-0.000215401,0.0001427,
++      -0.000786645,-7.01563e-05,3.64361e-05,-0.000251434,0.000518458,0.000294638,-0.000281104,-1.69228e-05,-0.000404994,-0.000340108,0.000512349,0.000568936,
++      2.28368e-05,0.00115347,0.000134257,-0.000458066,0.000577592,0.000610195,-0.000138651,0.00101446,0.000725194,-0.000216016,-0.000157757,0.000387589,
++      -0.000197301,0.000572528,0.000389839,-0.00023507,7.24257e-12,4.22199e-12,-2.35068e-12,-7.07244e-12,1.78032e-12,-8.40467e-13,4.56357e-13,0,
++      0,0,0,0,0,0,0,0,0,0,0,0,
++      0,0,0,0,0,0,0,0,0,0,0,0,
++      0,0,0,0,0,0,0,0,0,0,0,0,
++      0,0,0,0},
++     {0,0,0,0,0,0,0,0,-4.02191e-06,1.47366e-05,-3.36826e-05,6.52276e-05,
++      -0.000117619,0.000220515,-0.000532548,0.10522,0.0909129,0.0833046,0.0800016,0.073099,0.0573705,0.0475418,0.038182,0.0274806,
++      0.0252994,0.0184903,0.00896943,0.000783549,0.00448272,0.00467742,0.00636565,0.00369353,0.000989555,-0.0012089,0.000670664,-0.000408,
++      -0.000113067,0.00169373,0.00302591,0.00360776,0.00355719,0.00362164,0.0037136,0.00430156,0.00250267,0.00132151,0.00136281,-0.000124822,
++      -0.00091366,-0.00151882,-0.00187319,-0.0022318,-0.00236042,-0.0038022,-0.0044715,-0.00425708,-0.00471313,-0.00475183,-0.00431893,-0.00465088,
++      -0.00461995,-0.0044171,-0.00436983,-0.00413786,-0.00346507,-0.00352303,-0.00321183,-0.00284013,-0.00297407,-0.00285073,-0.00240223,-0.00269271,
++      -0.00282147,-0.00266339,-0.00294179,-0.0031155,-0.00265378,-0.00283409,-0.00271334,-0.00274288,-0.00299153,-0.00314317,-0.00273586,-0.00304124,
++      -0.00307642,-0.0027271,-0.00288,-0.00297302,-0.00246742,-0.00284526,-0.00276613,-0.00259759,-0.00277796,-0.00313167,-0.00289344,-0.00318349,
++      -0.00333331,-0.00295288,-0.00328032,-0.00320124,-0.00308801,-0.0031606,-0.00339276,-0.00314295,-0.00325998,-0.00326883,-0.00282347,-0.00291254,
++      -0.00284301,-0.00273269,-0.00273302,-0.00289254,-0.00255907,-0.00278865,-0.00283159,-0.00268923,-0.00272926,-0.00290288,-0.00260041,-0.00270095,
++      -0.00271052,-0.00250432,-0.0025327,-0.00261639,-0.00239634,-0.00250015,-0.00256967,-0.00231504,-0.00238158,-0.00229088,-0.00211441,-0.00223679,
++      -0.00233665,-0.0022093,-0.00222172,-0.0023439,-0.00200928,-0.00224982,-0.00207389,-0.00207092,-0.00210099,-0.00232969,-0.00203307,-0.00222339,
++      -0.00215715,-0.0019488,-0.00204903,-0.00214692,-0.00209098,-0.00218393,-0.00234048,-0.00220292,-0.00244005,-0.00237781,-0.00214769,-0.00213705,
++      -0.00214986,-0.00193174,-0.00200842,-0.0020711,-0.00190045,-0.00213916,-0.0021902,-0.00205764,-0.00202297,-0.0022029,-0.00191962,-0.0019856,
++      -0.00205826,-0.00196402,-0.00203219,-0.00213717,-0.00203561,-0.00208501,-0.00226519,-0.00199259,-0.0020196,-0.00201981,-0.00183799,-0.00189093,
++      -0.00204626,-0.00179116,-0.0017454,-0.00189496,-0.00163402,-0.00164892,-0.00165339,-0.00156651,-0.00159335,-0.00169782,-0.00148201,-0.00148943,
++      -0.00154445,-0.00131299,-0.00140491,-0.00149583,-0.00137179,-0.00134244,-0.00136219,-0.00115662,-0.00123434,-0.00138249,-0.00129753,-0.0013778,
++      -0.00140061,-0.0011518,-0.00117565,-0.00123383,-0.00106756,-0.00119806,-0.00119107,-0.00111621,-0.00114667,-0.00123689,-0.00107198,-0.00118045,
++      -0.00117245,-0.00102751,-0.000880573,-0.000911221,-0.000763487,-0.000929716,-0.00108173,-0.000967297,-0.00101814,-0.00108967,-0.000975934,-0.00109259,
++      -0.00127509,-0.00114936,-0.00114677,-0.001199,-0.00104534,-0.0011151,-0.0010931,-0.00110706,-0.00113173,-0.00133253,-0.00116293,-0.00120915,
++      -0.00129609,-0.00111289,-0.00102734,-0.00113362,-0.00104217,-0.00100614,-0.00114849,-0.00100349,-0.00096899,-0.00100516,-0.000877666,-0.000920059,
++      -0.000948006,-0.000854826,-0.000757069,-0.000771425,-0.00053948,-0.000594493,-0.000593918,-0.000459813,-0.000464787,-0.000581729,-0.000431929,-0.00039746,
++      -0.000444029,-0.000412137,-0.000331494,-0.000376295,-0.000268198,-0.000259858,-0.000288267,-1.33899e-06,5.20819e-07,-2.68612e-07,1.44329e-07,-7.18989e-08,
++      2.95865e-08,-7.7582e-09,3.19404e-13,0,0,0,0,0,0,0,0,0,
++      0,0,0,0,0,0,0,0,0,0,0,0,
++      0,0,0,0}},
++    /* FR: 42.6 degrees, elevation -18.0 */
++    {{0,0,0,0,0,0,0,0,-4.02292e-06,1.47404e-05,-3.36911e-05,6.52443e-05,
++      -0.000117656,0.000220571,-0.000532691,0.105219,0.090913,0.0833045,0.0800016,0.073099,0.0573705,0.0475418,0.038182,0.0274806,
++      0.0252994,0.0184903,0.00896944,0.000783549,0.00448271,0.00467741,0.00636564,0.00369353,0.00098956,-0.0012089,0.000670663,-0.000407995,
++      -0.000113071,0.00169373,0.00302591,0.00360776,0.00355719,0.00362164,0.0037136,0.00430156,0.00250268,0.00132151,0.00136282,-0.000124829,
++      -0.000913664,-0.00151882,-0.0018732,-0.00223181,-0.00236043,-0.0038022,-0.0044715,-0.00425709,-0.00471314,-0.00475183,-0.00431892,-0.00465088,
++      -0.00461995,-0.00441711,-0.00436983,-0.00413786,-0.00346507,-0.00352303,-0.00321183,-0.00284013,-0.00297407,-0.00285073,-0.00240224,-0.00269272,
++      -0.00282147,-0.00266339,-0.00294179,-0.0031155,-0.00265379,-0.0028341,-0.00271334,-0.00274287,-0.00299152,-0.00314316,-0.00273584,-0.00304122,
++      -0.0030764,-0.00272708,-0.00287999,-0.00297301,-0.00246741,-0.00284525,-0.00276612,-0.00259759,-0.00277795,-0.00313167,-0.00289343,-0.00318349,
++      -0.0033333,-0.00295288,-0.00328032,-0.00320123,-0.003088,-0.00316059,-0.00339276,-0.00314294,-0.00325998,-0.00326883,-0.00282347,-0.00291254,
++      -0.00284301,-0.00273269,-0.00273303,-0.00289253,-0.00255906,-0.00278864,-0.00283159,-0.00268923,-0.00272926,-0.00290288,-0.00260041,-0.00270095,
++      -0.00271053,-0.00250432,-0.0025327,-0.00261639,-0.00239634,-0.00250016,-0.00256968,-0.00231504,-0.00238159,-0.00229088,-0.00211442,-0.0022368,
++      -0.00233665,-0.0022093,-0.00222172,-0.0023439,-0.00200928,-0.00224982,-0.00207389,-0.00207092,-0.00210099,-0.00232969,-0.00203307,-0.00222338,
++      -0.00215715,-0.0019488,-0.00204903,-0.00214692,-0.00209097,-0.00218393,-0.00234048,-0.00220293,-0.00244006,-0.00237782,-0.0021477,-0.00213705,
++      -0.00214987,-0.00193174,-0.00200842,-0.00207111,-0.00190046,-0.00213916,-0.00219021,-0.00205765,-0.00202298,-0.0022029,-0.00191963,-0.0019856,
++      -0.00205825,-0.00196403,-0.00203218,-0.00213717,-0.00203561,-0.002085,-0.00226519,-0.0019926,-0.0020196,-0.00201981,-0.001838,-0.00189093,
++      -0.00204626,-0.00179116,-0.00174541,-0.00189496,-0.00163403,-0.00164893,-0.0016534,-0.00156651,-0.00159336,-0.00169782,-0.00148202,-0.00148943,
++      -0.00154445,-0.00131299,-0.00140491,-0.00149583,-0.00137179,-0.00134244,-0.0013622,-0.00115662,-0.00123434,-0.00138249,-0.00129753,-0.00137779,
++      -0.00140061,-0.00115179,-0.00117565,-0.00123382,-0.00106755,-0.00119805,-0.00119106,-0.00111621,-0.00114667,-0.00123689,-0.00107199,-0.00118046,
++      -0.00117245,-0.00102752,-0.000880582,-0.000911233,-0.000763495,-0.000929724,-0.00108173,-0.000967305,-0.00101815,-0.00108968,-0.000975943,-0.0010926,
++      -0.0012751,-0.00114936,-0.00114677,-0.001199,-0.00104534,-0.0011151,-0.0010931,-0.00110706,-0.00113173,-0.00133253,-0.00116293,-0.00120915,
++      -0.0012961,-0.00111288,-0.00102734,-0.00113363,-0.00104218,-0.00100614,-0.00114849,-0.0010035,-0.000968999,-0.00100517,-0.000877672,-0.000920067,
++      -0.000948013,-0.000854832,-0.000757076,-0.000771436,-0.000539491,-0.000594499,-0.000593925,-0.000459817,-0.000464789,-0.000581732,-0.00043193,-0.000397463,
++      -0.000444033,-0.00041214,-0.000331495,-0.000376296,-0.000268199,-0.000259859,-0.00028827,-1.33936e-06,5.2097e-07,-2.68688e-07,1.44364e-07,-7.19224e-08,
++      2.95945e-08,-7.76029e-09,3.19489e-13,0,0,0,0,0,0,0,0,0,
++      0,0,0,0,0,0,0,0,0,0,0,0,
++      0,0,0,0},
++     {0.639968,0.335862,0.0551233,-0.0302338,0.0116521,0.031739,0.0186425,0.0292933,0.00359184,0.0115199,0.00949121,-0.0149866,
++      -0.00245401,0.0388778,0.0145552,-0.0182283,-0.0237559,-0.0214433,-0.0209339,-0.0137829,-0.0136906,-0.0084108,0.000415321,-0.00599549,
++      -0.012077,-0.0149936,-0.011862,-0.00923691,0.000159651,-0.00593237,-0.0102202,-0.00496377,-0.00811772,-0.00761797,-0.00874906,-0.0100616,
++      -0.00909252,-0.00362651,-0.00761649,-0.00838032,-0.00226451,-0.00369437,-0.00614867,-0.0051763,-0.00734464,-0.00558872,-0.00272908,-0.00272701,
++      -0.00285331,-8.43942e-05,-0.00313178,-0.00335674,-0.00118706,-0.0026077,-0.00349276,-0.00168522,-0.0032889,-0.00258012,-0.000149227,-0.0013439,
++      -0.00317714,-0.000625194,-0.00218536,-0.00207144,-0.00178679,-0.00165711,-0.00182834,0.000703191,-0.000879049,-0.00142186,0.000726142,-0.000535154,
++      -0.00199212,0.000719121,-0.0011981,-0.000537612,0.000709971,0.000208054,-0.00165309,0.000299302,-0.000822358,-0.00177615,0.000440574,-0.00158206,
++      -0.000758549,5.75015e-05,-0.000769214,-0.00213574,-0.000261762,-0.000545254,-0.000981688,0.00108334,-0.000449133,-0.000742711,-0.000108775,-0.000290669,
++      -0.00159271,0.00043454,-0.000583795,-0.000942104,0.000265152,-5.97411e-05,-0.00141603,0.000365499,-0.000334226,-0.000444016,0.000797917,0.000172663,
++      -0.000916082,0.000263501,-0.000510691,-0.00119549,0.000759131,0.000368671,0.000718805,0.00146864,0.000387402,-0.000628813,0.000567341,0.000570291,
++      -0.000629403,0.00137718,-0.000498147,-0.000234238,-0.000180665,3.13482e-05,-0.00079724,0.000964895,6.97903e-05,1.57169e-06,0.00162445,0.000719616,
++      0.000135795,0.000526778,0.0011076,0.000465123,0.00152133,0.0005953,0.00029927,0.00167363,0.00107098,0.000225646,0.000786655,0.000445882,
++      -9.59481e-05,0.00114658,0.000390011,0.00089586,0.00148322,0.00108396,-9.22945e-05,0.000955847,0.000165635,9.74273e-05,0.000587189,0.000343038,
++      -0.000572867,0.000362749,0.000219017,-0.000246931,0.00119018,0.000767704,-0.000280551,0.000717845,0.000502549,0.0001663,0.00154867,0.00184768,
++      0.00048118,0.00199527,0.00148535,0.000721468,0.000678524,0.000700867,0.000613384,0.00168853,0.0012301,0.000762557,0.0022475,0.00113215,
++      0.000116941,0.000845164,0.0011702,0.000868479,0.00157764,0.00112853,0.000550116,0.000972152,-0.000101044,-0.000475134,0.0013867,0.000948809,
++      0.000116559,0.000806897,6.03788e-05,0.000321932,0.00111205,0.00111558,0.000720207,0.00159236,0.00049014,0.000510692,0.000910004,0.00133221,
++      0.000565549,0.00127723,-4.57857e-05,-0.000658457,0.000336426,0.000445882,0.000164849,0.00112412,0.00037208,-0.000296176,0.000437471,0.000225727,
++      -0.000436099,0.000878418,0.000551318,0.0001407,-0.000299451,-6.93856e-05,-0.000837119,0.000394805,-0.000187742,-0.000990823,-0.000215396,0.000142695,
++      -0.000786648,-7.01568e-05,3.64316e-05,-0.000251436,0.00051846,0.000294642,-0.0002811,-1.69179e-05,-0.000404985,-0.000340116,0.000512357,0.000568937,
++      2.28394e-05,0.00115347,0.000134262,-0.000458064,0.000577589,0.000610196,-0.000138651,0.00101446,0.000725201,-0.000216017,-0.000157756,0.000387589,
++      -0.000197298,0.000572529,0.000389839,-0.000235066,7.24253e-12,4.22204e-12,-2.3507e-12,-7.07241e-12,1.78028e-12,-8.40467e-13,4.5635e-13,0,
++      0,0,0,0,0,0,0,0,0,0,0,0,
++      0,0,0,0,0,0,0,0,0,0,0,0,
++      0,0,0,0,0,0,0,0,0,0,0,0,
++      0,0,0,0}},
++    /* SL: -85.3 degrees, elevation 17.4 */
++    {{0.724523,0.212701,-0.066847,-0.027146,0.0652076,0.074996,0.06282,0.0457086,0.0197894,0.0440561,0.0108294,-0.0444474,
++      -0.0363134,0.0244891,0.00751511,-0.00616441,-0.02046,-0.0309893,-0.028108,-0.00588413,-0.00985568,-0.00520701,0.00661469,0.000912161,
++      -0.00521384,-0.00345409,0.00129142,0.00367163,0.0112089,-0.000983033,-0.0046589,0.00551132,-0.0013493,-0.00355108,-0.00349955,-0.00412943,
++      -0.00469657,-0.00248103,-0.0127367,-0.0146719,-0.00740609,-0.0107557,-0.0119252,-0.00812195,-0.0113008,-0.00991754,-0.00594369,-0.00704778,
++      -0.00757373,-0.00334921,-0.00602145,-0.00440386,-0.000781737,-0.00300576,-0.00313858,-0.000301675,-0.00339071,-0.00315191,4.01799e-05,-0.0016819,
++      -0.00335401,0.000449882,-0.0020561,-0.00193368,-0.00154533,-0.00198518,-0.00214039,0.00106241,-0.00216542,-0.00302354,-2.5797e-06,-0.00132315,
++      -0.0023342,0.00153918,-0.00224278,-0.00126069,0.00100462,-6.73573e-05,-0.00207473,0.00120878,-0.000808519,-0.00179493,0.00183176,-0.000910458,
++      -0.000226991,0.00086643,-0.000361827,-0.00204449,0.000562231,-0.000744962,-0.00142775,0.00161898,-0.000513529,-0.000971075,6.48372e-05,-0.000315715,
++      -0.0018292,0.00109268,-0.000447597,-0.000889808,0.000551789,-0.000206987,-0.00174655,0.00081144,-0.000523484,-0.00102731,0.000572159,-0.000322974,
++      -0.00146822,0.000174178,-0.00101454,-0.00155445,0.000939744,-6.26303e-05,0.000246236,0.00106487,-0.000639071,-0.00143579,0.00033566,0.000209782,
++      -0.00106674,0.00191659,-0.000354325,0.000569105,0.000554707,0.000430318,-0.00102479,0.00139115,-0.000148542,-3.59984e-05,0.00156147,0.00010601,
++      -0.000478831,0.000300581,0.0004256,-0.00052794,0.000972079,-0.000488281,9.59942e-05,0.00179898,0.000695342,-0.000270631,0.000587043,-2.06298e-05,
++      -7.80796e-05,0.0018442,0.000373948,0.000315368,0.00117942,0.00062967,-0.00104612,0.00120547,0.000472118,0.000167035,0.000818557,0.00043123,
++      -0.000374733,0.000900433,0.000477736,-0.00033703,0.00179724,0.000860064,-0.00027994,0.000773265,-0.000199266,-0.000911309,0.00126702,0.00116163,
++      -0.000535602,0.00131882,0.000404199,-8.36134e-05,0.000513384,0.000150768,-0.00025499,0.00129769,0.000717749,0.000106671,0.00205014,0.000652149,
++      -0.000161577,0.00117345,0.0012387,0.000849441,0.00190827,0.00083258,0.000251896,0.0016368,0.000666509,0.000396844,0.0023804,0.00102588,
++      -0.000328667,0.0010541,0.000103358,0.000322851,0.00111458,0.000896923,0.000284148,0.00149263,8.09111e-08,-3.8184e-06,0.000703903,0.00101568,
++      6.77963e-05,0.00124924,-0.000347167,-0.000799971,0.00093965,0.000916206,0.00037433,0.00110896,-0.000200136,-0.000987625,0.000325752,0.000168323,
++      -0.000473774,0.000750729,-0.000431736,-0.000656772,-0.000707004,-0.000509665,-0.00126663,0.000553864,-0.000372014,-0.00145475,-0.000114999,0.00031275,
++      -0.000996307,3.301e-05,7.86097e-05,-0.000895191,0.000289751,3.78722e-05,-0.000782949,-8.09307e-05,-0.00075769,-0.00104781,-1.96875e-05,0.000181392,
++      -0.000709098,0.000591991,-0.00085623,-0.00108113,0.00054998,0.000216803,-0.00103798,0.000445008,-6.53312e-06,-0.000926094,-0.000533175,0.000262524,
++      -0.000619246,0.000303247,-0.000171185,-0.000853592,8.4828e-12,-6.59546e-12,-5.17748e-12,-7.50195e-12,9.46756e-12,6.06822e-14,1.65713e-12,0,
++      0,0,0,0,0,0,0,0,0,0,0,0,
++      0,0,0,0,0,0,0,0,0,0,0,0,
++      0,0,0,0,0,0,0,0,0,0,0,0,
++      0,0,0,0},
++     {0,0,0,0,0,0,0,0,0,0,0,0,
++      0,0,0,0,0,0,0,0,0,-3.61732e-06,1.20113e-05,-2.6531e-05,
++      5.15972e-05,-9.33695e-05,0.000176749,-0.000437229,0.0796586,0.0967859,0.105434,0.0895272,0.0729632,0.0595886,0.0521755,0.0473459,
++      0.0391292,0.0326859,0.0241119,0.0160285,0.00924355,0.00854747,0.0071395,0.00650024,0.00410616,0.00129326,-0.00161635,-0.00229284,
++      -0.0030832,-0.00296471,-0.00234475,-0.00171279,-0.000728014,-0.000350354,-1.97504e-05,0.000288276,0.00134081,0.000963716,0.000389112,0.000251134,
++      -0.000623393,-0.00111381,-0.00167219,-0.00208084,-0.00250586,-0.00263948,-0.003506,-0.00412577,-0.00408698,-0.00440763,-0.00454962,-0.00448089,
++      -0.00477514,-0.00487112,-0.00482303,-0.0047333,-0.00452803,-0.00414503,-0.00417732,-0.00403592,-0.00380273,-0.0038006,-0.00371922,-0.00348106,
++      -0.00358613,-0.00361583,-0.00345892,-0.00351952,-0.00362178,-0.00346765,-0.00356982,-0.00342496,-0.00343028,-0.00353655,-0.0036432,-0.00336671,
++      -0.00340094,-0.00331992,-0.00304701,-0.00305595,-0.0030876,-0.0028506,-0.00301123,-0.00289611,-0.00278883,-0.00278964,-0.00297266,-0.00285737,
++      -0.00298271,-0.00301449,-0.00277947,-0.00299156,-0.00288525,-0.00281767,-0.00280056,-0.00294675,-0.00285064,-0.00289309,-0.00280217,-0.00246417,
++      -0.00245708,-0.0023697,-0.00231651,-0.00227756,-0.00231511,-0.00208064,-0.00218756,-0.00219229,-0.00210134,-0.00210073,-0.00219296,-0.00204236,
++      -0.00208902,-0.00201925,-0.00185349,-0.00183724,-0.00188359,-0.00175317,-0.00182246,-0.00189908,-0.00177453,-0.00181601,-0.00172104,-0.00153072,
++      -0.00152416,-0.00158439,-0.00150205,-0.0014862,-0.00153838,-0.00133189,-0.0015038,-0.00140855,-0.0013767,-0.00135936,-0.00150019,-0.00135133,
++      -0.00145148,-0.00140134,-0.00122701,-0.00123942,-0.00126973,-0.0012619,-0.0012754,-0.00135013,-0.00126147,-0.00134569,-0.00131449,-0.00114186,
++      -0.001084,-0.00112564,-0.0010169,-0.000997273,-0.00104628,-0.0010158,-0.00120568,-0.00116305,-0.0011185,-0.00110714,-0.001226,-0.00113284,
++      -0.00117251,-0.00116894,-0.00116507,-0.00126917,-0.00139265,-0.00137919,-0.00142572,-0.00150919,-0.00137283,-0.00135611,-0.00135981,-0.00127538,
++      -0.00129201,-0.00135505,-0.00122616,-0.00114323,-0.00119036,-0.00102133,-0.00101714,-0.00101384,-0.0010363,-0.00108661,-0.00116115,-0.00103275,
++      -0.00104215,-0.00103683,-0.000874175,-0.000885499,-0.000923193,-0.000881731,-0.000872654,-0.000893754,-0.00079172,-0.000806441,-0.000895365,-0.00088039,
++      -0.000985018,-0.001063,-0.00092713,-0.000904952,-0.000926559,-0.000888754,-0.00103608,-0.00108418,-0.00102751,-0.000989219,-0.00104069,-0.00100137,
++      -0.00111026,-0.00109718,-0.00100156,-0.000838558,-0.000824997,-0.000734222,-0.000832397,-0.000931585,-0.000907062,-0.00092875,-0.000994553,-0.000921622,
++      -0.000994981,-0.00112167,-0.00111684,-0.00111508,-0.00110702,-0.000962192,-0.000970102,-0.000972564,-0.00101913,-0.00102297,-0.00119573,-0.00116657,
++      -0.00122073,-0.00123135,-0.00111569,-0.00105654,-0.00107595,-0.00101892,-0.000990525,-0.000993425,-0.000900125,-0.000880781,-0.000868172,-0.000805813,
++      -0.000806258,-0.000782057,-0.000725191,-0.00069234,-0.000683822,-0.000565832,-0.000555373,-0.000538269,-0.000484344,-0.00046581,-0.000482145,-0.00040345,
++      -0.000358682,-0.000353064,-0.000350311,-0.000340613,-0.000347291,-0.000291702,-0.000259463,-0.000244733,-1.29251e-06,4.7737e-07,-2.30702e-07,1.15872e-07,
++      -5.39533e-08,2.10387e-08,-5.3139e-09,2.85595e-13,0,0,0,0,0,0,0,0,
++      0,0,0,0}},
++    /* SR: 85.3 degrees, elevation 17.4 */
++    {{0,0,0,0,0,0,0,0,0,0,0,0,
++      0,0,0,0,0,0,0,0,0,-3.61732e-06,1.20113e-05,-2.6531e-05,
++      5.15972e-05,-9.33695e-05,0.000176749,-0.000437229,0.0796586,0.0967859,0.105434,0.0895272,0.0729632,0.0595886,0.0521755,0.047346,
++      0.0391292,0.0326859,0.0241119,0.0160285,0.00924356,0.00854747,0.0071395,0.00650024,0.00410616,0.00129326,-0.00161635,-0.00229284,
++      -0.00308321,-0.00296471,-0.00234475,-0.0017128,-0.000728016,-0.000350357,-1.97517e-05,0.000288275,0.00134081,0.000963719,0.000389114,0.000251136,
++      -0.000623388,-0.00111381,-0.00167219,-0.00208084,-0.00250586,-0.00263948,-0.003506,-0.00412577,-0.00408698,-0.00440763,-0.00454962,-0.00448089,
++      -0.00477514,-0.00487111,-0.00482303,-0.0047333,-0.00452803,-0.00414503,-0.00417731,-0.00403592,-0.00380273,-0.0038006,-0.00371922,-0.00348106,
++      -0.00358613,-0.00361583,-0.00345893,-0.00351952,-0.00362178,-0.00346766,-0.00356982,-0.00342496,-0.00343028,-0.00353655,-0.0036432,-0.00336672,
++      -0.00340095,-0.00331992,-0.00304701,-0.00305595,-0.0030876,-0.0028506,-0.00301123,-0.00289611,-0.00278884,-0.00278964,-0.00297266,-0.00285736,
++      -0.00298271,-0.00301449,-0.00277947,-0.00299156,-0.00288525,-0.00281767,-0.00280056,-0.00294675,-0.00285064,-0.00289309,-0.00280217,-0.00246417,
++      -0.00245708,-0.0023697,-0.00231651,-0.00227756,-0.00231511,-0.00208064,-0.00218756,-0.0021923,-0.00210134,-0.00210073,-0.00219297,-0.00204237,
++      -0.00208902,-0.00201925,-0.00185349,-0.00183724,-0.00188359,-0.00175317,-0.00182246,-0.00189908,-0.00177453,-0.00181601,-0.00172104,-0.00153071,
++      -0.00152416,-0.00158439,-0.00150205,-0.0014862,-0.00153837,-0.00133189,-0.0015038,-0.00140855,-0.0013767,-0.00135936,-0.00150018,-0.00135133,
++      -0.00145148,-0.00140135,-0.00122701,-0.00123942,-0.00126973,-0.0012619,-0.0012754,-0.00135013,-0.00126148,-0.00134569,-0.0013145,-0.00114186,
++      -0.00108401,-0.00112564,-0.0010169,-0.000997273,-0.00104628,-0.0010158,-0.00120568,-0.00116304,-0.00111849,-0.00110714,-0.00122601,-0.00113284,
++      -0.00117251,-0.00116895,-0.00116507,-0.00126917,-0.00139265,-0.00137919,-0.00142573,-0.00150919,-0.00137283,-0.00135611,-0.00135981,-0.00127538,
++      -0.00129201,-0.00135505,-0.00122616,-0.00114323,-0.00119036,-0.00102132,-0.00101714,-0.00101383,-0.00103629,-0.00108661,-0.00116114,-0.00103275,
++      -0.00104214,-0.00103682,-0.000874173,-0.000885497,-0.000923194,-0.000881729,-0.000872654,-0.000893754,-0.000791722,-0.000806442,-0.000895365,-0.000880389,
++      -0.000985017,-0.001063,-0.000927131,-0.000904953,-0.000926561,-0.000888752,-0.00103608,-0.00108418,-0.00102751,-0.00098922,-0.00104069,-0.00100136,
++      -0.00111026,-0.00109718,-0.00100156,-0.000838557,-0.000824995,-0.00073422,-0.000832395,-0.000931582,-0.000907064,-0.000928751,-0.000994554,-0.000921623,
++      -0.000994982,-0.00112168,-0.00111684,-0.00111509,-0.00110702,-0.000962196,-0.000970104,-0.000972566,-0.00101913,-0.00102297,-0.00119573,-0.00116657,
++      -0.00122072,-0.00123134,-0.00111569,-0.00105653,-0.00107595,-0.00101891,-0.00099052,-0.00099342,-0.000900119,-0.000880776,-0.000868168,-0.000805808,
++      -0.000806255,-0.000782054,-0.00072519,-0.00069234,-0.000683822,-0.000565832,-0.000555374,-0.00053827,-0.000484344,-0.000465811,-0.000482146,-0.000403451,
++      -0.000358683,-0.000353066,-0.000350313,-0.000340614,-0.000347292,-0.000291702,-0.000259464,-0.000244733,-1.29251e-06,4.7737e-07,-2.30702e-07,1.15872e-07,
++      -5.39533e-08,2.10387e-08,-5.31391e-09,2.85595e-13,0,0,0,0,0,0,0,0,
++      0,0,0,0},
++     {0.724523,0.212701,-0.066847,-0.027146,0.0652076,0.074996,0.06282,0.0457086,0.0197894,0.0440561,0.0108294,-0.0444474,
++      -0.0363134,0.024489,0.0075151,-0.00616441,-0.02046,-0.0309893,-0.0281079,-0.00588413,-0.00985568,-0.00520701,0.00661469,0.000912159,
++      -0.00521384,-0.00345409,0.00129142,0.00367162,0.0112089,-0.000983039,-0.0046589,0.00551132,-0.00134929,-0.00355109,-0.00349955,-0.00412943,
++      -0.00469656,-0.00248103,-0.0127367,-0.0146719,-0.00740609,-0.0107557,-0.0119252,-0.00812195,-0.0113008,-0.00991754,-0.00594369,-0.00704778,
++      -0.00757373,-0.0033492,-0.00602146,-0.00440386,-0.000781738,-0.00300575,-0.00313858,-0.000301674,-0.0033907,-0.00315191,4.01806e-05,-0.0016819,
++      -0.00335401,0.000449885,-0.00205611,-0.00193369,-0.00154533,-0.00198519,-0.00214039,0.00106241,-0.00216542,-0.00302354,-2.58174e-06,-0.00132316,
++      -0.0023342,0.00153918,-0.00224278,-0.00126069,0.00100462,-6.73595e-05,-0.00207474,0.00120878,-0.00080851,-0.00179492,0.00183176,-0.000910454,
++      -0.000226989,0.00086643,-0.000361825,-0.00204449,0.000562238,-0.000744959,-0.00142775,0.00161898,-0.000513532,-0.000971075,6.48467e-05,-0.000315714,
++      -0.00182919,0.00109267,-0.000447597,-0.000889807,0.000551788,-0.000206991,-0.00174655,0.000811437,-0.000523487,-0.00102731,0.000572156,-0.000322975,
++      -0.00146822,0.000174181,-0.00101453,-0.00155445,0.000939739,-6.26269e-05,0.000246233,0.00106488,-0.000639065,-0.00143579,0.000335659,0.000209779,
++      -0.00106674,0.00191659,-0.000354321,0.000569101,0.000554702,0.000430318,-0.00102479,0.00139114,-0.000148546,-3.5998e-05,0.00156148,0.000106013,
++      -0.000478824,0.000300577,0.000425602,-0.000527939,0.00097209,-0.000488275,9.59948e-05,0.00179898,0.000695341,-0.00027063,0.000587039,-2.06284e-05,
++      -7.80872e-05,0.0018442,0.000373949,0.000315367,0.00117942,0.000629666,-0.00104612,0.00120548,0.000472123,0.000167033,0.000818556,0.000431227,
++      -0.00037473,0.000900436,0.000477734,-0.000337033,0.00179724,0.000860066,-0.000279938,0.000773263,-0.000199266,-0.000911307,0.00126702,0.00116163,
++      -0.000535601,0.00131881,0.000404193,-8.36155e-05,0.000513385,0.00015077,-0.000254995,0.00129768,0.00071774,0.000106672,0.00205014,0.000652147,
++      -0.000161572,0.00117346,0.00123869,0.000849438,0.00190827,0.000832582,0.0002519,0.0016368,0.00066651,0.000396843,0.0023804,0.00102588,
++      -0.000328668,0.00105411,0.000103364,0.000322849,0.00111458,0.000896916,0.000284149,0.00149263,8.29418e-08,-3.81746e-06,0.000703901,0.00101568,
++      6.77949e-05,0.00124925,-0.000347165,-0.000799966,0.00093965,0.000916203,0.000374324,0.00110896,-0.000200134,-0.000987622,0.000325752,0.00016832,
++      -0.000473773,0.000750727,-0.000431738,-0.000656776,-0.000707003,-0.000509662,-0.00126663,0.00055386,-0.000372023,-0.00145475,-0.000115002,0.000312755,
++      -0.000996306,3.30151e-05,7.861e-05,-0.00089519,0.00028975,3.78734e-05,-0.000782948,-8.09255e-05,-0.000757688,-0.00104781,-1.96894e-05,0.000181388,
++      -0.000709094,0.000591996,-0.000856231,-0.00108113,0.000549982,0.000216803,-0.00103798,0.000445006,-6.53935e-06,-0.000926098,-0.000533168,0.000262523,
++      -0.000619247,0.000303242,-0.000171179,-0.00085359,8.48291e-12,-6.59549e-12,-5.17734e-12,-7.50199e-12,9.46755e-12,6.06709e-14,1.65713e-12,0,
++      0,0,0,0,0,0,0,0,0,0,0,0,
++      0,0,0,0,0,0,0,0,0,0,0,0,
++      0,0,0,0,0,0,0,0,0,0,0,0,
++      0,0,0,0}},
++    /* S5L: -110.0 degrees, elevation 10.2 */
++    {{0.725002,0.209818,-0.0315471,-0.0289862,0.0477346,0.103212,0.107829,0.0465613,0.00583246,0.029341,-0.0166819,-0.0729195,
++      -0.0442896,0.028123,0.0176051,0.00595971,-0.0126975,-0.0308643,-0.0243479,0.00327643,-4.93096e-05,0.00215539,0.00729201,-0.00271478,
++      -0.00652112,-0.00406381,0.00019156,0.00463759,0.0134856,-0.0029538,-0.00952134,-0.000356808,-0.00597229,-0.00597512,-0.00492216,-0.00745103,
++      -0.0106606,-0.00752509,-0.0141698,-0.0138046,-0.00496266,-0.00701368,-0.00688571,-0.00390372,-0.00799811,-0.00627218,-0.00178967,-0.00313541,
++      -0.0044768,-0.00163743,-0.0049714,-0.00267748,0.00155711,-0.00111151,-0.00159081,0.00158787,-0.00137197,-0.000969131,0.00252556,0.000377051,
++      -0.0011401,0.0020402,-0.00131926,-0.00111318,-0.000306151,-0.000523812,-0.00033089,0.00274804,-0.000850923,-0.00088413,0.00251321,0.000744959,
++      -0.00029512,0.00282164,-0.00136245,8.72804e-05,0.00225927,0.00114664,-0.00050149,0.00266245,0.000303666,-0.000815076,0.00252355,-0.00010227,
++      0.00182098,0.00286727,0.00109391,-0.0009454,0.00182742,0.000476429,-3.38743e-05,0.00297696,0.000690401,0.000333512,0.00158779,0.000979981,
++      -0.000409342,0.00265768,0.000641487,-0.000178979,0.000929035,0.000194785,-0.000760812,0.00209095,0.000613112,0.000326937,0.00177023,0.000595169,
++      -0.000454811,0.00147768,0.000472356,0.000160818,0.0025668,0.00117261,0.00141759,0.00198389,0.000506036,-0.000226142,0.00159704,0.00136542,
++      0.0003607,0.00305897,0.000555155,0.00171583,0.00156005,0.00153075,0.000276516,0.00266479,0.00126615,0.00156453,0.00304982,0.00166196,
++      0.00113074,0.001618,0.00169015,0.000832396,0.00193453,0.000250393,0.00163246,0.00361809,0.00205507,0.000873355,0.00165067,0.00119688,
++      0.00134517,0.00301711,0.0014359,0.00193525,0.00262875,0.00169505,9.82696e-05,0.00288275,0.00245828,0.00220044,0.00199257,0.00128067,
++      0.000394167,0.00189589,0.00130069,0.000538399,0.00248492,0.00163841,0.000646474,0.0017495,0.00103521,0.000925385,0.00329321,0.00287924,
++      0.0010078,0.00276794,0.00165147,0.00132593,0.00200251,0.00151136,0.00122168,0.00314899,0.00224223,0.00161982,0.00333107,0.00164963,
++      0.00110946,0.0025129,0.00224672,0.00193083,0.00305075,0.00173608,0.000953367,0.00252478,0.00173073,0.00197933,0.00410607,0.00230079,
++      0.000860654,0.00217037,0.00129929,0.00170428,0.00254854,0.00221597,0.00143182,0.00259203,0.0013352,0.00167118,0.00256904,0.00299873,
++      0.00174021,0.00270999,0.00106394,0.000805173,0.00244644,0.00236261,0.0015625,0.00172548,7.6169e-05,-0.000224144,0.00158748,0.00153827,
++      0.00116876,0.00248282,0.000687367,0.000516645,0.000710549,0.00112604,0.000438004,0.00223042,0.000802904,-0.000349459,0.00101774,0.00146815,
++      0.000407906,0.00163366,0.00145806,0.00024849,0.00123389,0.000610751,-1.87757e-05,0.00129,0.000638362,-2.3892e-05,0.000806718,0.0011694,
++      0.000666528,0.00214017,0.000620246,0.000334245,0.00195856,0.00176913,0.000620326,0.0020559,0.00139574,0.000401401,0.000688754,0.0012094,
++      0.000217109,0.00156273,0.00127053,0.000737942,-5.43309e-12,3.12574e-11,-6.09035e-12,-5.68956e-12,-1.1436e-11,-2.25441e-12,-1.43262e-12,0,
++      0,0,0,0,0,0,0,0,0,0,0,0,
++      0,0,0,0,0,0,0,0,0,0,0,0,
++      0,0,0,0,0,0,0,0,0,0,0,0,
++      0,0,0,0},
++     {0,0,0,0,0,0,0,0,0,0,0,0,
++      0,0,0,0,0,-7.29388e-07,5.92061e-05,-0.000171563,0.000370799,-0.000690233,0.00124579,-0.00239546,
++      0.00652131,0.0717897,0.0727735,0.0677008,0.0580202,0.0570338,0.0504749,0.0447774,0.0414539,0.0376267,0.0370843,0.0360436,
++      0.0337932,0.029489,0.0271968,0.0223769,0.0174477,0.0110061,0.00611319,0.00219782,0.000165117,-0.00230713,-0.00344918,-0.00360812,
++      -0.00370343,-0.00389531,-0.00415803,-0.00402065,-0.00365295,-0.00290345,-0.00311943,-0.00285135,-0.00189146,-0.0017178,-0.00158864,-0.00163392,
++      -0.0015279,-0.00139379,-0.00135655,-0.00222549,-0.00269748,-0.00270658,-0.00328437,-0.00396613,-0.00436796,-0.00487134,-0.00509414,-0.00520613,
++      -0.00539722,-0.00544439,-0.00527682,-0.00544105,-0.00543232,-0.00535629,-0.00537818,-0.00515319,-0.00485516,-0.00485681,-0.00470543,-0.00445881,
++      -0.00451821,-0.00463302,-0.00444847,-0.00443077,-0.00420144,-0.00412837,-0.00418551,-0.00422738,-0.00397703,-0.004078,-0.00420606,-0.00417983,
++      -0.00428584,-0.00428558,-0.00398669,-0.00405026,-0.00392148,-0.00378533,-0.00378472,-0.00393101,-0.00380484,-0.00392286,-0.00385222,-0.00356045,
++      -0.0036558,-0.00367164,-0.00367558,-0.00372066,-0.0038455,-0.00374874,-0.00375493,-0.00358912,-0.00327437,-0.00326461,-0.00321044,-0.00317911,
++      -0.00315726,-0.00318361,-0.00299021,-0.00300915,-0.0028419,-0.00257681,-0.00250225,-0.00256644,-0.00244582,-0.00252992,-0.00255414,-0.00246523,
++      -0.00249355,-0.00253415,-0.00244403,-0.00257134,-0.00268605,-0.00262918,-0.00267909,-0.00258692,-0.00241773,-0.00246313,-0.00247553,-0.00232095,
++      -0.00228087,-0.00234245,-0.0022013,-0.00234929,-0.00229688,-0.00224601,-0.00224988,-0.00234725,-0.00216588,-0.0022512,-0.00222274,-0.00213763,
++      -0.00223883,-0.00230416,-0.00225387,-0.00224623,-0.00225077,-0.00206262,-0.00206453,-0.00206228,-0.00198077,-0.00194302,-0.00195282,-0.00185875,
++      -0.00188953,-0.0019251,-0.00184663,-0.00190693,-0.00189288,-0.00187564,-0.00190036,-0.00200029,-0.00195522,-0.00209907,-0.00217055,-0.00211404,
++      -0.0021402,-0.00216091,-0.0020907,-0.00206334,-0.00207298,-0.00188848,-0.00186372,-0.00184129,-0.00174818,-0.00174937,-0.00181497,-0.0017404,
++      -0.00171714,-0.00174728,-0.00161596,-0.00161026,-0.00158342,-0.00157435,-0.0015879,-0.00164809,-0.00162874,-0.00171004,-0.0017233,-0.00154399,
++      -0.00151067,-0.00151939,-0.00142017,-0.00133395,-0.00128922,-0.00118832,-0.00123301,-0.00128776,-0.00126261,-0.00135911,-0.00146426,-0.00139883,
++      -0.00142612,-0.00146106,-0.00141864,-0.00152738,-0.00155271,-0.00152333,-0.00153406,-0.00156051,-0.0015078,-0.00162132,-0.00166727,-0.00166434,
++      -0.00164308,-0.00165025,-0.00153325,-0.00157545,-0.00160543,-0.00150993,-0.00147964,-0.00144879,-0.00127558,-0.0012461,-0.0012964,-0.00127711,
++      -0.00128074,-0.0013293,-0.00131764,-0.00138393,-0.00145502,-0.00155872,-0.00165135,-0.00181902,-0.00178772,-0.00179154,-0.00176355,-0.00165742,
++      -0.00162291,-0.00164322,-0.00157045,-0.00153858,-0.0015156,-0.0013601,-0.00123332,-0.00113234,-0.00106003,-0.00105307,-0.00099576,-0.000901575,
++      -0.000883781,-0.000881928,-0.000770472,-0.000751959,-0.000699435,-0.00062275,-0.000628847,-0.000666983,-0.000608764,-0.000585295,-0.000584765,-0.000552932,
++      -0.00048604,-0.000442741,-0.000353884,-0.000353066,-0.000298841,2.36001e-05,-9.53102e-06,4.72592e-06,-2.41302e-06,1.11271e-06,-4.35559e-07,9.1781e-08,
++      0,0,0,0,0,0,0,0,0,0,0,0,
++      0,0,0,0}},
++    /* S5R: 110.0 degrees, elevation 10.2 */
++    {{0,0,0,0,0,0,0,0,0,0,0,0,
++      0,0,0,0,0,-7.29388e-07,5.92061e-05,-0.000171563,0.000370799,-0.000690233,0.00124579,-0.00239546,
++      0.00652131,0.0717897,0.0727735,0.0677008,0.0580202,0.0570338,0.0504749,0.0447774,0.0414539,0.0376267,0.0370843,0.0360436,
++      0.0337932,0.029489,0.0271968,0.0223769,0.0174477,0.0110061,0.00611319,0.00219782,0.000165117,-0.00230713,-0.00344918,-0.00360812,
++      -0.00370343,-0.00389531,-0.00415803,-0.00402065,-0.00365295,-0.00290345,-0.00311943,-0.00285135,-0.00189146,-0.0017178,-0.00158864,-0.00163392,
++      -0.0015279,-0.00139379,-0.00135655,-0.00222549,-0.00269748,-0.00270658,-0.00328437,-0.00396613,-0.00436796,-0.00487134,-0.00509414,-0.00520613,
++      -0.00539722,-0.00544439,-0.00527682,-0.00544105,-0.00543232,-0.00535629,-0.00537818,-0.00515319,-0.00485516,-0.00485681,-0.00470543,-0.00445881,
++      -0.00451821,-0.00463302,-0.00444847,-0.00443077,-0.00420144,-0.00412837,-0.00418551,-0.00422738,-0.00397703,-0.004078,-0.00420606,-0.00417983,
++      -0.00428584,-0.00428558,-0.00398669,-0.00405026,-0.00392148,-0.00378533,-0.00378472,-0.00393101,-0.00380484,-0.00392286,-0.00385222,-0.00356045,
++      -0.0036558,-0.00367164,-0.00367558,-0.00372066,-0.0038455,-0.00374874,-0.00375493,-0.00358912,-0.00327437,-0.00326461,-0.00321044,-0.00317911,
++      -0.00315726,-0.00318361,-0.00299021,-0.00300915,-0.0028419,-0.00257681,-0.00250225,-0.00256644,-0.00244582,-0.00252992,-0.00255414,-0.00246523,
++      -0.00249355,-0.00253415,-0.00244403,-0.00257134,-0.00268605,-0.00262918,-0.00267909,-0.00258692,-0.00241773,-0.00246313,-0.00247553,-0.00232095,
++      -0.00228087,-0.00234245,-0.0022013,-0.00234929,-0.00229688,-0.00224601,-0.00224988,-0.00234725,-0.00216588,-0.0022512,-0.00222274,-0.00213763,
++      -0.00223883,-0.00230416,-0.00225387,-0.00224623,-0.00225077,-0.00206262,-0.00206453,-0.00206228,-0.00198077,-0.00194302,-0.00195282,-0.00185875,
++      -0.00188953,-0.0019251,-0.00184663,-0.00190693,-0.00189288,-0.00187564,-0.00190036,-0.00200029,-0.00195522,-0.00209907,-0.00217055,-0.00211404,
++      -0.0021402,-0.00216091,-0.0020907,-0.00206334,-0.00207298,-0.00188848,-0.00186372,-0.00184129,-0.00174818,-0.00174937,-0.00181497,-0.0017404,
++      -0.00171714,-0.00174728,-0.00161596,-0.00161026,-0.00158342,-0.00157435,-0.0015879,-0.00164809,-0.00162874,-0.00171004,-0.0017233,-0.00154399,
++      -0.00151067,-0.00151939,-0.00142017,-0.00133395,-0.00128922,-0.00118832,-0.00123301,-0.00128776,-0.00126261,-0.00135911,-0.00146426,-0.00139883,
++      -0.00142612,-0.00146106,-0.00141864,-0.00152738,-0.00155271,-0.00152333,-0.00153406,-0.00156051,-0.0015078,-0.00162132,-0.00166727,-0.00166434,
++      -0.00164308,-0.00165025,-0.00153325,-0.00157545,-0.00160543,-0.00150993,-0.00147964,-0.00144879,-0.00127558,-0.0012461,-0.0012964,-0.00127711,
++      -0.00128074,-0.0013293,-0.00131764,-0.00138393,-0.00145502,-0.00155872,-0.00165135,-0.00181902,-0.00178772,-0.00179154,-0.00176355,-0.00165742,
++      -0.00162291,-0.00164322,-0.00157045,-0.00153858,-0.0015156,-0.0013601,-0.00123332,-0.00113234,-0.00106003,-0.00105307,-0.00099576,-0.000901575,
++      -0.000883781,-0.000881928,-0.000770472,-0.000751959,-0.000699435,-0.00062275,-0.000628847,-0.000666983,-0.000608764,-0.000585295,-0.000584765,-0.000552932,
++      -0.00048604,-0.000442741,-0.000353884,-0.000353066,-0.000298841,2.36001e-05,-9.53102e-06,4.72592e-06,-2.41302e-06,1.11271e-06,-4.35559e-07,9.1781e-08,
++      0,0,0,0,0,0,0,0,0,0,0,0,
++      0,0,0,0},
++     {0.725002,0.209818,-0.0315471,-0.0289862,0.0477346,0.103212,0.107829,0.0465613,0.00583246,0.029341,-0.0166819,-0.0729195,
++      -0.0442896,0.028123,0.0176051,0.00595971,-0.0126975,-0.0308643,-0.0243479,0.00327643,-4.93096e-05,0.00215539,0.00729201,-0.00271478,
++      -0.00652112,-0.00406381,0.00019156,0.00463759,0.0134856,-0.0029538,-0.00952134,-0.000356808,-0.00597229,-0.00597512,-0.00492216,-0.00745103,
++      -0.0106606,-0.00752509,-0.0141698,-0.0138046,-0.00496266,-0.00701368,-0.00688571,-0.00390372,-0.00799811,-0.00627218,-0.00178967,-0.00313541,
++      -0.0044768,-0.00163743,-0.0049714,-0.00267748,0.00155711,-0.00111151,-0.00159081,0.00158787,-0.00137197,-0.000969131,0.00252556,0.000377051,
++      -0.0011401,0.0020402,-0.00131926,-0.00111318,-0.000306151,-0.000523812,-0.00033089,0.00274804,-0.000850923,-0.00088413,0.00251321,0.000744959,
++      -0.00029512,0.00282164,-0.00136245,8.72804e-05,0.00225927,0.00114664,-0.00050149,0.00266245,0.000303666,-0.000815076,0.00252355,-0.00010227,
++      0.00182098,0.00286727,0.00109391,-0.0009454,0.00182742,0.000476429,-3.38743e-05,0.00297696,0.000690401,0.000333512,0.00158779,0.000979981,
++      -0.000409342,0.00265768,0.000641487,-0.000178979,0.000929035,0.000194785,-0.000760812,0.00209095,0.000613112,0.000326937,0.00177023,0.000595169,
++      -0.000454811,0.00147768,0.000472356,0.000160818,0.0025668,0.00117261,0.00141759,0.00198389,0.000506036,-0.000226142,0.00159704,0.00136542,
++      0.0003607,0.00305897,0.000555155,0.00171583,0.00156005,0.00153075,0.000276516,0.00266479,0.00126615,0.00156453,0.00304982,0.00166196,
++      0.00113074,0.001618,0.00169015,0.000832396,0.00193453,0.000250393,0.00163246,0.00361809,0.00205507,0.000873355,0.00165067,0.00119688,
++      0.00134517,0.00301711,0.0014359,0.00193525,0.00262875,0.00169505,9.82696e-05,0.00288275,0.00245828,0.00220044,0.00199257,0.00128067,
++      0.000394167,0.00189589,0.00130069,0.000538399,0.00248492,0.00163841,0.000646474,0.0017495,0.00103521,0.000925385,0.00329321,0.00287924,
++      0.0010078,0.00276794,0.00165147,0.00132593,0.00200251,0.00151136,0.00122168,0.00314899,0.00224223,0.00161982,0.00333107,0.00164963,
++      0.00110946,0.0025129,0.00224672,0.00193083,0.00305075,0.00173608,0.000953367,0.00252478,0.00173073,0.00197933,0.00410607,0.00230079,
++      0.000860654,0.00217037,0.00129929,0.00170428,0.00254854,0.00221597,0.00143182,0.00259203,0.0013352,0.00167118,0.00256904,0.00299873,
++      0.00174021,0.00270999,0.00106394,0.000805173,0.00244644,0.00236261,0.0015625,0.00172548,7.6169e-05,-0.000224144,0.00158748,0.00153827,
++      0.00116876,0.00248282,0.000687367,0.000516645,0.000710549,0.00112604,0.000438004,0.00223042,0.000802904,-0.000349459,0.00101774,0.00146815,
++      0.000407906,0.00163366,0.00145806,0.00024849,0.00123389,0.000610751,-1.87757e-05,0.00129,0.000638362,-2.3892e-05,0.000806718,0.0011694,
++      0.000666528,0.00214017,0.000620246,0.000334245,0.00195856,0.00176913,0.000620326,0.0020559,0.00139574,0.000401401,0.000688754,0.0012094,
++      0.000217109,0.00156273,0.00127053,0.000737942,-5.43309e-12,3.12574e-11,-6.09035e-12,-5.68956e-12,-1.1436e-11,-2.25441e-12,-1.43262e-12,0,
++      0,0,0,0,0,0,0,0,0,0,0,0,
++      0,0,0,0,0,0,0,0,0,0,0,0,
++      0,0,0,0,0,0,0,0,0,0,0,0,
++      0,0,0,0}},
++    /* BL: -136.8 degrees, elevation 3.0 */
++    {{0.47945,0.165871,0.0464429,0.0751822,0.112647,0.0980115,0.0695203,0.0308174,0.0187379,0.0407793,0.0169479,-0.0318227,
++      -0.0265498,0.0180683,0.0110589,-0.000340811,-0.00862169,-0.0166091,-0.0217321,-0.0136784,-0.0182629,-0.013018,-0.00367142,-0.007062,
++      -0.010723,-0.0123202,-0.0104304,-0.00764785,-0.000789128,-0.00874209,-0.00973459,-0.00428317,-0.00944568,-0.00966249,-0.00693407,-0.00569712,
++      -0.00471657,-0.00307395,-0.00878123,-0.00923905,-0.00393058,-0.00610209,-0.00662332,-0.00411124,-0.00579694,-0.00567249,-0.00396028,-0.00391105,
++      -0.00295758,-0.000661005,-0.00264743,-0.00204933,-0.00029726,-0.00218137,-0.00177108,0.000593675,-0.00109006,-0.00128828,0.000283249,-0.00122754,
++      -0.00186931,0.000846256,-0.000549249,-0.0001501,-0.000108697,-0.00101436,-0.00109513,0.00111104,-0.000698851,-0.000735063,0.00123597,0.000128781,
++      -0.000510293,0.00166631,-0.000958515,0.000115652,0.00124561,0.000225675,-0.00105067,0.00085082,-0.000636098,-0.00119548,0.00116603,-0.000848213,
++      -0.000297415,0.000105995,-0.000587718,-0.00168632,5.30172e-05,-0.000611445,-0.000914923,0.000712507,-0.000846563,-0.000896528,-2.55147e-05,-0.000207455,
++      -0.0011057,0.000627921,-0.000584695,-0.000802939,5.44328e-05,-0.000527139,-0.00123364,0.000607766,-0.000284081,-0.000447313,0.000711573,8.71388e-05,
++      -0.000516139,0.000513752,-0.000365644,-0.000731426,0.000799349,-3.89011e-05,0.000300117,0.000852449,-0.000172005,-0.000502068,0.00063238,0.000163124,
++      -0.000741794,0.00101655,-0.00066745,0.000101143,0.000145196,-6.31846e-05,-0.00110739,0.000596441,-0.000301311,5.41528e-05,0.00128041,0.000304351,
++      -5.78553e-05,0.00039713,0.000648831,8.12139e-05,0.000870696,-0.000344203,0.000293384,0.00151921,0.000908017,0.000509782,0.0010776,0.000549585,
++      0.000362601,0.00141963,0.000273499,0.000408477,0.000963681,0.000771064,-0.000218609,0.00147979,0.000851739,0.000581076,0.000705694,0.000667903,
++      0.000177287,0.000851103,0.000298779,-0.000140407,0.00124182,0.000808213,0.000385196,0.00122152,0.000642828,0.00027712,0.00159349,0.00140919,
++      0.000447949,0.00192796,0.00125778,0.000936086,0.00121107,0.00104882,0.000751588,0.00173111,0.00103098,0.000703459,0.0018861,0.000937766,
++      0.000503949,0.00142878,0.00139423,0.00113166,0.00164915,0.000774449,0.00028303,0.00112067,0.000447465,0.000392651,0.00159946,0.000689867,
++      -3.3338e-05,0.000891988,0.000180055,0.000295311,0.000580517,0.000427366,0.000192309,0.00118386,0.000233011,0.000252068,0.000681032,0.00103646,
++      0.000538227,0.00146435,0.000331252,-0.000185363,0.000701202,0.000564112,-6.30671e-05,0.00042935,-0.000408899,-0.000570705,0.000319218,0.000291899,
++      -8.26808e-06,0.00104854,0.000115306,-4.6778e-05,-0.000219256,-0.000133045,-0.000608966,0.000577504,-0.000178927,-0.000750483,5.17319e-05,0.00019295,
++      -0.000526033,0.000287942,0.000255128,-0.000354133,0.00046258,0.000254098,-0.000143112,0.000315324,-6.8509e-05,-0.000161952,0.000416456,0.000371214,
++      -9.68187e-05,0.000850146,-6.06373e-05,-0.000156765,0.000789661,0.000499763,-0.00030493,0.000793774,0.000571287,-1.04395e-05,0.000201402,0.000564776,
++      -4.66718e-05,0.000709004,0.000389695,-3.07835e-05,1.1407e-12,8.14277e-12,-4.63829e-12,-4.72219e-12,-9.13122e-13,-7.74344e-13,5.9762e-14,0,
++      0,0,0,0,0,0,0,0,0,0,0,0,
++      0,0,0,0,0,0,0,0,0,0,0,0,
++      0,0,0,0,0,0,0,0,0,0,0,0,
++      0,0,0,0},
++     {0,0,0,0,0,0,0,0,0,-3.53374e-07,6.18837e-05,-0.000190842,
++      0.000407026,-0.000760595,0.00136566,-0.00261153,0.00691452,0.118607,0.116881,0.0885235,0.0600161,0.0528388,0.0415981,0.0356141,
++      0.0316928,0.0238863,0.0227998,0.0215677,0.0181309,0.0110006,0.0105809,0.00820982,0.00776843,0.00456701,0.00272597,0.00297893,
++      0.00597244,0.00595316,0.00561506,0.00611936,0.00703415,0.00796185,0.00849064,0.00896191,0.00953101,0.0104673,0.00876679,0.00701105,
++      0.00683513,0.00572641,0.00463526,0.00333918,0.00203757,0.000812595,0.000406674,-0.00119882,-0.00233868,-0.00232352,-0.00279496,-0.00308172,
++      -0.00290509,-0.00329911,-0.00322101,-0.00271018,-0.00255585,-0.00253555,-0.00206702,-0.00226582,-0.00201847,-0.0016061,-0.00169923,-0.001756,
++      -0.00148735,-0.00179658,-0.00193141,-0.00168938,-0.0018331,-0.00205637,-0.00183366,-0.00205487,-0.00205626,-0.00212355,-0.0022296,-0.00227128,
++      -0.00178342,-0.00192675,-0.0019779,-0.00168117,-0.00177165,-0.00186175,-0.00144073,-0.00163662,-0.00154922,-0.00127112,-0.00125078,-0.00151341,
++      -0.00123982,-0.00139271,-0.00142675,-0.00109046,-0.00127495,-0.00117562,-0.00102568,-0.00109822,-0.00131696,-0.00108434,-0.00120502,-0.00116431,
++      -0.000734858,-0.000775915,-0.000741631,-0.000637426,-0.000690653,-0.000891339,-0.000610295,-0.000778951,-0.000790575,-0.000555343,-0.000515339,-0.000732726,
++      -0.000581196,-0.000731629,-0.000760895,-0.000567353,-0.000594715,-0.000775162,-0.000611739,-0.000702542,-0.000801583,-0.000585931,-0.000586338,-0.000449995,
++      -0.000241059,-0.000337469,-0.000492017,-0.000312677,-0.000244732,-0.000318847,-3.11491e-05,-0.00019817,-6.64395e-05,-2.27594e-06,-1.0027e-05,-0.000220774,
++      4e-05,-8.61181e-05,-9.70482e-05,3.95272e-05,-5.32839e-05,-0.000196818,-0.000128005,-0.000154261,-0.000290218,-0.000149267,-0.000240545,-0.000240419,
++      -0.000110217,-6.06264e-05,-0.000151412,-6.57331e-05,-0.000123615,-0.000172035,-3.73452e-05,-0.000126691,-9.57142e-05,3.29882e-06,4.48268e-05,-0.000130295,
++      -3.998e-05,-0.000172988,-0.000218837,-0.00013694,-0.000253624,-0.000427796,-0.000353656,-0.000349787,-0.000459082,-0.000242043,-0.00027736,-0.000381133,
++      -0.000316912,-0.000411908,-0.000586188,-0.00037581,-0.000257224,-0.000359345,-0.000206367,-0.000238876,-0.000292793,-0.000304666,-0.000390083,-0.00050288,
++      -0.00031905,-0.000265053,-0.000246707,3.33303e-05,2.28019e-05,-9.25858e-05,-4.23223e-05,-3.42779e-05,-6.93073e-05,0.000129708,0.000145454,7.17164e-05,
++      0.00019603,0.00014606,7.91449e-05,0.000270366,0.000231631,0.000148542,0.000270594,0.000154079,9.32861e-05,0.00016571,0.000193188,0.000144825,
++      0.000227043,9.73824e-05,0.000127191,0.000273194,0.000367855,0.000286889,0.000385579,0.000211825,7.44988e-05,0.000152925,0.000167664,0.000225073,
++      0.000439225,0.000371774,0.000119775,0.000122607,6.41774e-05,-4.19118e-05,3.15582e-05,3.16322e-05,5.39134e-05,-9.58289e-06,-5.88772e-05,-0.00029452,
++      -0.000206705,-0.000230195,-0.000283071,-0.000126159,1.09003e-06,-7.53143e-05,-3.83421e-05,-4.74054e-06,-6.13442e-05,6.18947e-05,7.25548e-05,4.76724e-05,
++      0.00013505,4.9247e-05,-2.1551e-06,8.23183e-05,0.000142177,0.000123209,0.000306284,0.000222708,0.000176587,0.000269786,0.000248316,0.000135125,
++      0.000232265,0.000229041,0.00012118,8.57703e-05,0.000123841,8.53719e-05,0.000145479,0.000141122,9.11027e-05,-4.60277e-06,1.7811e-06,-8.62322e-07,
++      4.38134e-07,-2.11545e-07,9.58068e-08,-2.52126e-08,0,0,0,0,0,0,0,0,
++      0,0,0,0,0,0,0,0,0,0,0,0,
++      0,0,0,0}},
++    /* BR: 136.8 degrees, elevation 3.0 */
++    {{0,0,0,0,0,0,0,0,0,-3.53374e-07,6.18837e-05,-0.000190842,
++      0.000407026,-0.000760595,0.00136566,-0.00261153,0.00691452,0.118607,0.116881,0.0885235,0.0600161,0.0528388,0.0415981,0.0356141,
++      0.0316928,0.0238863,0.0227998,0.0215677,0.0181309,0.0110006,0.010581,0.00820982,0.00776843,0.00456701,0.00272597,0.00297893,
++      0.00597244,0.00595316,0.00561506,0.00611936,0.00703415,0.00796185,0.00849064,0.00896191,0.00953101,0.0104673,0.00876679,0.00701105,
++      0.00683513,0.00572641,0.00463526,0.00333918,0.00203757,0.000812594,0.000406671,-0.00119882,-0.00233868,-0.00232352,-0.00279496,-0.00308172,
++      -0.00290509,-0.00329911,-0.00322101,-0.00271019,-0.00255585,-0.00253555,-0.00206703,-0.00226582,-0.00201847,-0.0016061,-0.00169923,-0.00175601,
++      -0.00148735,-0.00179658,-0.00193141,-0.00168938,-0.00183311,-0.00205638,-0.00183366,-0.00205487,-0.00205626,-0.00212355,-0.0022296,-0.00227128,
++      -0.00178342,-0.00192675,-0.0019779,-0.00168117,-0.00177165,-0.00186175,-0.00144072,-0.00163661,-0.00154922,-0.00127111,-0.00125078,-0.00151341,
++      -0.00123982,-0.00139271,-0.00142675,-0.00109046,-0.00127494,-0.00117562,-0.00102568,-0.00109822,-0.00131696,-0.00108434,-0.00120502,-0.00116431,
++      -0.000734857,-0.000775914,-0.00074163,-0.000637425,-0.000690652,-0.000891337,-0.000610295,-0.000778951,-0.000790574,-0.000555342,-0.000515338,-0.000732725,
++      -0.000581197,-0.000731629,-0.000760894,-0.000567352,-0.000594715,-0.000775162,-0.000611739,-0.000702541,-0.000801582,-0.000585931,-0.000586335,-0.000449992,
++      -0.000241057,-0.000337469,-0.000492016,-0.000312676,-0.000244732,-0.000318848,-3.11486e-05,-0.00019817,-6.64407e-05,-2.27704e-06,-1.00276e-05,-0.000220775,
++      3.99993e-05,-8.6118e-05,-9.70461e-05,3.95273e-05,-5.32847e-05,-0.000196817,-0.000128007,-0.000154261,-0.000290218,-0.000149268,-0.000240545,-0.000240421,
++      -0.000110219,-6.06265e-05,-0.000151414,-6.57336e-05,-0.000123615,-0.000172034,-3.73421e-05,-0.000126691,-9.57146e-05,3.29887e-06,4.48262e-05,-0.000130295,
++      -3.99809e-05,-0.00017299,-0.000218838,-0.000136941,-0.000253625,-0.000427797,-0.000353655,-0.000349787,-0.000459082,-0.000242043,-0.000277358,-0.000381134,
++      -0.000316912,-0.000411908,-0.000586187,-0.000375809,-0.000257223,-0.000359343,-0.000206367,-0.000238876,-0.000292793,-0.000304666,-0.000390081,-0.000502879,
++      -0.00031905,-0.000265052,-0.000246705,3.3329e-05,2.28029e-05,-9.25851e-05,-4.23201e-05,-3.42763e-05,-6.93068e-05,0.00012971,0.000145457,7.17187e-05,
++      0.000196032,0.000146061,7.91469e-05,0.000270366,0.000231633,0.000148544,0.000270597,0.00015408,9.32863e-05,0.00016571,0.000193188,0.000144826,
++      0.000227044,9.73816e-05,0.000127191,0.000273195,0.000367855,0.00028689,0.000385579,0.000211824,7.44966e-05,0.000152923,0.000167661,0.000225072,
++      0.000439223,0.000371772,0.000119774,0.000122606,6.4177e-05,-4.19122e-05,3.15581e-05,3.16321e-05,5.39125e-05,-9.58442e-06,-5.88787e-05,-0.000294521,
++      -0.000206706,-0.000230195,-0.000283072,-0.000126159,1.08903e-06,-7.53157e-05,-3.83424e-05,-4.74147e-06,-6.13453e-05,6.18936e-05,7.25528e-05,4.76718e-05,
++      0.000135049,4.92465e-05,-2.15599e-06,8.23186e-05,0.000142177,0.000123208,0.000306281,0.000222705,0.000176586,0.000269786,0.000248316,0.000135125,
++      0.000232265,0.000229042,0.00012118,8.57708e-05,0.000123842,8.53722e-05,0.000145481,0.000141123,9.11038e-05,-4.60284e-06,1.78113e-06,-8.62334e-07,
++      4.3814e-07,-2.11548e-07,9.58081e-08,-2.52129e-08,0,0,0,0,0,0,0,0,
++      0,0,0,0,0,0,0,0,0,0,0,0,
++      0,0,0,0},
++     {0.47945,0.165871,0.0464429,0.0751822,0.112647,0.0980115,0.0695203,0.0308174,0.0187379,0.0407792,0.0169479,-0.0318227,
++      -0.0265498,0.0180683,0.0110589,-0.00034081,-0.00862168,-0.0166091,-0.0217321,-0.0136784,-0.0182629,-0.013018,-0.00367142,-0.00706201,
++      -0.010723,-0.0123202,-0.0104304,-0.00764785,-0.000789127,-0.00874209,-0.00973459,-0.00428317,-0.00944567,-0.00966249,-0.00693407,-0.00569712,
++      -0.00471657,-0.00307395,-0.00878123,-0.00923905,-0.00393057,-0.00610209,-0.00662332,-0.00411124,-0.00579693,-0.00567249,-0.00396028,-0.00391105,
++      -0.00295757,-0.000661003,-0.00264743,-0.00204933,-0.000297256,-0.00218137,-0.00177108,0.000593674,-0.00109006,-0.00128828,0.000283248,-0.00122754,
++      -0.00186931,0.000846256,-0.000549248,-0.000150103,-0.000108702,-0.00101436,-0.00109513,0.00111104,-0.000698854,-0.000735061,0.00123597,0.000128781,
++      -0.000510293,0.00166632,-0.000958513,0.000115654,0.00124561,0.000225675,-0.00105068,0.000850817,-0.000636102,-0.00119548,0.00116603,-0.000848215,
++      -0.000297418,0.000105992,-0.000587721,-0.00168632,5.30132e-05,-0.000611442,-0.000914923,0.000712504,-0.000846569,-0.000896529,-2.55124e-05,-0.000207453,
++      -0.0011057,0.00062792,-0.000584694,-0.000802936,5.44317e-05,-0.000527139,-0.00123364,0.000607769,-0.000284079,-0.000447313,0.000711571,8.71368e-05,
++      -0.000516137,0.000513753,-0.000365641,-0.000731428,0.000799356,-3.88981e-05,0.000300119,0.00085245,-0.000172,-0.000502068,0.000632382,0.000163126,
++      -0.000741792,0.00101655,-0.00066745,0.000101139,0.0001452,-6.31843e-05,-0.00110739,0.000596449,-0.000301317,5.41528e-05,0.00128041,0.000304355,
++      -5.78477e-05,0.000397136,0.000648831,8.1217e-05,0.000870697,-0.000344203,0.000293385,0.00151921,0.000908019,0.000509777,0.0010776,0.000549585,
++      0.00036261,0.00141964,0.000273501,0.000408479,0.000963683,0.000771066,-0.000218608,0.00147979,0.000851735,0.000581077,0.000705696,0.000667903,
++      0.000177284,0.000851102,0.000298779,-0.000140412,0.0012418,0.00080821,0.000385197,0.00122152,0.000642819,0.000277115,0.0015935,0.00140918,
++      0.000447939,0.00192795,0.00125778,0.000936086,0.00121107,0.00104881,0.000751584,0.00173111,0.00103097,0.000703455,0.0018861,0.000937767,
++      0.000503947,0.00142878,0.00139423,0.00113166,0.00164915,0.000774448,0.000283027,0.00112066,0.000447463,0.00039265,0.00159946,0.000689864,
++      -3.33427e-05,0.000891984,0.000180055,0.00029531,0.00058052,0.000427364,0.000192312,0.00118387,0.000233016,0.000252072,0.000681032,0.00103646,
++      0.000538231,0.00146436,0.000331253,-0.00018536,0.00070121,0.000564118,-6.30678e-05,0.000429351,-0.000408895,-0.000570703,0.000319218,0.000291899,
++      -8.2734e-06,0.00104854,0.00011531,-4.67788e-05,-0.000219256,-0.000133045,-0.000608965,0.000577505,-0.000178944,-0.000750486,5.17319e-05,0.000192947,
++      -0.000526034,0.000287939,0.000255126,-0.000354133,0.000462577,0.0002541,-0.000143111,0.000315328,-6.8507e-05,-0.00016195,0.000416455,0.000371214,
++      -9.68148e-05,0.00085015,-6.0638e-05,-0.000156762,0.000789661,0.000499763,-0.000304931,0.00079377,0.000571289,-1.04403e-05,0.000201401,0.000564772,
++      -4.6685e-05,0.000709008,0.000389696,-3.07864e-05,1.14067e-12,8.1429e-12,-4.63832e-12,-4.7222e-12,-9.13094e-13,-7.74346e-13,5.97677e-14,0,
++      0,0,0,0,0,0,0,0,0,0,0,0,
++      0,0,0,0,0,0,0,0,0,0,0,0,
++      0,0,0,0,0,0,0,0,0,0,0,0,
++      0,0,0,0}},
++    /* BC: 180.0 degrees, elevation 3.0 */
++    {{0.233127,0.190752,0.112629,0.0720061,0.0649938,0.04966,0.041847,0.035701,0.0233294,0.0272711,0.0243578,0.00749897,
++      -0.00657176,0.00191998,0.00306622,0.00341823,-0.00104047,-0.00541028,-0.00859742,-0.00575574,-0.00769093,-0.00690181,-0.0028177,-0.000681107,
++      -0.000100805,-0.000515379,-0.000424202,0.000150557,0.00263219,0.000244897,-0.00110279,0.00112924,-6.83438e-05,-0.000930225,-0.00148671,-0.0018467,
++      -0.00216212,-0.00122353,-0.00327073,-0.00441772,-0.00311002,-0.00359307,-0.00410066,-0.00335634,-0.00384114,-0.00357937,-0.00262812,-0.00239331,
++      -0.00230248,-0.00135841,-0.00186529,-0.001568,-0.000684641,-0.000996461,-0.00106228,-0.000333949,-0.000960483,-0.00116551,-0.000576562,-0.000932607,
++      -0.00143408,-0.000553519,-0.000951695,-0.000883154,-0.000945246,-0.00126464,-0.00145659,-0.000455481,-0.000906461,-0.00113327,-0.000455623,-0.000741361,
++      -0.00114125,-0.000201268,-0.00095428,-0.000829324,-0.000255792,-0.000369179,-0.0010795,-0.000490302,-0.000896348,-0.00124504,-0.000367657,-0.000922727,
++      -0.000819764,-0.000561419,-0.000744156,-0.00130144,-0.000768853,-0.000946247,-0.0010263,-0.000127499,-0.000464819,-0.000589314,-0.000322362,-0.000326552,
++      -0.00081708,-0.000179489,-0.00050366,-0.000643071,-0.000230969,-0.000270781,-0.000734885,-0.000156032,-0.000368644,-0.000474516,-1.2252e-05,-6.46576e-05,
++      -0.000440548,-6.2597e-05,-0.000330192,-0.000609367,-4.03389e-05,-0.000122591,3.90328e-05,0.00043341,0.000110107,-0.000263007,6.26379e-05,4.05927e-05,
++      -0.000380888,0.000295694,-0.000216242,8.12136e-07,8.59382e-05,5.5014e-05,-0.000519691,7.49506e-05,-0.000217451,-0.000187121,0.000323097,0.00012727,
++      -0.000152884,-1.65453e-05,2.38783e-05,-0.000283457,9.20224e-05,-0.000159221,-4.87635e-05,0.000401437,0.00035686,9.19101e-05,0.000286092,0.000193395,
++      7.40245e-06,0.000374427,7.3221e-05,8.18282e-05,0.000339498,0.000398705,-0.000123547,0.000288264,0.000203694,0.000112503,0.000212694,7.57775e-05,
++      -0.000209181,4.69685e-05,1.10088e-05,-0.00027276,0.000298711,0.00028561,4.74625e-05,0.000288953,0.00013235,-0.000170624,0.000386362,0.000612499,
++      0.000219722,0.000639619,0.000537075,0.000370288,0.00039652,0.000314961,0.00013684,0.000560589,0.000516975,0.000342299,0.000846575,0.000657861,
++      0.00035509,0.000549847,0.000605137,0.000462097,0.000726926,0.000526114,0.000249318,0.000518696,0.000361736,0.000207647,0.000650715,0.000464066,
++      0.000133129,0.00042763,0.00020885,0.000186219,0.000393114,0.000423484,0.000242626,0.000496273,0.000226734,0.000254273,0.000488355,0.000640713,
++      0.000434562,0.000714259,0.000286361,-9.2996e-05,0.000200756,0.000283349,0.000205358,0.000505331,0.00024732,-0.000177446,-2.33967e-05,-3.75878e-06,
++      -0.000126623,0.000243606,0.000113462,6.0937e-05,-6.92626e-05,-0.000130132,-0.000517492,-0.000145294,-0.000170556,-0.000363356,-6.66429e-05,0.00012629,
++      -0.000183966,-5.11672e-05,6.79729e-05,-0.000116918,0.000161955,0.000190467,7.01746e-05,0.00025134,7.61144e-05,-7.62903e-05,0.000148239,0.000281117,
++      0.000131748,0.00053887,0.000261362,6.49737e-05,0.000385788,0.000402845,7.21364e-05,0.000463017,0.000524689,0.000247904,0.000221352,0.000413793,
++      0.000226446,0.000490494,0.00047219,0.000286375,-7.71911e-14,9.02145e-12,-1.0767e-12,-2.28128e-12,-4.21501e-12,-8.33945e-13,-5.5596e-13,0,
++      0,0,0,0,0,0,0,0,0,0,0,0,
++      0,0,0,0,0,0,0,0,0,0,0,0,
++      0,0,0,0,0,0,0,0,0,0,0,0,
++      0,0,0,0},
++     {0.233127,0.190752,0.112629,0.0720061,0.0649938,0.04966,0.041847,0.035701,0.0233294,0.0272711,0.0243578,0.00749897,
++      -0.00657176,0.00191998,0.00306622,0.00341823,-0.00104047,-0.00541028,-0.00859742,-0.00575574,-0.00769093,-0.00690181,-0.0028177,-0.000681107,
++      -0.000100805,-0.000515379,-0.000424202,0.000150557,0.00263219,0.000244897,-0.00110279,0.00112924,-6.83438e-05,-0.000930225,-0.00148671,-0.0018467,
++      -0.00216212,-0.00122353,-0.00327073,-0.00441772,-0.00311002,-0.00359307,-0.00410066,-0.00335634,-0.00384114,-0.00357937,-0.00262812,-0.00239331,
++      -0.00230248,-0.00135841,-0.00186529,-0.001568,-0.000684641,-0.000996461,-0.00106228,-0.000333949,-0.000960483,-0.00116551,-0.000576562,-0.000932607,
++      -0.00143408,-0.000553519,-0.000951695,-0.000883154,-0.000945246,-0.00126464,-0.00145659,-0.000455481,-0.000906461,-0.00113327,-0.000455623,-0.000741361,
++      -0.00114125,-0.000201268,-0.00095428,-0.000829324,-0.000255792,-0.000369179,-0.0010795,-0.000490302,-0.000896348,-0.00124504,-0.000367657,-0.000922727,
++      -0.000819764,-0.000561419,-0.000744156,-0.00130144,-0.000768853,-0.000946247,-0.0010263,-0.000127499,-0.000464819,-0.000589314,-0.000322362,-0.000326552,
++      -0.00081708,-0.000179489,-0.00050366,-0.000643071,-0.000230969,-0.000270781,-0.000734885,-0.000156032,-0.000368644,-0.000474516,-1.2252e-05,-6.46576e-05,
++      -0.000440548,-6.2597e-05,-0.000330192,-0.000609367,-4.03389e-05,-0.000122591,3.90328e-05,0.00043341,0.000110107,-0.000263007,6.26379e-05,4.05927e-05,
++      -0.000380888,0.000295694,-0.000216242,8.12136e-07,8.59382e-05,5.5014e-05,-0.000519691,7.49506e-05,-0.000217451,-0.000187121,0.000323097,0.00012727,
++      -0.000152884,-1.65453e-05,2.38783e-05,-0.000283457,9.20224e-05,-0.000159221,-4.87635e-05,0.000401437,0.00035686,9.19101e-05,0.000286092,0.000193395,
++      7.40245e-06,0.000374427,7.3221e-05,8.18282e-05,0.000339498,0.000398705,-0.000123547,0.000288264,0.000203694,0.000112503,0.000212694,7.57775e-05,
++      -0.000209181,4.69685e-05,1.10088e-05,-0.00027276,0.000298711,0.00028561,4.74625e-05,0.000288953,0.00013235,-0.000170624,0.000386362,0.000612499,
++      0.000219722,0.000639619,0.000537075,0.000370288,0.00039652,0.000314961,0.00013684,0.000560589,0.000516975,0.000342299,0.000846575,0.000657861,
++      0.00035509,0.000549847,0.000605137,0.000462097,0.000726926,0.000526114,0.000249318,0.000518696,0.000361736,0.000207647,0.000650715,0.000464066,
++      0.000133129,0.00042763,0.00020885,0.000186219,0.000393114,0.000423484,0.000242626,0.000496273,0.000226734,0.000254273,0.000488355,0.000640713,
++      0.000434562,0.000714259,0.000286361,-9.2996e-05,0.000200756,0.000283349,0.000205358,0.000505331,0.00024732,-0.000177446,-2.33967e-05,-3.75878e-06,
++      -0.000126623,0.000243606,0.000113462,6.0937e-05,-6.92626e-05,-0.000130132,-0.000517492,-0.000145294,-0.000170556,-0.000363356,-6.66429e-05,0.00012629,
++      -0.000183966,-5.11672e-05,6.79729e-05,-0.000116918,0.000161955,0.000190467,7.01746e-05,0.00025134,7.61144e-05,-7.62903e-05,0.000148239,0.000281117,
++      0.000131748,0.00053887,0.000261362,6.49737e-05,0.000385788,0.000402845,7.21364e-05,0.000463017,0.000524689,0.000247904,0.000221352,0.000413793,
++      0.000226446,0.000490494,0.00047219,0.000286375,-7.71911e-14,9.02145e-12,-1.0767e-12,-2.28128e-12,-4.21501e-12,-8.33945e-13,-5.5596e-13,0,
++      0,0,0,0,0,0,0,0,0,0,0,0,
++      0,0,0,0,0,0,0,0,0,0,0,0,
++      0,0,0,0,0,0,0,0,0,0,0,0,
++      0,0,0,0}},
++};

@@ -1,0 +1,180 @@
+From: MacFinals
+Subject: [PATCH] xinput: look for a new controller when a game asks about an empty slot
+
+A controller switched on (or plugged in) while THE FINALS ran was not picked up until some later
+device change. The game, like Unreal Engine's XInput code, checks empty slots once per
+WM_DEVICECHANGE. Wine broadcasts DBT_DEVNODES_CHANGED from plugplay before xinput's own device
+notification arrives and before xinput has opened the new device, so that one check came 1-4 ms
+too early (tests/controller_latency/hotplug_probe.c: broadcast at 23473.7 ms, XInput connected at
+23476-23480 ms). Windows' XInput looks for the device when asked, so there is no such race.
+
+XInputGetState/Ex and XInputGetCapabilities(Ex) on an empty slot now look for new devices
+themselves when anything under HKLM\System\CurrentControlSet\Control\DeviceClasses changed since
+the last look (a registry change notification: ntoskrnl writes the interface's "Linked" value
+before it broadcasts the arrival), so the scan runs once per device change, not per call. The
+symbolic link is created just after "Linked", so for a second after a change a device that is
+listed but can't be opened yet is looked for again. Adding and removing devices now share a lock,
+since the scan can run on the game's thread as well as xinput's update thread.
+---
+--- a/dlls/xinput1_3/main.c
++++ b/dlls/xinput1_3/main.c
+@@ -138,6 +138,24 @@
+ static HMODULE xinput_instance;
+ static HANDLE start_event;
+ static HANDLE update_event;
++
++/* Adding and removing devices happens on the update thread and, for a controller that just
++ * arrived, on the thread of a game asking about an empty slot (see check_new_devices). */
++static CRITICAL_SECTION devices_cs;
++static CRITICAL_SECTION_DEBUG devices_cs_debug =
++{
++    0, 0, &devices_cs,
++    { &devices_cs_debug.ProcessLocksList, &devices_cs_debug.ProcessLocksList },
++      0, 0, { (DWORD_PTR)(__FILE__ ": devices_cs") }
++};
++static CRITICAL_SECTION devices_cs = { &devices_cs_debug, -1, 0, 0, 0, 0 };
++
++/* Signalled when anything under DeviceClasses changes: ntoskrnl writes an interface's "Linked"
++ * value there before it broadcasts the arrival. */
++static HKEY device_classes_key;
++static HANDLE device_classes_changed;
++static DWORD device_classes_retry_until;
++static BOOL device_open_failed;
+ 
+ static BOOL find_opened_device(const WCHAR *device_path, int *free_slot)
+ {
+@@ -483,7 +501,11 @@
+ 
+     device = CreateFileW(device_path, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                          NULL, OPEN_EXISTING, FILE_FLAG_OVERLAPPED | FILE_FLAG_NO_BUFFERING, NULL);
+-    if (device == INVALID_HANDLE_VALUE) return TRUE;
++    if (device == INVALID_HANDLE_VALUE)
++    {
++        device_open_failed = TRUE;
++        return TRUE;
++    }
+ 
+     preparsed = NULL;
+     if (!HidD_GetPreparsedData(device, &preparsed))
+@@ -511,11 +533,22 @@
+ {
+     int i;
+ 
++    EnterCriticalSection(&devices_cs);
+     if (find_opened_device(device_path, &i))
+         controller_destroy(&controllers[i], TRUE);
++    LeaveCriticalSection(&devices_cs);
+ }
+ 
++static void update_controller_list_locked(void);
++
+ static void update_controller_list(void)
++{
++    EnterCriticalSection(&devices_cs);
++    update_controller_list_locked();
++    LeaveCriticalSection(&devices_cs);
++}
++
++static void update_controller_list_locked(void)
+ {
+     char buffer[sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_W) + MAX_PATH * sizeof(WCHAR)];
+     SP_DEVICE_INTERFACE_DETAIL_DATA_W *detail = (SP_DEVICE_INTERFACE_DETAIL_DATA_W *)buffer;
+@@ -687,7 +720,12 @@
+     if (msg == WM_DEVICECHANGE)
+     {
+         DEV_BROADCAST_DEVICEINTERFACE_W *iface = (DEV_BROADCAST_DEVICEINTERFACE_W *)lparam;
+-        if (wparam == DBT_DEVICEARRIVAL) try_add_device(iface->dbcc_name);
++        if (wparam == DBT_DEVICEARRIVAL)
++        {
++            EnterCriticalSection(&devices_cs);
++            try_add_device(iface->dbcc_name);
++            LeaveCriticalSection(&devices_cs);
++        }
+         if (wparam == DBT_DEVICEREMOVECOMPLETE) try_remove_device(iface->dbcc_name);
+     }
+ 
+@@ -772,6 +810,12 @@
+ 
+     update_event = CreateEventA(NULL, FALSE, FALSE, NULL);
+     if (!update_event) ERR("failed to create update event, error %lu\n", GetLastError());
++
++    if (!RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"System\\CurrentControlSet\\Control\\DeviceClasses", 0,
++                       KEY_NOTIFY, &device_classes_key)
++        && (device_classes_changed = CreateEventW(NULL, FALSE, FALSE, NULL)))
++        RegNotifyChangeKeyValue(device_classes_key, TRUE, REG_NOTIFY_CHANGE_NAME | REG_NOTIFY_CHANGE_LAST_SET,
++                                device_classes_changed, TRUE);
+ 
+     thread = CreateThread(NULL, 0, hid_update_thread_proc, NULL, 0, NULL);
+     if (!thread) ERR("failed to create update thread, error %lu\n", GetLastError());
+@@ -785,8 +829,40 @@
+ {
+     static INIT_ONCE init_once = INIT_ONCE_STATIC_INIT;
+     InitOnceExecuteOnce(&init_once, start_update_thread_once, NULL, NULL);
++}
++
++/* A game asked about an empty slot. Windows' XInput looks for the device right then; Wine's
++ * learns of a new controller from its device notification, which arrives a few milliseconds after
++ * the WM_DEVICECHANGE broadcast games react to. Unreal Engine checks empty slots once per
++ * WM_DEVICECHANGE, so a controller switched on while the game ran was missed until the next
++ * device change. When the device classes changed since the last look, look now. */
++static BOOL check_new_devices(void)
++{
++    BOOL retry;
++
++    if (!device_classes_changed) return FALSE;
++    retry = (LONG)(device_classes_retry_until - GetTickCount()) > 0;
++    if (WaitForSingleObject(device_classes_changed, 0) == WAIT_OBJECT_0)
++    {
++        RegNotifyChangeKeyValue(device_classes_key, TRUE, REG_NOTIFY_CHANGE_NAME | REG_NOTIFY_CHANGE_LAST_SET,
++                                device_classes_changed, TRUE);
++        device_classes_retry_until = GetTickCount() + 1000;
++    }
++    else if (!retry) return FALSE;
++
++    EnterCriticalSection(&devices_cs);
++    device_open_failed = FALSE;
++    update_controller_list_locked();
++    /* "Linked" is written just before the device's symbolic link: keep looking for a second
++     * while a listed device can't be opened yet. */
++    if (!device_open_failed) device_classes_retry_until = GetTickCount();
++    LeaveCriticalSection(&devices_cs);
++    TRACE("looked for new controllers\n");
++    return TRUE;
+ }
+ 
++static BOOL controller_lock_or_check(struct xinput_controller *controller);
++
+ static BOOL controller_lock(struct xinput_controller *controller)
+ {
+     if (!controller->device) return FALSE;
+@@ -807,6 +883,12 @@
+     LeaveCriticalSection(&controller->crit);
+ }
+ 
++static BOOL controller_lock_or_check(struct xinput_controller *controller)
++{
++    if (controller_lock(controller)) return TRUE;
++    return check_new_devices() && controller_lock(controller);
++}
++
+ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
+ {
+     TRACE("inst %p, reason %lu, reserved %p.\n", inst, reason, reserved);
+@@ -869,7 +951,7 @@
+     start_update_thread();
+ 
+     if (index >= XUSER_MAX_COUNT) return ERROR_BAD_ARGUMENTS;
+-    if (!controller_lock(&controllers[index])) return ERROR_DEVICE_NOT_CONNECTED;
++    if (!controller_lock_or_check(&controllers[index])) return ERROR_DEVICE_NOT_CONNECTED;
+ 
+     *state = controllers[index].state;
+     controller_unlock(&controllers[index]);
+@@ -1167,7 +1249,7 @@
+ 
+     if (index >= XUSER_MAX_COUNT) return ERROR_BAD_ARGUMENTS;
+ 
+-    if (!controller_lock(&controllers[index])) return ERROR_DEVICE_NOT_CONNECTED;
++    if (!controller_lock_or_check(&controllers[index])) return ERROR_DEVICE_NOT_CONNECTED;
+ 
+     if (flags & XINPUT_FLAG_GAMEPAD && controllers[index].caps.SubType != XINPUT_DEVSUBTYPE_GAMEPAD)
+         ret = ERROR_DEVICE_NOT_CONNECTED;

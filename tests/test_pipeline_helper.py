@@ -85,7 +85,7 @@ class PipelineHelper(unittest.TestCase):
         for name, text in (('pipeline-prepare', PREPARE), ('pipeline-warm', WARM)):
             (self.helpers / name).write_text(text); (self.helpers / name).chmod(0o755)
         (self.helpers / 'fit').write_text('100000')
-        self.root = self.base / 'User Directory With Spaces/Overwatch2Mac'
+        self.root = self.base / 'User Directory With Spaces/SteamDriver Steam'
         self.folder = self.root / 'cache/pipelines' / self.folder_name
         for name in ('recipes', 'libraries', 'archives'): (self.folder / name).mkdir(parents=True)
         (self.root / 'home').mkdir()
@@ -144,10 +144,10 @@ class PipelineHelper(unittest.TestCase):
         self.assertGreater(len(self.prepared()), 689)
 
     def test_the_game_apps_shader_cache_is_warmed_once_per_app_macos_and_gpu(self):
-        identifier = 'org.overwatch2mac.helper-test-' + secrets.token_hex(4)
+        identifier = 'app.steamdriver.helper-test-' + secrets.token_hex(4)
         cache = self.caches / identifier / 'com.apple.metal'
         self.addCleanup(shutil.rmtree, self.caches / identifier, True)
-        app = self.base / 'Overwatch.app'; (app / 'Contents').mkdir(parents=True)
+        app = self.base / 'Counter-Strike 2.app'; (app / 'Contents').mkdir(parents=True)
         (app / 'Contents/Info.plist').write_bytes(plistlib.dumps({'CFBundleIdentifier': identifier}))
         keys = self.recipes(50)
         result, steps, _ = self.run_helper(app)
@@ -177,7 +177,7 @@ class PipelineHelper(unittest.TestCase):
     def test_an_unusable_game_app_is_not_warmed(self):
         self.recipes(5)
         for identifier in ('../escape', '.hidden', 'a/b', ''):
-            app = self.base / 'Overwatch.app'; shutil.rmtree(app, ignore_errors=True); (app / 'Contents').mkdir(parents=True)
+            app = self.base / 'Counter-Strike 2.app'; shutil.rmtree(app, ignore_errors=True); (app / 'Contents').mkdir(parents=True)
             (app / 'Contents/Info.plist').write_bytes(plistlib.dumps({'CFBundleIdentifier': identifier}))
             result, steps, _ = self.run_helper(app)
             self.assertEqual(result.returncode, 0, result)

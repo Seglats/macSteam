@@ -200,6 +200,26 @@ def trace_start(trace):
     return datetime.datetime.fromisoformat(d).timestamp()
 
 
+class _XmlCleanReader:
+    """xctrace export writes symbol names verbatim, control bytes included (seen 2026-11-25: a
+    '__block_descriptor_…' name with a raw \\x01 and an invalid UTF-8 byte), which makes the XML
+    unparseable. Replaces invalid UTF-8 and drops the characters XML 1.0 forbids (C0 controls
+    except tab, newline, carriage return)."""
+    _DROP = {c: None for c in range(32) if c not in (9, 10, 13)}
+
+    def __init__(self, path):
+        import codecs
+        self._f = open(path, 'rb')
+        self._dec = codecs.getincrementaldecoder('utf-8')('replace')
+
+    def read(self, n=-1):
+        data = self._f.read(n)
+        text = self._dec.decode(data, final=not data)
+        if not data:
+            self._f.close()
+        return text.translate(self._DROP).encode('utf-8')
+
+
 def samples(trace, xml_path):
     """Yield (seconds since trace start, thread label, [(addr, name, binary), ...] leaf first)."""
     if not xml_path.exists():
@@ -213,7 +233,7 @@ def samples(trace, xml_path):
         r = el.get('ref')
         return ids[r] if r is not None else el
 
-    for _, el in ET.iterparse(str(xml_path), events=('end',)):
+    for _, el in ET.iterparse(_XmlCleanReader(xml_path), events=('end',)):
         i = el.get('id')
         if i is not None:
             ids[i] = el

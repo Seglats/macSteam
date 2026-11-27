@@ -289,6 +289,44 @@ WINE_PATCHES = [
     # script's STEAMDRIVER_SHORTCUTS) are switched off in WindowServer while the game is in
     # front, so the keys reach the game; recorded per process so the run script can restore.
     'wine-macdrv-game-shortcuts.patch',
+    # Controllers: the Xbox 360 USB bus reads any pad with an XInput interface (255/93/1), not
+    # only Microsoft's, and runs on macOS 15+ (leaving Microsoft's own pads to GameController).
+    # Third-party pads in XInput mode are not HID, so this is their only way in; the 8BitDo
+    # Ultimate 2 reports at 1000 Hz there (tests/controller_latency/README.md).
+    'wine-winebus-xinput-any-pad.patch',
+    # The "timing presents of ... for the per-frame file" notice is trace (macfinals_ui), not ERR.
+    'wine-winemac-present-timing-trace.patch',
+    # macfinals_pad: trace timestamps at each controller-report handoff (tests/controller_latency).
+    'wine-pad-latency-trace.patch',
+    # A controller switched on while a game runs: xinput looks for it when asked about an empty slot.
+    'wine-xinput-hotplug-check.patch',
+    # STEAMDRIVER_BG_THREADS=1: below-normal threads in macOS's background band (off the fastest cores).
+    'wine-server-bg-threads.patch',
+    # C06: the stuck dump names the user-lock and win_data holders, and fires 10 s into a freeze.
+    'wine-diag-lock-holders.patch',
+    # C16: the stuck dump lists the last memory-protection/free/exec-region calls and the last SIGABRT.
+    'wine-diag-vm-ring-abrt.patch',
+    # C06 fix: macdrv_DestroyWindow releases D3DMetal client surfaces after dropping win_data_mutex.
+    'wine-macdrv-destroy-surfaces-lock-order.patch',
+    # Direct3D 9's adapter driver version from the display driver's registry key, not wined3d's
+    # old-card table (Deadlock: "driver out of date", DLSS hidden, async shader creation off).
+    'wine-wined3d-registry-driver-version.patch',
+    # Follow-up: its out-parameters are unsigned int (wined3d_driver_info), not DWORD.
+    'wine-wined3d-registry-driver-version-types.patch',
+    # VideoDriverVersion setting (WINE_D3D_CONFIG): the tool sets DXMT's version when DXMT presents
+    # an NVIDIA GPU, which registers none (Deadlock: driver out of date, no DLSS).
+    'wine-wined3d-config-driver-version.patch',
+    # Headphone surround (WINE_HEADPHONE_SURROUND=1, the run script's STEAMDRIVER_SURROUND): a
+    # stereo output is offered as 7.1 and multichannel streams are rendered binaurally
+    # (spherical-head model: per-ear delay and head shadow). Inert unless set.
+    'wine-coreaudio-headphone-surround.patch',
+    # Headphone surround, fitted: measured head responses (MIT KEMAR) reshaped with settings fitted
+    # to Dolby Atmos for Headphones (scripts/surround_fit, docs/SURROUND.md), baked as per-speaker
+    # filters (surround_ir.h), plus a short reverb tail. Replaces the sphere model above.
+    'wine-coreaudio-headphone-surround-fitted.patch',
+    # Headphone surround with the player's own settings: a file baked by macSteam's live preview
+    # (Settings…), named by WINE_HEADPHONE_SURROUND_FILTERS; without one, the fitted filters.
+    'wine-coreaudio-headphone-surround-settings.patch',
 ]
 
 

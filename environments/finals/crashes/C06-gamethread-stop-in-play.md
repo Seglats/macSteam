@@ -157,3 +157,111 @@ second, a lost wakeup instead of a block) and is **not** addressed by this fix.
      there (focus, visibility, display sleep) and name both sides of the rendezvous.
 2. Bounding or deferring the destroy's driver call (and any other user-lock-holding call into
    the mac driver) comes after that names what stalls the Cocoa main thread.
+
+**Third occurrence of the watchdog crash (2026-11-25 04:09, `macfinals-165`, no counters):
+leaving the lobby, game frontmost and focused** (`Platform.AppHasFocus=true` — a third trigger
+besides alt-tab and AFK). GameThread blocked in `NtUserPeekMessage` from the same nested-pump
+site as the 2026-11-21 capture (`Discovery-d+0x2eec3d`); all other threads parked; **no
+user-lock holder visible in the Windows threads** — if this is C06, the stall sits on the Cocoa
+main thread (invisible to the game's dump; exactly what `-137`'s `ui wait` lines name) or in
+the event-queue path of the 2026-11-15 capture. One core was still busy 56 s into the freeze,
+so the C04 spin is not ruled out; full details and the game's crash-context fields in
+[C04](C04-load-spin-gamethread.md)'s 2026-11-25 entry. Reproducer to try: play, then leave the
+lobby, with `STEAMDRIVER_PERF=1 WINEDEBUG=err+fixme,+macfinals_ui %command%`.
+
+### Fourth occurrence, fully instrumented (2026-11-25 05:53, `macfinals-165`, trigger drill)
+
+Caught ~12 min into the trigger drill (no CPU stress; counters, driver stats and
+`+macfinals_ui` on), game frontmost and focused. Perf session `perf/20261125-054058/wine.35752`,
+crash `UECC-Windows-B92B7E8B4DE55760347875B11C2C18B5_0000`, Time Profiler
+`cpu-profile/freeze-20261125-055326.trace`, freeze_watch fired 6 s in.
+
+- **Block, not spin (settles the C04/C06 question for this shape).** GameThread ran at
+  85–88 ms CPU per 100 ms until 05:53:19.3, then dropped out of the counters completely: no
+  `PeekMessage` loop, process NT calls fell from ~30,000 to ~2,000 per 100 ms (audio and
+  network threads only). The 70 s trace has 14.6 s of CPU in all (0.2 cores), GameThread never
+  on-CPU.
+- **The 200 ms before the stop:** the process registered a window class, created a menu and a
+  window (`NtUserRegisterClassExWOW`, `NtUserCreateMenu`, `NtUserCreateWindowEx`), then
+  `NtUserDestroyWindow` + `NtUserQueryWindow`; 34 Cocoa-main-thread waits completed in that
+  second (max 12.7 ms) — the create/destroy's own rendezvous, all finished.
+- **Crash dump:** GameThread (332, `0x14c`) in `NtUserPeekMessage+0x14` from the nested pump
+  `Discovery-d+0x2eec3d` (same as 11-21 and 04:09). **Background Worker #0 (`0x31c`) in
+  `NtUserDestroyWindow+0x14`** — the 11-21 holder shape again. WindowsRawInputThread in its
+  normal `NtUserGetMessage`.
+- **Stuck dump at 33.8 s** (fired for an unrelated long wait, so it caught the freeze mid-way):
+  `014c in NtUserPeekMessage for 33.8 s`; `031c in NtCallbackReturn for 33.8 s` (that call
+  never returns to its caller — it resumes the outer `NtUserDestroyWindow`, so the worker came
+  back from a window-proc/hook callback into the destroy's Unix side and stopped there);
+  `0214 in NtUserMessageCall … WM_GETTEXT to 0x20096 for 29.6 s` (downstream: it waits for the
+  GameThread; its 10 s `no reply` ERR is in the Wine log); and **`0154 not in an NT call; last
+  NtClose returned 33.8 s ago`** — a thread that in every earlier dump of the session sits
+  outside NT calls closing handles constantly ("0.0 s ago"), stopped at the same instant. The
+  process is idle, so 0154 is blocked too, outside any NT call (a Unix call or a lock in Unix
+  code). No `ui wait` lines: **no Cocoa-main-thread rendezvous was outstanding.**
+- **The Cocoa main thread was healthy throughout:** the driver's main-thread lag probe ran
+  100×/s for the whole freeze with max lag 0.07–0.2 ms. The mechanism written up above (the
+  user-lock holder waits on a stalled main thread) **does not fit this occurrence.** Note:
+  `OnMainThread`'s >10 s ERR and 20 ms trace are logged only when the wait *ends*, so an
+  unfinished wait never logs — the registry/`ui wait` lines and the lag probe are what rule it
+  out here.
+- `ui state` at the dump: app active (frontmost), key window `0x20096`, visible, displays awake
+  — nobody was away.
+
+**Working hypothesis (unproven):** three threads stopped at the same instant inside Unix code —
+GameThread in the pump, Worker #0 in the destroy (after its callback), 0154 outside NT calls —
+with the main thread idle. That is the shape of a lock-order deadlock among Unix-side locks
+rather than a rendezvous. Candidates on that path: win32u's user lock, macdrv's
+`win_data_mutex` (recursive; `macdrv_DestroyWindow` holds it across `destroy_cocoa_window` and
+the release of D3DMetal's client surfaces, CW HACK 22435), and whatever D3DMetal holds while
+calling the macdrv hooks (`get_win_data` etc., which take `win_data_mutex`; CodeWeavers'
+comment in `d3dmetal.c` already notes ordering there "to avoid deadlocks"). The GameThread's
+pump reaches macdrv event handlers (incl. `CLIENT_SURFACE_PRESENTED`) through `ProcessEvents`.
+
+**Next:** name the lock holders at the moment of the freeze — record the holder (Wine tid + since)
+of the user lock and `win_data_mutex` the way the fd-cache section already does, print them in
+the stuck dump, and fire the dump when one thread has been in a single NT call (or out of NT
+calls while it normally isn't) for ~10 s instead of waiting for the 55-s cadence. The drill
+reproduces this in ~12 minutes, so one more run should decide it.
+
+**Diagnostics in place (2026-11-25, `macfinals-168`+, `wine-diag-lock-holders.patch`):** the
+stuck dump's `lock:` lines name the user-lock and `win_data_mutex` holders with call sites, and
+contended waits name both ends; the dump fires 10 s into the freeze. Passive capture during
+normal play; procedure in `tests/finals_bisect/README.md` ("Passive capture").
+
+## Root cause found (2026-11-25 09:01, `macfinals-171`): lock-order deadlock in winemac
+
+Fifth occurrence, ~1 minute into a session (run B of the thread-band A/B, practice range).
+Perf `perf/20261125-085953/wine.74452`; the 10 s dump (new in `-168`) fired:
+
+```
+stuck-dump: thread 014c in NtUserPeekMessage for over 10 s
+  lock: user lock free
+  lock: macdrv win_data lock held by tid 031c for 10.1 s; taken at winemac.so+0x4d88c
+  ui wait: tid 014c waiting for the macdrv win_data lock; tid 031c for 10.1 s
+  SIGABRT: none
+  014c in NtUserPeekMessage for 10.1 s
+  031c in NtCallbackReturn for 10.1 s      (back inside NtUserDestroyWindow)
+  0154 not in an NT call; last NtClose returned 10.0 s ago
+```
+
+`winemac.so+0x4d88c` is the return from `get_win_data` at the top of `macdrv_DestroyWindow`
+(disassembly of the build tree's winemac.so; bytes identical to the installed one).
+
+| Thread | Holds | Waits for |
+|---|---|---|
+| GameThread `014c`: pump → `CLIENT_SURFACE_PRESENTED` → `client_surface_present` (win32u) → `macdrv_client_surface_present` | win32u `surfaces_lock` | `win_data_mutex` (`get_win_data`) |
+| Worker `031c`: `NtUserDestroyWindow` → `macdrv_DestroyWindow` → `CFRelease(d3dmetal_client_surfaces)` (CW HACK 22435) → `client_surface_release` | `win_data_mutex` | win32u `surfaces_lock` (last reference) |
+
+Every other path takes `surfaces_lock` first (present, update, the surface's detach, D3DMetal's
+`get_win_data` hook, whose CodeWeavers comment already notes the ordering "to avoid
+deadlocks"); only `macdrv_DestroyWindow` releases surfaces under `win_data_mutex`. It fires when
+a worker destroys a window with D3DMetal surfaces (a temporary window the game creates and
+destroys at transitions — seen in the 05:53 and 09:01 captures) while the GameThread handles a
+present event. The earlier "main-thread rendezvous" mechanism was wrong; the 11-21 capture's
+`NtUserDestroyWindow` holder is this same worker shape.
+
+**Fix:** `patches/wine-macdrv-destroy-surfaces-lock-order.patch` (`macfinals-174`):
+`macdrv_DestroyWindow` takes the surface array out of the window data and releases it after
+`win_data_mutex` is dropped and the data is out of `win_datas`. In-game confirmation pending
+(no recurrence over normal play; the diagnostics stay on).

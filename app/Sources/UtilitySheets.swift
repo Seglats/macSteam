@@ -103,6 +103,12 @@ struct SettingsSheet:View {
                     Label("Uninstall \(Brand.name)…",systemImage:"trash").font(LauncherStyle.font(13,.medium))
                 }.buttonStyle(.borderless).hoverGrow().foregroundStyle(.red).disabled(model.uninstall == .working)
                     .help("Remove \(Brand.name) and everything it set up; your Steam app and games stay")
+                if model.windowsSteam && model.ownSteamExists {
+                    Button(role:.destructive) { model.sheet = .removeOwnSteam } label: {
+                        Label("Remove Own Steam…",systemImage:"trash").font(LauncherStyle.font(13,.medium))
+                    }.buttonStyle(.borderless).hoverGrow().foregroundStyle(.red).disabled(model.busy)
+                        .help("Remove this Windows Steam; its games can move to the Steam app")
+                }
                 Spacer()
                 Button("Done") { dismiss() }.buttonStyle(.bordered).hoverGrow().buttonBorderShape(.capsule).controlSize(.large).keyboardShortcut(.cancelAction)
             }
@@ -251,7 +257,7 @@ struct SettingsSheet:View {
                                                disabled:model.busy || model.running == .game) { model.chooseResolution($0,for:game) }
                         Spacer(minLength:8)
                         Toggle("Fullscreen",isOn:Binding(get:{ model.fullscreen(game) },set:{ model.setFullscreen(game,$0) }))
-                            .toggleStyle(.switch).controlSize(.small).disabled(model.busy || model.running == .game)
+                            .toggleStyle(.switch).hoverGrow().controlSize(.small).disabled(model.busy || model.running == .game)
                     }
                     Text(main?.caption(for:model.resolution(for:game)) ?? "Smaller resolutions run faster; larger ones look sharper.")
                         .font(LauncherStyle.font(12)).foregroundStyle(.secondary).fixedSize(horizontal:false,vertical:true)
@@ -407,7 +413,7 @@ private struct SettingSwitch<Accessory:View>:View {
                 }
             }
             Spacer(minLength:12)
-            Toggle(title,isOn:$isOn).labelsHidden().toggleStyle(.switch).tint(LauncherStyle.accent).disabled(disabled)
+            Toggle(title,isOn:$isOn).labelsHidden().toggleStyle(.switch).hoverGrow().tint(LauncherStyle.accent).disabled(disabled)
                 .accessibilityHint(detail ?? "")
         }
     }
@@ -436,7 +442,7 @@ struct HelpSheet:View {
         ("Steam can’t connect on a work or school network","Some of these networks set up their proxy automatically. Close Steam, turn on Settings › Advanced › Detect network proxy automatically, then open Steam again from \(Brand.name)."),
         ("My team can’t hear me","Open Settings › Audio. If the microphone is off, choose Turn On…, switch on \(Brand.name) in System Settings, then open \(Brand.name) again. Then check the voice settings in the game’s Audio options."),
         ("Which Macs can play?","Macs with Apple silicon on macOS 26.5 or later, with Rosetta. 16 GB of memory is recommended, and a new installation needs about 70 GB per game of storage."),
-        ("How do I uninstall?","Choose Uninstall \(Brand.name) at the bottom of the window. It removes \(Brand.name) and everything it set up (its options in Steam, game tools, their prefixes and its own Steam if you used it). Your Steam app, its games, NotProton and your Steam account stay."),
+        ("How do I uninstall?","Choose Uninstall \(Brand.name) at the bottom of the window. It removes \(Brand.name) and everything it set up (its options in Steam, game tools, their prefixes and its own Steam if you used it). Your Steam app, its games, NotProton and your Steam account stay. To remove only \(Brand.name)’s own Steam, use Remove… beside it under Advanced; either way you can keep its games, which move into the Steam app’s library."),
         ("Found a bug?","Choose Report a Problem to open an issue on GitHub, and attach a support report (below): it lists your setup, never account details."),
     ]
     var body:some View {
@@ -527,7 +533,7 @@ struct AboutSheet:View {
             HStack(alignment:.center,spacing:18) {
                 AppArtwork(size:76)
                 VStack(alignment:.leading,spacing:4) {
-                    Wordmark(height:44).frame(width:116,height:34)   // the name, as the main window shows it
+                    Wordmark(height:44).padding(.leading,-44*74/412).frame(height:34,alignment:.leading)   // the name, flush with the text under it (74 of the image's 1045 px are transparent on the left)
                     Text(Brand.tagline).font(LauncherStyle.font(14)).foregroundStyle(.secondary)
                     Text(version).font(LauncherStyle.font(11)).foregroundStyle(.secondary)
                 }
@@ -544,7 +550,7 @@ struct AboutSheet:View {
                 VStack(alignment:.leading,spacing:10) {
                     Text("Credits").font(LauncherStyle.font(15,.semibold)).accessibilityAddTraits(.isHeader)
                     AuthorLink()
-                    Text("\(Brand.name) runs Counter-Strike 2 and Deadlock through Steam on the Wine engine, Metal translation and setup that Recall built for Overwatch.")
+                    Text("\(Brand.name) runs Windows games from your Mac’s Steam through SteamDriver: its own Wine, patched to behave like Wine on Linux, with DXMT or Apple’s D3DMetal for graphics.")
                         .font(LauncherStyle.font(13)).lineSpacing(3).foregroundStyle(.secondary).fixedSize(horizontal:false,vertical:true)
                     UpstreamLink()
                 }
@@ -595,11 +601,77 @@ struct LicensesSheet:View {
             .tint(.primary).background { LauncherBackground() }
     }
 }
+/// Advanced › Remove (and Settings in the own Steam): deletes macSteam's own Steam, keeping its
+/// games for the Steam app or not (AppModel.removeOwnSteam, OwnSteamGames.swift).
+struct RemoveOwnSteamSheet:View {
+    @Bindable var model:AppModel
+    @State private var keepGames=true
+    @State private var games:[OwnSteamGames.Game]=[]
+    var body:some View {
+        VStack(spacing:24) {
+            switch model.ownSteamRemoval {
+            case .idle, .failed:
+                SheetHero(symbol:"trash",title:"Remove \(Brand.name)’s own Steam?",subtitle:"The Windows Steam \(Brand.name) set up for troubleshooting, with its Wine environment and runtime. \(Brand.name), NotProton and the Steam app stay.")
+                LauncherPanel {
+                    VStack(alignment:.leading,spacing:14) {
+                        if games.isEmpty {
+                            Text("No games are installed in it.").font(LauncherStyle.font(13)).foregroundStyle(.secondary)
+                        } else {
+                            Text("Its games").font(LauncherStyle.font(14,.semibold))
+                            VStack(alignment:.leading,spacing:6) {
+                                ForEach(games) { game in
+                                    HStack {
+                                        Text(game.name).font(LauncherStyle.font(13))
+                                        Spacer()
+                                        if game.size > 0 { Text(ByteCountFormatter.string(fromByteCount:game.size,countStyle:.file)).font(LauncherStyle.font(12).monospacedDigit()).foregroundStyle(.secondary) }
+                                    }
+                                }
+                            }
+                            Divider()
+                            Picker("",selection:$keepGames) {
+                                Text("Keep the games: move them to the Steam app").tag(true)
+                                Text("Delete the games too").tag(false)
+                            }.pickerStyle(.radioGroup).labelsHidden().font(LauncherStyle.font(13))
+                            Text(keepGames ? "They go into the Steam app’s library, so it uses them instead of downloading them again (it may check the files the first time). A game the Steam app already has stays behind and goes to the Trash. Quit the Steam app first."
+                                           : "They go to the Trash with the rest.")
+                                .font(LauncherStyle.font(12)).foregroundStyle(.secondary).fixedSize(horizontal:false,vertical:true)
+                        }
+                        Text("Everything else goes to the Trash, so you can put it back from Finder; storage is freed once you empty it.")
+                            .font(LauncherStyle.font(13)).lineSpacing(3).foregroundStyle(.secondary).fixedSize(horizontal:false,vertical:true)
+                    }
+                }
+                if case .failed(let message)=model.ownSteamRemoval { LauncherNotice(text:message) }
+                else { LauncherNotice(text:"The own Steam is closed for you if it’s open; quit any game in it first. Nothing is removed until you choose Remove.") }
+                HStack(spacing:16) {
+                    Button("Cancel") { model.finishOwnSteamRemoval() }.buttonStyle(.bordered).hoverGrow().buttonBorderShape(.capsule)
+                        .controlSize(.large).keyboardShortcut(.cancelAction)
+                    Spacer()
+                    // Deliberately not the default action: Return never removes.
+                    Button(role:.destructive) { model.removeOwnSteam(keepGames:keepGames && !games.isEmpty) } label: { Text("Remove").font(LauncherStyle.font(15,.semibold)).padding(.horizontal,8) }
+                        .buttonStyle(.borderedProminent).hoverGrow().buttonBorderShape(.capsule).controlSize(.large).tint(.red)
+                }
+            case .working(let step):
+                SheetHero(symbol:"trash",title:"Removing",subtitle:step == "Moving games to the Steam app" ? "Moving the games to the Steam app. From another drive this copies them, which takes a while." : "\(step)…")
+                ProgressView().controlSize(.small).accessibilityLabel("Removing")
+            case .done(let note):
+                SheetHero(symbol:"checkmark",title:"Removed",subtitle:"\(Brand.name)’s own Steam is removed.")
+                LauncherNotice(text:note)
+                Button("Done") { model.finishOwnSteamRemoval() }.buttonStyle(.bordered).hoverGrow().buttonBorderShape(.capsule)
+                    .controlSize(.large).keyboardShortcut(.defaultAction)
+            }
+        }.font(LauncherStyle.font(14)).padding(32).frame(width:520)
+            .tint(.primary).background { LauncherBackground() }
+            .onAppear { games=model.ownSteamGames }
+    }
+}
 struct UninstallSheet:View {
     @Bindable var model:AppModel
     @Environment(\.dismiss) private var dismiss
     /// Off: the Wine prefixes the game tools made go too (they hold local game settings).
     @State private var keepPrefixes=false
+    /// The own Steam's games move into the Steam app's library instead of going to the Trash.
+    @State private var keepOwnGames=true
+    @State private var ownGames:[OwnSteamGames.Game]=[]
     var body:some View {
         // macSteam's own Steam (troubleshooting) exists only if it was ever set up here; it is the
         // only Steam, and the only games, Uninstall removes. The Steam app and its games stay.
@@ -618,15 +690,23 @@ struct UninstallSheet:View {
                                 "The local settings of each game you played with a game tool (its Windows environment). Online progress and cloud saves aren’t affected")
                             row("Changed settings", "Deadlock’s renderer goes back to Vulkan where \(Brand.name) switched it to DirectX 11")
                             if ownSteam {
-                                row("Own Steam", "The Windows Steam \(Brand.name) set up for troubleshooting, with its games and their settings")
+                                row("Own Steam", ownGames.isEmpty || !keepOwnGames ? "The Windows Steam \(Brand.name) set up for troubleshooting, with its games and their settings"
+                                    : "The Windows Steam \(Brand.name) set up for troubleshooting; its games move to the Steam app")
                             }
                             row(Brand.name, "This app, its settings, key combo overrides and macOS permissions; shortcuts a game took over go back to macOS")
                         }
                         Divider()
                         VStack(alignment:.leading,spacing:3) {
-                            Toggle("Keep game settings",isOn:$keepPrefixes).toggleStyle(.checkbox).font(LauncherStyle.font(13))
+                            Toggle("Keep game settings",isOn:$keepPrefixes).toggleStyle(.checkbox).hoverGrow().font(LauncherStyle.font(13))
                             Text("Recommended if you plan on reinstalling \(Brand.name): your games start with the settings you left them with.")
                                 .font(LauncherStyle.font(12)).foregroundStyle(.secondary).fixedSize(horizontal:false,vertical:true).padding(.leading,20)
+                        }
+                        if ownSteam && !ownGames.isEmpty {
+                            VStack(alignment:.leading,spacing:3) {
+                                Toggle("Keep the own Steam’s games",isOn:$keepOwnGames).toggleStyle(.checkbox).hoverGrow().font(LauncherStyle.font(13))
+                                Text("\(ownGames.map(\.name).joined(separator:", ")) move into the Steam app’s library, so it uses them instead of downloading them again. Quit the Steam app first.")
+                                    .font(LauncherStyle.font(12)).foregroundStyle(.secondary).fixedSize(horizontal:false,vertical:true).padding(.leading,20)
+                            }
                         }
                         Text("Your Steam app and the games in it, NotProton and your Steam account stay: \(Brand.name) didn’t install them. Most files go to the Trash, so you can put them back from Finder; storage is freed once you empty it.")
                             .font(LauncherStyle.font(13)).lineSpacing(3).foregroundStyle(.secondary).fixedSize(horizontal:false,vertical:true)
@@ -639,7 +719,7 @@ struct UninstallSheet:View {
                         .controlSize(.large).keyboardShortcut(.cancelAction)
                     Spacer()
                     // Deliberately not the default action: Return never uninstalls.
-                    Button(role:.destructive) { model.uninstallEverything(keepPrefixes:keepPrefixes) } label: { Text("Uninstall").font(LauncherStyle.font(15,.semibold)).padding(.horizontal,8) }
+                    Button(role:.destructive) { model.uninstallEverything(keepPrefixes:keepPrefixes,keepOwnGames:keepOwnGames && !ownGames.isEmpty) } label: { Text("Uninstall").font(LauncherStyle.font(15,.semibold)).padding(.horizontal,8) }
                         .buttonStyle(.borderedProminent).hoverGrow().buttonBorderShape(.capsule).controlSize(.large).tint(.red)
                 }
             case .working:
@@ -654,6 +734,7 @@ struct UninstallSheet:View {
             }
         }.font(LauncherStyle.font(14)).padding(32).frame(width:520)
             .tint(.primary).background { LauncherBackground() }
+            .onAppear { ownGames=model.ownSteamGames }
     }
     private func row(_ name:String,_ detail:String)->some View {
         HStack(alignment:.firstTextBaseline,spacing:12) {

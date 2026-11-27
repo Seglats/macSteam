@@ -187,13 +187,18 @@ Then check `$R/logs` for errors and `pgrep -fl $R` for Wine processes left runni
 ## Tests
 
 - **Main suite:** `python3 tests/run_portable.py` (141 tests at this sync). The mouse tests
-  (`test_mouselook_session`, `test_mouse_timing_check`, `test_rawinput_trace`) aren't in its
-  list; run them with `python3 -m unittest tests.<name>`.
+  (`test_mouse_rate_check`, `test_mouse_timing_check`, `test_rawinput_trace`, the same files as
+  Recall 1.6.7's) aren't in its list; run them with `python3 -m unittest tests.<name>`.
+  Recall's in-game mouse play-test (`test_mouselook_session`, `tests/mouselook/run.py`,
+  `scripts/mouselook_session.py`) starts Overwatch through Battle.net, so it isn't ported
+  (removed 2026-11-27 with the other Overwatch tooling).
 - **Code-extracting tests:** `tests/test_steam_window_fix.py` compiles a slice of `launchClient`
   copied out of `portable_setup.m`. When that slice calls something new, add a stub to the
   fixture (as was done for `sessionMouse()`).
-- **Failing before this sync:** `test_mouse_rate_check` and `test_candidate_parity` also fail
-  on `main`.
+- **Region:** `test_mouse_rate_check` runs the tool with `-AppleLocale en_US`; on a Mac set to
+  another region its verdicts write numbers that way ("1 000") and the text checks failed.
+- **MacVolvo's own `test_mouselook_raw_timing`** (never in Recall) tested MacVolvo's clock edit
+  of `wine-mouselook.patch`, which went back to Recall's version; removed 2026-11-27.
 - **Removed tests:** Recall's `ShaderPack` tests in `test_derive_runtime.py` were dropped
   because the DXMT shader pack wasn't ported.
 

@@ -36,7 +36,7 @@ enum Brand {
     #else
     static let dataFolderName="SteamDriver Steam"
     #endif
-    static let tagline="Counter-Strike 2 and Deadlock on Apple Silicon."
+    static let tagline="Makes Wine on the Mac behave like Wine on Linux, so more games run."
     static let repositoryPath="seglats/macsteam"  // the GitHub repository, issues and update feed (haeli05/MacVolvo until 2026-11-24)
     static let repository=URL(string:"https://github.com/\(repositoryPath)")!
     static let releases=URL(string:"https://github.com/\(repositoryPath)/releases")!
@@ -46,10 +46,12 @@ enum Brand {
     /// release disk image named "<anything>-<version>.dmg".
     static let releaseFeed=URL(string:"https://api.github.com/repos/\(repositoryPath)/releases/latest")!
     static func diskImage(_ version:String)->String { "\(name)-\(version).dmg" }
-    static let trademarks="Not affiliated with or endorsed by Valve Corporation, Volvo, Blizzard Entertainment or Apple. Counter-Strike, Deadlock and Steam are trademarks of Valve Corporation. Mac is a trademark of Apple Inc. Based on Recall by Joshua Asher Nelson."
+    static let trademarks="Not affiliated with or endorsed by Valve Corporation or Apple. Counter-Strike, Deadlock and Steam are trademarks of Valve Corporation. Mac is a trademark of Apple Inc. Based on Recall by Joshua Asher Nelson."
     /// Who makes macSteam: shown in About.
-    static let author="@haeli05"
-    static let authorPage=URL(string:"https://github.com/haeli05")!
+    static let author="@seglats"
+    static let authorPage=URL(string:"https://github.com/seglats")!
+    /// MacVolvo, the project macSteam forked (by @haeli05), credited in About next to Recall.
+    static let macvolvo=URL(string:"https://github.com/haeli05/MacVolvo")!
     /// The project macSteam is built on.
     static let upstream=URL(string:"https://github.com/AsherJN/recall")!
 }

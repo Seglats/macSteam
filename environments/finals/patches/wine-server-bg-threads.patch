@@ -1,0 +1,56 @@
+From: MacFinals
+Subject: [PATCH] server: STEAMDRIVER_BG_THREADS: below-normal threads in macOS's background band
+
+Wine threads have no QoS class: the Mach policies apply_thread_priority sets opt a thread out of
+QoS for good (pthread_set_qos_class_self_np then fails with EPERM, and the class reads 0), so
+macOS places them by base priority alone. Below-normal threads get about 27, the utility band.
+On chips with two kinds of performance cores that still spilled onto the fastest cluster: in THE
+FINALS Unreal's below-normal background workers spent 35 % of their time (0.9 cores) there while
+that cluster was full and clocked down (6 of 6 cores 84 % busy, 3.7 of 4.6 GHz) and the twelve
+other cores were two-thirds idle (tests/rosetta_nt/R26_CPU_PROFILE.md).
+
+With STEAMDRIVER_BG_THREADS=1 (read once from the wineserver's environment), threads whose base
+priority is below normal get importance -12 or lower, a base priority under 20: the background
+band. Off by default until an A/B in game says it helps.
+---
+--- a/server/thread.c
++++ b/server/thread.c
+@@ -293,6 +293,27 @@
+     return min + (effective_priority - 1) * range / 14;
+ }
+ 
++/* STEAMDRIVER_BG_THREADS=1: threads below normal priority get a Mach base priority under 20,
++ * macOS's background band, instead of about 27 (its utility band).
++ *
++ * Wine threads have no QoS class (the policies set below opt a thread out of QoS for good), so
++ * macOS places them by base priority alone. On chips with two kinds of performance cores the
++ * utility band still spilled onto the fastest cluster: in THE FINALS Unreal's below-normal
++ * background workers spent 35 % of their time (0.9 cores) there while that cluster was full and
++ * clocked down (3.7 of 4.6 GHz) and the twelve other cores were two-thirds idle
++ * (tests/rosetta_nt/R26_CPU_PROFILE.md). The background band keeps them off it, leaving those
++ * cores and their clock to GameThread. Read once from the wineserver's environment. */
++static int bg_threads_enabled(void)
++{
++    static int enabled = -1;
++    if (enabled == -1)
++    {
++        const char *env = getenv( "STEAMDRIVER_BG_THREADS" );
++        enabled = env && env[0] == '1';
++    }
++    return enabled;
++}
++
+ static void apply_thread_priority( struct thread *thread )
+ {
+     kern_return_t kr;
+@@ -310,6 +331,10 @@
+     /* effective priority 15 is for time-critical threads, so not compute-bound */
+     thread_extended_policy.timeshare = effective_priority > 14 ? 0 : 1;
+     thread_precedence_policy.importance = get_mach_importance( effective_priority );
++    /* base priority 31 + importance; under 20 is the background band */
++    if (bg_threads_enabled() && thread->base_priority < THREAD_PRIORITY_NORMAL &&
++        effective_priority < LOW_REALTIME_PRIORITY && thread_precedence_policy.importance > -12)
++        thread_precedence_policy.importance = -12;
+     /* adapted from the QoS table at xnu/osfmk/kern/thread_policy.c */
+     switch (thread->base_priority)
+     {

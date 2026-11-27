@@ -1,0 +1,329 @@
+From: MacFinals
+Subject: [PATCH] winebus.sys: Xbox 360 bus for any XInput pad, on macOS 15 and later too
+
+Pads in XInput mode that are not Microsoft's (8BitDo's "normal" mode on its dongle and cable,
+and many others) present a USB interface of class 255/93/1, which is not HID: macOS, its
+GameController framework and SDL never see them, so games got no controller. This bus could
+read them, but it accepted only Microsoft's ids and switched itself off on macOS 15+.
+
+- Matches any device with that interface; on macOS 15+ leaves Microsoft's own wired 360 pads
+  to GameController.framework (they reach Wine through SDL), so nothing is listed twice.
+- Opens only that interface, found in the registry, instead of opening the device and setting
+  its configuration (composite pads have other interfaces in use by macOS).
+- Looks up the interrupt pipes instead of assuming the IN pipe is 1.
+- Sends what XUSB/xpad send first: the vendor control read 0xC1 0x01 0x0100 and the
+  player-1 LED command.
+- Forwards only input reports (00 14 ...); LED/connection/headset messages reached the game
+  as input. A read error ends the read loop instead of re-queuing forever.
+- Keeps the sticks' Y as the pad sends it (up = positive): winebus gamepad reports use the
+  XUSB convention since Wine 9 (bus_sdl.c flips SDL's Y to match); the old inversion here
+  inverted both sticks' up/down in games.
+- Says when the interface is held exclusively (macOS Steam does that to wired pads).
+
+Measured with tests/controller_latency/xinput_usb_probe.c (same IOUSBLib path): the 8BitDo
+Ultimate 2 on its dongle reports at 1000 Hz (1.00 ms median), against 25 Hz in Nintendo mode.
+---
+--- a/dlls/winebus.sys/bus_xbox360.c	2026-11-25 01:18:36
++++ b/dlls/winebus.sys/bus_xbox360.c	2026-11-25 01:47:51
+@@ -56,6 +56,7 @@
+ #include <IOKit/IOKitLib.h>
+ #include <IOKit/IOCFPlugIn.h>
+ #include <IOKit/usb/IOUSBLib.h>
++#include <CoreFoundation/CoreFoundation.h>  /* CFNumber, for find_xinput_interface */
+ #undef ULONG
+ #undef E_INVALIDARG
+ #undef E_OUTOFMEMORY
+@@ -117,6 +118,7 @@
+ 
+     IOUSBInterfaceInterface550 **interface;
+     CFRunLoopSourceRef source;
++    UInt8 in_pipe, out_pipe;
+ 
+     char buffer[64];
+ };
+@@ -124,6 +126,54 @@
+ static inline struct xbox_device *impl_from_unix_device(struct unix_device *iface)
+ {
+     return CONTAINING_RECORD(iface, struct xbox_device, unix_device);
++}
++
++static BOOL sequoia_or_later(void);
++
++/* The device's Xbox 360 wired interface (class 255, subclass 93, protocol 1), found in the
++ * registry without opening the device: composite pads (8BitDo's "for PC" models add HID keyboard
++ * and mouse interfaces) have other interfaces in use by macOS, which USBDeviceOpen and
++ * SetConfiguration would disturb. Returns a retained interface service, or 0. */
++static io_service_t find_xinput_interface(io_object_t device)
++{
++    io_iterator_t iter;
++    io_service_t entry, found = 0;
++
++    if (IORegistryEntryCreateIterator(device, kIOServicePlane, kIORegistryIterateRecursively, &iter) != KERN_SUCCESS)
++        return 0;
++    while (!found && (entry = IOIteratorNext(iter)))
++    {
++        static const char *keys[3] = {"bInterfaceClass", "bInterfaceSubClass", "bInterfaceProtocol"};
++        static const int want[3] = {255, 93, 1};
++        int i, value;
++
++        for (i = 0; i < 3; i++)
++        {
++            CFStringRef key = CFStringCreateWithCString(NULL, keys[i], kCFStringEncodingUTF8);
++            CFTypeRef number = IORegistryEntryCreateCFProperty(entry, key, kCFAllocatorDefault, 0);
++            CFRelease(key);
++            value = -1;
++            if (number)
++            {
++                if (CFGetTypeID(number) == CFNumberGetTypeID()) CFNumberGetValue(number, kCFNumberIntType, &value);
++                CFRelease(number);
++            }
++            if (value != want[i]) break;
++        }
++        /* Only this device's own interfaces: a hub's subtree holds the devices behind it. */
++        if (i == 3)
++        {
++            io_registry_entry_t parent = 0;
++            if (IORegistryEntryGetParentEntry(entry, kIOServicePlane, &parent) == KERN_SUCCESS)
++            {
++                if (IOObjectIsEqualTo(parent, device)) found = entry;
++                IOObjectRelease(parent);
++            }
++        }
++        if (!found) IOObjectRelease(entry);
++    }
++    IOObjectRelease(iter);
++    return found;
+ }
+ 
+ static struct xbox_device *find_device_from_io_object(io_object_t object)
+@@ -290,16 +340,22 @@
+     UInt32 numBytesRead = (UINT_PTR)arg0;
+     int hatswitch;
+ 
+-    /* Invert Y axis */
+-    if (report->hat_left_y < -32767)
+-        report->hat_left_y = 32767;
+-    else
+-        report->hat_left_y = -1*report->hat_left_y;
+-    if (report->hat_right_y < -32767)
+-        report->hat_right_y = 32767;
+-    else
+-        report->hat_right_y = -1*report->hat_right_y;
++    /* An error (unplugged, aborted by stop) ends the read loop; re-queuing would spin. */
++    if (result != kIOReturnSuccess)
++    {
++        if (result != kIOReturnAborted) WARN("read failed %#x, stopping input from this pad\n", result);
++        return;
++    }
+ 
++    /* Only input reports (00 14 ...) are input; the pad also sends LED state (01 03),
++     * connection (02 03, 08 ..) and headset messages, which used to reach the game as input. */
++    if (numBytesRead < FIELD_OFFSET(IN_REPORT, reserved) || report->header.cmd != 0x00 || report->header.size != 0x14)
++        goto next;
++
++    /* Y stays as the pad sends it (up = positive): winebus's gamepad reports use the XUSB/GIP
++     * convention (bus_sdl.c flips SDL's Y to match), and xinput reads them unchanged. The old
++     * inversion here made both sticks' up/down inverted in games. */
++
+     /* Convert D-pad button bitmask to hat switch:
+      * 8 1 2
+      * 7 0 3
+@@ -322,11 +378,13 @@
+ 
+     bus_event_queue_input_report(&event_queue, device, (BYTE *)report, FIELD_OFFSET(IN_REPORT, reserved));
+ 
++next:
+     numBytesRead = sizeof(private->buffer) - 1;
+ 
+-    (*private->interface)->ReadPipeAsync(private->interface, 1,
++    result = (*private->interface)->ReadPipeAsync(private->interface, private->in_pipe,
+                             private->buffer, numBytesRead, ReadCompletion,
+                             device);
++    if (result != kIOReturnSuccess) WARN("ReadPipeAsync failed %#x, stopping input from this pad\n", result);
+ }
+ 
+ /* Handlers */
+@@ -380,12 +438,9 @@
+ {
+     struct xbox_device *private = impl_from_unix_device(iface);
+     IOCFPlugInInterface **plugInInterface = NULL;
+-    IOUSBConfigurationDescriptor *desc = NULL;
+-    IOUSBFindInterfaceRequest intf;
+     io_service_t usbInterface;
+     UInt32 numBytesRead;
+-    io_iterator_t iter;
+-    UInt8 numConfig;
++    UInt8 pipe, endpoints = 0;
+     IOReturn ret;
+     SInt32 score;
+ 
+@@ -394,37 +449,9 @@
+     if (private->interface != NULL)
+         return STATUS_SUCCESS;
+ 
+-    ret = (*private->dev)->GetNumberOfConfigurations(private->dev, &numConfig);
+-    if (ret != kIOReturnSuccess || numConfig < 1)
+-        return STATUS_UNSUCCESSFUL;
+-
+-    ret = (*private->dev)->GetConfigurationDescriptorPtr(private->dev, 0, &desc);
+-    if (ret != kIOReturnSuccess || desc == NULL)
+-        return STATUS_UNSUCCESSFUL;
+-
+-    ret = (*private->dev)->USBDeviceOpen(private->dev);
+-    if (ret != kIOReturnSuccess)
+-        return STATUS_UNSUCCESSFUL;
+-
+-    ret = (*private->dev)->SetConfiguration(private->dev, desc->bConfigurationValue);
+-    if (ret != kIOReturnSuccess)
+-    {
+-        (*private->dev)->USBDeviceClose(private->dev);
+-        return STATUS_UNSUCCESSFUL;
+-    }
+-
+-    /* XBox 360 */
+-    intf.bInterfaceClass=kIOUSBFindInterfaceDontCare;
+-    intf.bInterfaceSubClass=93;
+-    intf.bInterfaceProtocol=1;
+-    intf.bAlternateSetting=kIOUSBFindInterfaceDontCare;
+-
+-    ret = (*private->dev)->CreateInterfaceIterator(private->dev, &intf, &iter);
+-    usbInterface = IOIteratorNext(iter);
+-    IOObjectRelease(iter);
+-    (*private->dev)->USBDeviceClose(private->dev);
+-
+-    if (!usbInterface)
++    /* The interface alone, without opening the device or setting its configuration (the device
++     * is configured already; its other interfaces may be in use, see find_xinput_interface). */
++    if (!(usbInterface = find_xinput_interface(private->object)))
+         return STATUS_UNSUCCESSFUL;
+ 
+     ret = IOCreatePlugInInterfaceForService(usbInterface,
+@@ -446,8 +473,58 @@
+ 
+     ret = (*private->interface)->USBInterfaceOpen(private->interface);
+     if (ret != kIOReturnSuccess)
++    {
++        /* macOS Steam's own controller support opens wired Xbox-protocol pads exclusively. */
++        WARN("cannot open the pad's Xbox 360 interface (%#x)%s\n", ret,
++             ret == kIOReturnExclusiveAccess ? ": another program holds it (Steam's controller support?)" : "");
++        (*private->interface)->Release(private->interface);
++        private->interface = NULL;
+         return STATUS_UNSUCCESSFUL;
++    }
+ 
++    /* The interrupt pipes, rather than assuming the IN pipe is 1. */
++    private->in_pipe = private->out_pipe = 0;
++    (*private->interface)->GetNumEndpoints(private->interface, &endpoints);
++    for (pipe = 1; pipe <= endpoints; pipe++)
++    {
++        UInt8 direction, number, type, interval;
++        UInt16 max_packet;
++
++        if ((*private->interface)->GetPipeProperties(private->interface, pipe, &direction, &number,
++                                                     &type, &max_packet, &interval) != kIOReturnSuccess)
++            continue;
++        if (type != kUSBInterrupt) continue;
++        if (direction == kUSBIn && !private->in_pipe) private->in_pipe = pipe;
++        if (direction == kUSBOut && !private->out_pipe) private->out_pipe = pipe;
++        TRACE("pipe %u: endpoint %u %s, max packet %u, interval %u\n", pipe, number,
++              direction == kUSBIn ? "in" : "out", max_packet, interval);
++    }
++    if (!private->in_pipe)
++    {
++        WARN("no interrupt IN pipe on the pad's Xbox 360 interface\n");
++        return STATUS_UNSUCCESSFUL;
++    }
++
++    /* What Windows' XUSB driver and Linux's xpad send first: a vendor control read many
++     * non-Microsoft pads wait for before they send input, then the player-1 LED command. */
++    {
++        UInt8 data[20];
++        IOUSBDevRequest request =
++        {
++            .bmRequestType = USBmakebmRequestType(kUSBIn, kUSBVendor, kUSBInterface),
++            .bRequest = 0x01, .wValue = 0x0100, .wIndex = 0, .wLength = sizeof(data), .pData = data,
++        };
++        static UInt8 led[3] = {0x01, 0x03, 0x02};
++
++        ret = (*private->interface)->ControlRequest(private->interface, 0, &request);
++        TRACE("start-up control read %#x, %u bytes\n", ret, (unsigned)request.wLenDone);
++        if (private->out_pipe)
++        {
++            ret = (*private->interface)->WritePipe(private->interface, private->out_pipe, led, sizeof(led));
++            TRACE("player LED %#x\n", ret);
++        }
++    }
++
+     ret = (*private->interface)->CreateInterfaceAsyncEventSource(private->interface, &private->source);
+     if (ret != kIOReturnSuccess)
+         return STATUS_UNSUCCESSFUL;
+@@ -456,7 +533,7 @@
+ 
+     /* Start event queue */
+     numBytesRead = sizeof(private->buffer) - 1;
+-    ret = (*private->interface)->ReadPipeAsync(private->interface, 1,
++    ret = (*private->interface)->ReadPipeAsync(private->interface, private->in_pipe,
+                             private->buffer, numBytesRead, ReadCompletion,
+                             iface);
+     if (ret != kIOReturnSuccess)
+@@ -516,6 +593,7 @@
+     SInt32 score;
+     HRESULT res;
+     WORD vid, pid, rel;
++    io_service_t xinput_intf;
+     UInt32 uid;
+     UInt8 idx;
+ 
+@@ -555,9 +633,20 @@
+ 
+     TRACE("object %#x, dev %p, desc %s.\n", object, dev, debugstr_device_desc(&desc));
+ 
+-    if (!is_xbox_gamepad(vid, pid))
++    /* Any pad with an Xbox 360 wired interface, not only Microsoft's: third-party pads in XInput
++     * mode (8BitDo's "normal" mode, and many others) are not HID, so neither macOS nor SDL sees
++     * them and this bus is their only way in. On macOS 15 and later GameController.framework
++     * drives Microsoft's own wired 360 pads, which then reach Wine through SDL; taking those
++     * here as well would list them twice. */
++    if (!(xinput_intf = find_xinput_interface(object)))
++    {
++        TRACE("no Xbox 360 wired interface\n");
++        goto failed;
++    }
++    IOObjectRelease(xinput_intf);
++    if (sequoia_or_later() && is_xbox_gamepad(vid, pid))
+     {
+-        TRACE("Not an xbox gamepad\n");
++        TRACE("Microsoft pad, left to GameController.framework\n");
+         goto failed;
+     }
+ 
+@@ -623,13 +712,8 @@
+ 
+     TRACE("args %p\n", args);
+ 
+-    /* In Sequoia and later, GameController.framework supports wired XBOX 360 controllers */
+-    if (sequoia_or_later())
+-    {
+-        TRACE("disabled: running on macOS Sequoia or later\n");
+-        return STATUS_SUCCESS;
+-    }
+-
++    /* Runs on macOS 15 and later too, for the pads GameController.framework does not drive
++     * (process_IOService_Device leaves Microsoft's own to it). */
+     options = *(struct xbox_bus_options *)args;
+ 
+     run_loop = CFRunLoopGetCurrent();
+@@ -666,13 +750,6 @@
+     /* cleanup previously returned event */
+     bus_event_cleanup(result);
+ 
+-    /* In Sequoia and later, GameController.framework supports wired XBOX 360 controllers */
+-    if (sequoia_or_later())
+-    {
+-        TRACE("disabled: running on macOS Sequoia or later\n");
+-        return STATUS_SUCCESS;
+-    }
+-
+     do
+     {
+         if (bus_event_queue_pop(&event_queue, result)) return STATUS_PENDING;

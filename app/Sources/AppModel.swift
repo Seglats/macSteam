@@ -6,10 +6,12 @@ import UniformTypeIdentifiers
 @MainActor @Observable
 final class AppModel {
     enum Screen: String, CaseIterable { case welcome, moveApp, checking, readyToInstall, preparing, launching, installer, ready, running, driveMissing, failure }
-    enum Sheet: String, Identifiable { case settings, help, about, uninstall, update, whatsNew, keyOverrides, profileSettings; var id: String { rawValue } }
+    enum Sheet: String, Identifiable { case settings, help, about, uninstall, removeOwnSteam, surroundSettings, update, whatsNew, keyOverrides, profileSettings, controllerCheck, benchmarks, installedGames; var id: String { rawValue } }
     enum UninstallState: Equatable { case idle, working, done(appRemoved: Bool), failed(String) }
     enum UpdateState: Equatable { case idle, checking, upToDate, available(AvailableUpdate), downloading(Double), installing, failed(String) }
     var uninstall: UninstallState = .idle
+    enum OwnSteamRemoval: Equatable { case idle, working(String), done(String), failed(String) }
+    var ownSteamRemoval: OwnSteamRemoval = .idle
     var update: UpdateState = .idle
     var updateNotice=""
     /// The games macSteam starts through Steam (worker: launch --game, status games).
@@ -90,6 +92,7 @@ final class AppModel {
         profiles=Profiles.list()
         rowsRemoved=NotProton.rowsRemoved
         checkGameTools()
+        checkControllers()
         // A newer macSteam, or files changed underneath: update in place, never remove and add again.
         if case .added=notProton,!notProtonCurrent {
             let change=NotProton.refresh(resources:resources)
@@ -105,6 +108,104 @@ final class AppModel {
         catch { notice=error.localizedDescription }
         checkNotProton()
     }
+    // MARK: More controller support (experimental, ControllerSupport.swift)
+    var controllerSupportOn=false
+    /// Benchmarks (Benchmarks.swift, BenchmarkRecorder.swift): which games record, the saved
+    /// runs, and what the hotkey is doing ("" when idle).
+    var benchRecord=Benchmarks.Record.off
+    var benchRuns:[Benchmarks.Run]=[]
+    var benchStatus=""
+    var benchHotkey=Benchmarks.defaultHotkey
+    /// What "Install a Windows game" is doing ("" when idle; GameInstaller, InstallGamePanel).
+    var installingGame=""
+    /// Why the last install or delete gave up, shown under it in the panel or sheet ("" if none).
+    var installError=""
+    /// Bumped when the installed games change, so InstalledGamesSheet reloads.
+    var installedGamesVersion=0
+    /// The controllers handed to games (saved), and the Xbox-mode ones connected now.
+    var controllerPads:[ControllerSupport.Pad]=[]
+    var connectedPads:[ControllerSupport.Pad]=[]
+    /// What the running Steam started with (nil: Steam not running or started without it).
+    var steamControllerValue:String?
+    var steamRunningNow=false
+    private var checkingControllers=false
+    func checkControllers() {
+        guard !checkingControllers else { return }
+        checkingControllers=true
+        Task {
+            let (on,saved,connected,steam,running)=await Task.detached {
+                (ControllerSupport.enabled,ControllerSupport.saved(),ControllerSupport.connected(),
+                 ControllerSupport.steamValue(),NotProton.steamRunning)
+            }.value
+            controllerSupportOn=on;controllerPads=saved;connectedPads=connected
+            steamControllerValue=steam;steamRunningNow=running
+            checkingControllers=false
+        }
+    }
+    /// Adds a dropped installer to Steam on SteamDriver and starts it (GameInstaller.install).
+    /// Advanced › Custom runtimes (Runtimes.swift): game profiles may then have their own runtime copy.
+    var customRuntimes=Runtimes.customOn
+    func setCustomRuntimes(_ on:Bool) {
+        do { try Runtimes.setCustom(on) } catch { notice=error.localizedDescription }
+        customRuntimes=Runtimes.customOn
+    }
+    /// Experimental › Headphone surround (Surround.swift): profiles may then turn it on.
+    var surroundOn=Surround.enabled
+    /// Its Test: a 7.1 stream through the SteamDriver Wine, with the setting on or off.
+    let surroundTest=SurroundTest()
+    /// Headphone surround › Settings… (SurroundSettings.swift): the live preview and the saved settings.
+    let surroundSettings=SurroundSettings()
+    var surroundTestExe:URL { resources.appendingPathComponent("SurroundTest/surround_test.exe") }
+    func setSurround(_ on:Bool) {
+        do { try Surround.setEnabled(on) } catch { notice=error.localizedDescription }
+        surroundOn=Surround.enabled
+    }
+    /// Where Install a Windows game puts games: nil = Steam's folder, else a folder the player
+    /// chose (remembered).
+    var installLocation:URL?=UserDefaults.standard.string(forKey:"installLocation").map { URL(fileURLWithPath:$0) } {
+        didSet { UserDefaults.standard.set(installLocation?.path,forKey:"installLocation") }
+    }
+    func installGame(name:String,installer:URL,store:GameInstaller.StoreMatch?) {
+        guard installingGame.isEmpty else { return }
+        installingGame="Starting…";installError=""
+        Task {
+            do {
+                try await GameInstaller.install(name:name,installer:installer,store:store,location:installLocation) { step in
+                    Task { @MainActor in self.installingGame=step }
+                }
+                notice="\(name) is installed. Launch it from Steam to play."
+            } catch { installError=error.localizedDescription }
+            installingGame="";installedGamesVersion+=1
+        }
+    }
+    /// Deletes a game macSteam installed (InstalledGames.delete), keeping its saves if asked.
+    func deleteGame(_ game:InstalledGames.Game,keep:Bool) {
+        guard installingGame.isEmpty else { return }
+        installingGame="Deleting \(game.name)…";installError=""
+        Task {
+            do {
+                try await InstalledGames.delete(game,keep:keep) { step in Task { @MainActor in self.installingGame=step } }
+                notice=keep ? "\(game.name) is deleted; its saves and settings are kept and come back if you install it again." : "\(game.name) is deleted."
+            } catch { installError=error.localizedDescription }
+            installingGame="";installedGamesVersion+=1
+        }
+    }
+    func setControllerSupport(_ on:Bool) {
+        if on {
+            do {
+                let pads=try ControllerSupport.enable()
+                notice="Steam now leaves \(pads.map(\.name).joined(separator:", ")) to your games."
+            } catch { notice=error.localizedDescription;checkControllers();return }
+        } else {
+            ControllerSupport.disable()
+            notice="Steam takes these controllers again."
+        }
+        if NotProton.steamRunning { askRestartSteam=true }
+        checkControllers()
+    }
+    /// Adds controllers connected since it was turned on.
+    func addConnectedControllers() { setControllerSupport(true) }
+
     /// Steam reads macSteam's options when it starts: after a change, ask to restart it.
     var askRestartSteam=false
     var restartingSteam=false
@@ -161,7 +262,7 @@ final class AppModel {
         do {
             try Profiles.addGlobal(kind,resources:resources)
             rewriteRows(kind == .dx11 ? "Added Global DX11: switch on \u{201C}SteamDriver DX11 profile\u{201D} in a DX11 game’s Compatibility settings." :
-                "Added Global DX12. D3DMetal has no settings yet; MetalFX upscaling will go here.")
+                "Added Global DX12: its settings (MetalFX upscaling) apply to DX12 games on the SteamDriver tool.")
         } catch { notice=error.localizedDescription }
         checkNotProton()
     }
@@ -170,6 +271,14 @@ final class AppModel {
             try Profiles.addGame(appID:game.appID,name:game.name,kind:kind,resources:resources)
             rewriteRows(kind == .dx11 ? "Added a profile for \(game.name): switch on \u{201C}SteamDriver profile: \(game.name)\u{201D} in its Compatibility settings." :
                 "Added a DX12 profile for \(game.name).")
+        } catch { notice=error.localizedDescription }
+        checkNotProton()
+    }
+    /// The profile row's "Switch to DX12/DX11" for a game whose last launch used the other Direct3D.
+    func switchProfile(_ profile:Profiles.Profile,to kind:Profiles.Kind) {
+        do {
+            try Profiles.setKind(profile.id,kind,resources:resources)
+            rewriteRows("\(profile.name) is now a \(kind.title) profile."+(profile.kind == .dx11 ? " Its DX11 settings are kept for switching back." : ""))
         } catch { notice=error.localizedDescription }
         checkNotProton()
     }
@@ -417,6 +526,7 @@ final class AppModel {
         // Opened from the disk image: move to Applications before anything else.
         if AppLocation.needsMove(Bundle.main.bundleURL) { prepareMove();return }
         if automaticUpdates { checkForUpdates(manual:false) }
+        loadBenchmarks()
         // macSteam for NotProton needs no setup of its own: no worker, no Steam install.
         guard windowsSteam else { checkNotProton();return }
         startWindowsSteam(autoLaunch:true)
@@ -1092,7 +1202,62 @@ final class AppModel {
         saveLaunchOptions(for:selectedGame)
         notice="\(selectedGame.title) opens at \(initial.label) next time."
     }
-    func uninstallEverything(keepPrefixes:Bool=false) {
+    /// macSteam's own Steam was set up here (its folder exists).
+    var ownSteamExists:Bool { fm.fileExists(atPath:root.path) }
+    /// Own Steam's games, for the removal choices.
+    var ownSteamGames:[OwnSteamGames.Game] { ownSteamExists ? OwnSteamGames.list(root) : [] }
+
+    /// Keep games: closes the own Steam and moves its games into the Steam app's library. A
+    /// message when it can't (nothing removed then); nil when done or there was nothing to move.
+    private func keepOwnSteamGames(_ progress:(String)->Void) async->(failure:String?,note:String) {
+        let root=self.root
+        guard !OwnSteamGames.list(root).isEmpty else { return (nil,"") }
+        guard OwnSteamGames.steamAppInstalled else { return ("The Steam app isn’t installed, so there’s nowhere to keep the games. Nothing was removed.","") }
+        if NotProton.steamRunning { return ("Quit the Steam app first: it finds the moved games when it starts. Nothing was removed.","") }
+        progress("Closing Steam")
+        do { _ = try await service.run("close-for-removal",event:receive) }
+        catch { return ((error as? SetupFailure ?? SetupFailure(code:"unexpected_setup_error")).message,"") }
+        progress("Moving games to the Steam app")
+        let moved=await Task.detached { Result { try OwnSteamGames.move(root) } }.value
+        switch moved {
+        case .failure(let error): return ("\(error.localizedDescription). \(Brand.name)’s own Steam and the games not yet moved are still there.","")
+        case .success(let result):
+            var note=result.moved.isEmpty ? "" : "Moved to the Steam app: \(result.moved.joined(separator:", ")). "
+            if !result.skipped.isEmpty { note+="Already in the Steam app, so left with the rest in the Trash: \(result.skipped.joined(separator:", ")). " }
+            return (nil,note)
+        }
+    }
+
+    /// Advanced › Remove: deletes macSteam's own Steam (to the Trash), with its games or after
+    /// moving them into the Steam app's library. macSteam, NotProton and the Steam app stay.
+    func removeOwnSteam(keepGames:Bool) {
+        guard !isPreview,ownSteamExists else { return }
+        ownSteamRemoval = .working("Closing Steam")
+        Task {
+            while busy { cancel(); try? await Task.sleep(for:.milliseconds(100)) }
+            busy=true; notice=""
+            defer { busy=false }
+            var note=""
+            if keepGames {
+                let kept=await keepOwnSteamGames { self.ownSteamRemoval = .working($0) }
+                if let failure=kept.failure { ownSteamRemoval = .failed(failure);return }
+                note=kept.note
+            }
+            ownSteamRemoval = .working("Removing \(Brand.name)’s own Steam")
+            do { _ = try await service.run("uninstall",event:receive) }
+            catch { ownSteamRemoval = .failed((error as? SetupFailure ?? SetupFailure(code:"unexpected_setup_error")).message);return }
+            clientInstalled=false;gameInstalled=false;state=[:]
+            ownSteamRemoval = .done(note+"The rest is in the Trash; storage is freed once you empty it.")
+        }
+    }
+    /// The removal sheet's Done: back to macSteam for NotProton.
+    func finishOwnSteamRemoval() {
+        let removed:Bool={ if case .done=ownSteamRemoval { return true };return false }()
+        ownSteamRemoval = .idle;sheet=nil
+        if removed { windowsSteam=false;screen = .welcome;checkNotProton() }
+    }
+
+    func uninstallEverything(keepPrefixes:Bool=false,keepOwnGames:Bool=false) {
         guard !isPreview else { uninstall = .done(appRemoved:true);return }
         uninstall = .working
         Task {
@@ -1104,6 +1269,12 @@ final class AppModel {
             // variants) keeps its files open: nothing is removed until it is quit.
             if Uninstaller.runningGame() != nil {
                 uninstall = .failed("A game is running through \(Brand.name)’s options. Quit it, then try again. Nothing was removed.");return
+            }
+            // Keep games: the own Steam's games move into the Steam app's library before anything
+            // is removed, so a refusal (the Steam app open) leaves everything as it was.
+            if keepOwnGames,fm.fileExists(atPath:root.path) {
+                let kept=await keepOwnSteamGames { self.stage=$0 }
+                if let failure=kept.failure { uninstall = .failed(failure);return }
             }
             // macSteam in NotProton's Steam: only macSteam's own files; NotProton and Steam stay.
             do { try NotProton.remove() } catch { uninstall = .failed(error.localizedDescription);return }

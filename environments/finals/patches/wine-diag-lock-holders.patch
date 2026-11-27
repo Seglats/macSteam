@@ -1,0 +1,347 @@
+From: MacFinals
+Subject: [PATCH] ntdll, win32u, winemac: name the user-lock and win_data holders in the stuck dump
+
+C06's fourth capture (2026-11-25 05:53) caught the GameThread blocked in NtUserPeekMessage, a
+worker blocked in NtUserDestroyWindow and a third thread blocked outside any NT call, all from
+one instant, with the Cocoa main thread idle (lag probe max 0.2 ms) and no main-thread
+rendezvous outstanding: a lock cycle among Unix-side locks, and nothing named the holders.
+
+Diagnostics only; no lock is taken, dropped or reordered differently.
+
+- ntdll: wine_diag_lock_held(slot, holder, site) records the outermost holder of win32u's user
+  lock (slot 0) and winemac's win_data_mutex (slot 1), with the holder's call site. The stuck
+  dump prints "lock: <name> held by tid X for N s; taken at <module>+<offset>" or "free".
+- win32u user_lock and winemac's win_data lock: a contended acquire registers a wait in the
+  existing registry ("ui wait: tid A waiting for the user lock; tid B for N s"), so the dump
+  shows both ends of each edge.
+- The stuck dump fires after 10 s for a win32u call that does not wait by design (PeekMessage,
+  DestroyWindow, ...) instead of only after 60 s, when the game's watchdog has already killed
+  the process. Plain long waits keep the 60 s threshold and 55 s spacing; dumps are at least
+  5 s apart.
+
+--- a/dlls/ntdll/unix/loader.c
++++ b/dlls/ntdll/unix/loader.c
+@@ -988,7 +988,29 @@
+     if (token < 0 || token >= WINE_DIAG_WAITS) return;
+     __atomic_store_n( &wine_diag_waits[token].since, 0, __ATOMIC_RELEASE );
+ }
++
++/* C06 (2026-11-25): who holds the Unix-side locks a freeze can sit on. The fourth capture had
++ * three threads stop at one instant inside Unix code with the Cocoa main thread idle - a lock
++ * cycle, not a rendezvous - and nothing named the holders. Slot 0 is win32u's user lock, slot 1
++ * winemac's win_data_mutex. Both are recursive: the caller keeps the depth and reports only its
++ * outermost acquire (holder, call site) and release (holder 0). A sequence counter keeps the
++ * dump from printing a half-written record. Contended acquires also go in the wait registry
++ * above, so a dump names both ends of each edge. */
++#define WINE_DIAG_LOCKS 2
++static const char * const wine_diag_lock_names[WINE_DIAG_LOCKS] = { "user lock", "macdrv win_data lock" };
++static struct { UINT32 holder; UINT64 since; void *site; LONG seq; } wine_diag_locks[WINE_DIAG_LOCKS];
+ 
++__attribute__((visibility("default")))
++void wine_diag_lock_held( int slot, UINT32 holder, void *site )
++{
++    if (slot < 0 || slot >= WINE_DIAG_LOCKS) return;
++    __atomic_add_fetch( &wine_diag_locks[slot].seq, 1, __ATOMIC_ACQ_REL );  /* odd: writing */
++    wine_diag_locks[slot].holder = holder;
++    wine_diag_locks[slot].site   = holder ? site : NULL;
++    wine_diag_locks[slot].since  = holder ? syscall_log_now_ns() : 0;
++    __atomic_add_fetch( &wine_diag_locks[slot].seq, 1, __ATOMIC_ACQ_REL );  /* even: stable */
++}
++
+ static const char *wine_diag_who( UINT32 tid, char *buf, size_t size )
+ {
+     if (tid == WINE_DIAG_MAIN_THREAD) return "Cocoa main thread";
+@@ -1019,6 +1041,42 @@
+             if (__atomic_load_n( &wine_diag_notes[i].seq, __ATOMIC_RELAXED ) != seq) continue;
+             if (text[0] && ts && now >= ts)
+                 fprintf( file, "  ui state: %s (for %.1f s)\n", text, (now - ts) / 1000000000.0 );
++            break;
++        }
++    }
++    for (i = 0; i < WINE_DIAG_LOCKS; i++)
++    {
++        for (tries = 0; tries < 8; tries++)
++        {
++            LONG seq = __atomic_load_n( &wine_diag_locks[i].seq, __ATOMIC_ACQUIRE );
++            UINT32 holder;
++            UINT64 since;
++            void *site;
++            char where[128];
++            Dl_info info;
++
++            if (seq & 1) continue;
++            holder = wine_diag_locks[i].holder;
++            since = wine_diag_locks[i].since;
++            site = wine_diag_locks[i].site;
++            __atomic_thread_fence( __ATOMIC_ACQUIRE );
++            if (__atomic_load_n( &wine_diag_locks[i].seq, __ATOMIC_RELAXED ) != seq) continue;
++            if (!holder)
++            {
++                fprintf( file, "  lock: %s free\n", wine_diag_lock_names[i] );
++                break;
++            }
++            where[0] = 0;
++            if (site && dladdr( site, &info ) && info.dli_fname)
++            {
++                const char *base = strrchr( info.dli_fname, '/' );
++                snprintf( where, sizeof(where), "; taken at %s+%#lx", base ? base + 1 : info.dli_fname,
++                          (unsigned long)((char *)site - (char *)info.dli_fbase) );
++            }
++            else if (site) snprintf( where, sizeof(where), "; taken at %p", site );
++            fprintf( file, "  lock: %s held by %s for %.1f s%s\n", wine_diag_lock_names[i],
++                     wine_diag_who( holder, who, sizeof(who) ),
++                     since && now >= since ? (now - since) / 1000000000.0 : 0.0, where );
+             break;
+         }
+     }
+@@ -1178,10 +1236,33 @@
+ /* Say what every thread is in when something looks stuck, so a lock's owner or a stuck
+  * send's target can be found by Windows thread id. */
+ #define SYSCALL_LOG_STUCK_NS 60000000000ull
++#define SYSCALL_LOG_FAST_NS  10000000000ull  /* C06: a non-waiting win32u call stuck this long */
+ static UINT32 syscall_log_dump_wtid;
+ static char syscall_log_dump_name[36];
++static int syscall_log_dump_secs = 60;
+ static UINT64 syscall_log_last_dump;
+ 
++/* C06 (2026-11-25): win32u calls that do not wait by design. One stuck for 10 s is a freeze
++ * (the GameThread blocked in NtUserPeekMessage, a worker in NtUserDestroyWindow), and the game's
++ * watchdog kills the process at 60 s - the same moment the ordinary 60 s trigger would fire, so
++ * those dumps came too late or by luck. These dump after 10 s instead. Excluded: the calls
++ * that wait for messages, sends (they wait for the receiver), modal loops, and
++ * NtCallbackReturn, whose slot stays current while the thread is back in any outer call. */
++static int syscall_log_fast_call( const char *what )
++{
++    static const char * const waiting[] =
++    {
++        "NtUserGetMessage", "NtUserMsgWaitForMultipleObjectsEx", "NtUserWaitMessage",
++        "NtUserMessageCall", "NtUserWaitForInputIdle", "NtUserTrackPopupMenuEx",
++        "NtUserDragDetect", "NtUserDragObject", "NtUserSendInput",
++    };
++    unsigned int i;
++
++    if (strncmp( what, "NtUser", 6 )) return 0;
++    for (i = 0; i < ARRAY_SIZE(waiting); i++) if (!strcmp( what, waiting[i] )) return 0;
++    return 1;
++}
++
+ /* Any thread whose current NT call has been running for >= 60 s: a stuck SendMessage, a wait
+  * with no timeout, a thread that won't finish dying. Run by the log thread, so no thread-side
+  * trigger is needed (the old one, STATUS_TIMEOUT after >= 59 s, fired on ordinary 60 s timed
+@@ -1199,10 +1280,12 @@
+     UINT64 now = syscall_log_now_ns();
+     char headline_name[36];
+     UINT32 headline_wtid = 0;
+-    int have_headline = 0, headline_is_wait = 0, nstuck = 0, i;
++    int have_headline = 0, headline_rank = 0, nstuck = 0, i;
+     LONG t;
+ 
+-    if (syscall_log_last_dump && now - syscall_log_last_dump < 55000000000ull) return;
++    /* 5 s between dumps at most; a dump headed by a plain long wait still keeps the old
++     * 55 s spacing (checked below, once the headline is known) */
++    if (syscall_log_last_dump && now - syscall_log_last_dump < 5000000000ull) return;
+ 
+     for (t = 0; t < used; t++)
+     {
+@@ -1210,31 +1293,36 @@
+         UINT16 key = __atomic_load_n( &tc->cur_key, __ATOMIC_ACQUIRE );
+         char name[32];
+         const char *what;
+-        int is_wait, known = 0;
++        int rank, fast, known = 0;
+ 
+         if (!tc->wtid || !key || !tc->cur_start) continue;
+         if (tc->exited) continue;  /* pthread_exit_wrapper marked it: a dead thread never triggers */
+         /* cur_start > now: the thread entered this call after this scan read its clock;
+          * the unsigned subtraction would wrap to ~2^64 and pass the 60 s filter (a false
+          * "in NtSetEvent" headline seen in the 2026-11-15 game run) */
+-        if (tc->cur_start > now || now - tc->cur_start < SYSCALL_LOG_STUCK_NS) continue;
++        if (tc->cur_start > now || now - tc->cur_start < SYSCALL_LOG_FAST_NS) continue;
+         /* the name is the return value: syscall_log_name only fills the buffer for
+          * unnamed calls */
+         what = syscall_log_name( (key - 1) >> 12, (key - 1) & 0xfff, name, sizeof(name) );
+         if (!strcmp( what, "NtTerminateThread" )) continue;
++        fast = syscall_log_fast_call( what );
++        if (!fast && now - tc->cur_start < SYSCALL_LOG_STUCK_NS) continue;
+         stuck[nstuck].wtid = tc->wtid;
+         stuck[nstuck].key = key;
+         nstuck++;
+         for (i = 0; i < reported_count; i++)
+             if (reported[i].wtid == tc->wtid && reported[i].key == key) { known = 1; break; }
+         if (known) continue;
+-        is_wait = !strncmp( what, "NtWaitFor", 9 ) || !strncmp( what, "NtDelay", 7 );
+-        if (!have_headline || (headline_is_wait && !is_wait))
++        /* headline preference: a stuck non-waiting win32u call, then any other non-wait call,
++         * then a plain wait or sleep */
++        if (fast) rank = 2;
++        else rank = !(!strncmp( what, "NtWaitFor", 9 ) || !strncmp( what, "NtDelay", 7 ));
++        if (!have_headline || rank > headline_rank)
+         {
+             snprintf( headline_name, sizeof(headline_name), "%s", what );
+             headline_wtid = tc->wtid;
+             have_headline = 1;
+-            headline_is_wait = is_wait;
++            headline_rank = rank;
+         }
+     }
+     /* a condition that ended is forgotten, so the same thread sticking again dumps again */
+@@ -1251,6 +1339,10 @@
+         }
+     }
+     if (!have_headline) return;  /* nothing new is stuck */
++    /* not recorded as reported, so these conditions are picked up again once the spacing allows */
++    if (headline_rank < 2 && syscall_log_last_dump && now - syscall_log_last_dump < 55000000000ull) return;
++    syscall_log_dump_secs = headline_rank == 2 ? (int)(SYSCALL_LOG_FAST_NS / 1000000000ull)
++                                               : (int)(SYSCALL_LOG_STUCK_NS / 1000000000ull);
+     for (i = 0; i < nstuck && reported_count < SYSCALL_LOG_TSLOTS; i++)
+     {
+         int j, known = 0;
+@@ -1277,12 +1369,13 @@
+     int i, nlive = 0;
+     LONG t;
+ 
+-    if (syscall_log_last_dump && now - syscall_log_last_dump < 55000000000ull) return;
++    if (syscall_log_last_dump && now - syscall_log_last_dump < 5000000000ull) return;
+     syscall_log_last_dump = now;
+     gettimeofday( &tv, NULL );
+-    fprintf( file, "%lld.%03d stuck-dump: thread %04x in %s for over 60 s; every thread's NT call:\n",
++    fprintf( file, "%lld.%03d stuck-dump: thread %04x in %s for over %d s; every thread's NT call:\n",
+              (long long)tv.tv_sec, (int)(tv.tv_usec / 1000),
+-             syscall_log_dump_wtid, syscall_log_dump_name[0] ? syscall_log_dump_name : "?" );
++             syscall_log_dump_wtid, syscall_log_dump_name[0] ? syscall_log_dump_name : "?",
++             syscall_log_dump_secs );
+     {   /* C17: the fd-cache section serializes every NtClose and fd-cache fill; a wedged holder
+          * is the mechanism behind the quit hang, so name it up front (0 = free) */
+         UINT64 held_since;
+--- a/dlls/win32u/sysparams.c
++++ b/dlls/win32u/sysparams.c
+@@ -310,15 +310,36 @@
+ static pthread_mutex_t user_mutex;
+ static unsigned int user_lock_thread, user_lock_rec;
+ 
+-void user_lock(void)
++/* C06 (2026-11-25): from ntdll - the holder record and wait registry the stuck dump prints */
++extern void wine_diag_lock_held( int slot, UINT32 holder, void *site );
++extern int wine_diag_wait_begin( const char *what, UINT32 waiter, UINT32 target, UINT64 hwnd );
++extern void wine_diag_wait_end( int token );
++
++/* noinline: the return address is the holder's call site, printed by the stuck dump */
++__attribute__((noinline)) void user_lock(void)
+ {
+-    pthread_mutex_lock( &user_mutex );
+-    if (!user_lock_rec++) user_lock_thread = GetCurrentThreadId();
++    if (pthread_mutex_trylock( &user_mutex ))
++    {
++        /* contended: register the wait (and whom it waits on) for as long as it lasts */
++        int token = wine_diag_wait_begin( "waiting for the user lock", GetCurrentThreadId(),
++                                          user_lock_thread, 0 );
++        pthread_mutex_lock( &user_mutex );
++        wine_diag_wait_end( token );
++    }
++    if (!user_lock_rec++)
++    {
++        user_lock_thread = GetCurrentThreadId();
++        wine_diag_lock_held( 0, user_lock_thread, __builtin_return_address(0) );
++    }
+ }
+ 
+ void user_unlock(void)
+ {
+-    if (!--user_lock_rec) user_lock_thread = 0;
++    if (!--user_lock_rec)
++    {
++        user_lock_thread = 0;
++        wine_diag_lock_held( 0, 0, NULL );
++    }
+     pthread_mutex_unlock( &user_mutex );
+ }
+ 
+--- a/dlls/winemac.drv/macdrv_cocoa.h
++++ b/dlls/winemac.drv/macdrv_cocoa.h
+@@ -141,6 +141,8 @@
+ extern int wine_diag_wait_begin(const char *what, unsigned int waiter, unsigned int target,
+                                 unsigned long long hwnd);
+ extern void wine_diag_wait_end(int token);
++/* C06 (2026-11-25): lock holder records (slot 1: win_data_mutex); holder 0 = released */
++extern void wine_diag_lock_held(int slot, unsigned int holder, void *site);
+ /* C06: who the current thread is, for holder and waiter names: a Wine tid, or these */
+ #define MACDRV_DIAG_MAIN_THREAD 0xffffffffu
+ #define MACDRV_DIAG_UNLOGGED    0xfffffffeu
+--- a/dlls/winemac.drv/window.c
++++ b/dlls/winemac.drv/window.c
+@@ -42,6 +42,38 @@
+ 
+ static pthread_mutex_t win_data_mutex;
+ static CFMutableDictionaryRef win_datas;
++
++/* C06 (2026-11-25): the holder of win_data_mutex for the stuck dump (ntdll lock slot 1). The
++ * mutex is recursive; the depth and holder are touched only by the thread holding it. A
++ * contended acquire is registered as a wait naming the holder. D3DMetal reaches this lock
++ * through the get_win_data hook (d3dmetal.c), so the recorded site tells that path apart. */
++static unsigned int win_data_depth, win_data_holder;
++
++static void win_data_lock(void *site)
++{
++    if (pthread_mutex_trylock(&win_data_mutex))
++    {
++        int token = wine_diag_wait_begin("waiting for the macdrv win_data lock", macdrv_diag_self(),
++                                         win_data_holder, 0);
++        pthread_mutex_lock(&win_data_mutex);
++        wine_diag_wait_end(token);
++    }
++    if (!win_data_depth++)
++    {
++        win_data_holder = macdrv_diag_self();
++        wine_diag_lock_held(1, win_data_holder, site);
++    }
++}
++
++static void win_data_unlock(void)
++{
++    if (!--win_data_depth)
++    {
++        win_data_holder = 0;
++        wine_diag_lock_held(1, 0, NULL);
++    }
++    pthread_mutex_unlock(&win_data_mutex);
++}
+ 
+ static unsigned int activate_on_focus_time;
+ 
+@@ -244,7 +276,7 @@
+     if ((data = calloc(1, sizeof(*data))))
+     {
+         data->hwnd = hwnd;
+-        pthread_mutex_lock(&win_data_mutex);
++        win_data_lock(__builtin_return_address(0));
+         if (!win_datas)
+             win_datas = CFDictionaryCreateMutable(NULL, 0, NULL, NULL);
+         CFDictionarySetValue(win_datas, hwnd, data);
+@@ -258,15 +290,15 @@
+  *
+  * Lock and return the data structure associated with a window.
+  */
+-struct macdrv_win_data *get_win_data(HWND hwnd)
++__attribute__((noinline)) struct macdrv_win_data *get_win_data(HWND hwnd)
+ {
+     struct macdrv_win_data *data;
+ 
+     if (!hwnd) return NULL;
+-    pthread_mutex_lock(&win_data_mutex);
++    win_data_lock(__builtin_return_address(0));
+     if (win_datas && (data = (struct macdrv_win_data*)CFDictionaryGetValue(win_datas, hwnd)))
+         return data;
+-    pthread_mutex_unlock(&win_data_mutex);
++    win_data_unlock();
+     return NULL;
+ }
+ 
+@@ -278,7 +310,7 @@
+  */
+ void release_win_data(struct macdrv_win_data *data)
+ {
+-    if (data) pthread_mutex_unlock(&win_data_mutex);
++    if (data) win_data_unlock();
+ }
+ 
+ 

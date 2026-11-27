@@ -42,6 +42,11 @@ risk of tuning for the canary is accepted as slim.
    in order to patch them.
 2. **No spoofing and no hiding Wine from the anti-cheat.** Compatibility fixes only. No
    CPU-vendor spoofing. Fixes must make the environment *more* truthful, never less.
+   **Decided by Rasmus, 2026-11-25:** MetalFX upscaling (DLSS through D3DMetal,
+   `STEAMDRIVER_UPSCALE` / the profile switch) is allowed for THE FINALS like any other game.
+   With it on, D3DMetal presents an NVIDIA GPU instead of its default "AMD Compatibility
+   Mode" (neither is the real Apple GPU). That is Apple's own switch, used for performance,
+   not to deceive the anti-cheat. It is not a precedent for any other identity change.
 3. **Do not analyse or reverse-engineer the anti-cheat's protected code** — the packed PE
    manually mapped at `0x700000000000` (sections `packer0`, `packer1`, `packer30`, …),
    loaded by `preloader.dll`. Working out which of its checks fails is out of scope even

@@ -96,19 +96,21 @@ int main(void) {@autoreleasepool {
             self.assertFalse((roots[other] / 'nested').exists())
 
     def test_swift_identity_and_location_checks_match_worker_variant(self):
-        for variant, name, marker, bundle in (
-                ('dxmt', 'MacVolvo', '.macvolvo-owner', 'app.macvolvo.launcher'),
-                ('gptk4', 'MacVolvo GPTK4', '.macvolvo-gptk4-owner', 'app.macvolvo.gptk4')):
+        # Renamed 2026-11-24 (Brand.swift): the app is macSteam, its own-Steam folder and bundle
+        # identifier keep SteamDriver's name, and the owner markers keep their .macvolvo names.
+        for variant, name, folder, marker, bundle in (
+                ('dxmt', 'macSteam', 'SteamDriver Steam', '.macvolvo-owner', 'app.steamdriver.launcher'),
+                ('gptk4', 'macSteam GPTK4', 'SteamDriver GPTK4 Steam', '.macvolvo-gptk4-owner', 'app.steamdriver.gptk4')):
             root = self.base / variant
             root.mkdir()
             result = json.loads(subprocess.check_output([str(self.brands[variant]), str(root)]))
             self.assertEqual((result['name'], result['folder'], result['marker'], result['id']),
-                             (name, name, marker, bundle))
+                             (name, folder, marker, bundle))
             self.assertEqual(result['updates'], variant == 'dxmt')
             other_marker = '.macvolvo-owner' if variant == 'gptk4' else '.macvolvo-gptk4-owner'
             (root / other_marker).write_text('owned by other variant')
             result = json.loads(subprocess.check_output([str(self.brands[variant]), str(root / 'nested')]))
-            self.assertIn('other MacVolvo app', result['problem'])
+            self.assertIn('other macSteam app', result['problem'])
 
     def test_renderer_profiles_switch_modules_without_changing_wine_session_settings(self):
         baseline, evaluation = self.profiles['dxmt'], self.profiles['gptk4']

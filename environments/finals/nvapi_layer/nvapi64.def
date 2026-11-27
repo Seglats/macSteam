@@ -1,0 +1,4 @@
+LIBRARY nvapi64.dll
+EXPORTS
+    nvapi_QueryInterface
+    nvapi_Direct_GetMethod = nvapi64_gptk.nvapi_Direct_GetMethod

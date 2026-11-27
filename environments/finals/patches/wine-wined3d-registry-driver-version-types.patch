@@ -1,0 +1,19 @@
+From: MacFinals
+Subject: [PATCH] wined3d: registry driver version, follow-up: unsigned int out-parameters
+
+wine-wined3d-registry-driver-version.patch declared the out-parameters as DWORD, but
+wined3d_driver_info's version_high/version_low are unsigned int; in the PE build DWORD is
+unsigned long, so GCC rejected the call (-Wincompatible-pointer-types). The applied patch
+can't change (WINE_PATCHES is append-only), so this follows it.
+
+--- a/dlls/wined3d/directx.c	2026-11-25 13:33:23
++++ b/dlls/wined3d/directx.c	2026-11-25 13:33:23
+@@ -747,7 +747,7 @@
+  * minimum, DLSS hidden, asynchronous shader creation off), while DXGI and the registry report
+  * the current one. Used only when exactly one display adapter is registered and its provider
+  * matches VENDOR, so the version belongs to this GPU; otherwise the table stays. */
+-static BOOL registry_driver_version(enum wined3d_pci_vendor vendor, DWORD *high, DWORD *low)
++static BOOL registry_driver_version(enum wined3d_pci_vendor vendor, unsigned int *high, unsigned int *low)
+ {
+     static const WCHAR class_key[] = L"System\\CurrentControlSet\\Control\\Class\\"
+             L"{4d36e968-e325-11ce-bfc1-08002be10318}";

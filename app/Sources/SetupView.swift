@@ -49,11 +49,16 @@ struct SetupView: View {
             case .help: HelpSheet(model:model)
             case .about: AboutSheet(model:model)
             case .uninstall: UninstallSheet(model:model).interactiveDismissDisabled(model.uninstall == .working)
+            case .removeOwnSteam: RemoveOwnSteamSheet(model:model).interactiveDismissDisabled(model.ownSteamRemoval != .idle)
+            case .surroundSettings: SurroundSettingsSheet(model:model)
             case .update: UpdateSheet(model:model).interactiveDismissDisabled(model.update == .installing)
                 .onDisappear { model.updateSheetClosed() }
             case .whatsNew: WhatsNewSheet()
             case .keyOverrides: KeyOverridesSheet(model:model)
             case .profileSettings: ProfileSettingsSheet(model:model)
+            case .controllerCheck: ControllerCheckSheet(model:model)
+            case .benchmarks: BenchmarksSheet(model:model)
+            case .installedGames: InstalledGamesSheet(model:model)
             }
         }
         .task { model.startup() }

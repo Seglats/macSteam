@@ -1,0 +1,66 @@
+From: MacFinals
+Subject: [PATCH] wined3d: VideoDriverVersion setting for the reported driver version
+
+Follows wine-wined3d-registry-driver-version.patch. When a game renders with DXMT presenting an
+NVIDIA GPU (DXMT_ENABLE_NVEXT, MetalFX upscaling on DXMT), DXGI reports DXMT's driver version
+(32.0.19.9999) but nothing registers one, so Direct3D 9 (wined3d) still reported its table's
+GeForce 8 driver, 31.0.13.4052. Deadlock reads that one, reports the driver as out of date
+(< 32.0.15.8108) and never offers DLSS: it doesn't even load nvngx.dll (2026-11-25 14:05).
+
+wined3d now takes a VideoDriverVersion setting (a.b.c.d), read like its other settings (the
+WINE_D3D_CONFIG environment variable, then Software\Wine\Direct3D), which wins over the
+registry and the table. The compatibility tool sets it to DXMT's version in those launches only.
+
+--- a/dlls/wined3d/wined3d_private.h	2026-11-25 14:07:48
++++ b/dlls/wined3d/wined3d_private.h	2026-11-25 14:07:48
+@@ -493,6 +493,9 @@
+     bool check_float_constants;
+     bool cb_access_map_w;
+     bool ffp_hlsl;
++    /* VideoDriverVersion (a.b.c.d); both 0 = not set. */
++    unsigned int driver_version_high;
++    unsigned int driver_version_low;
+ };
+ 
+ extern struct wined3d_settings wined3d_settings;
+--- a/dlls/wined3d/wined3d_main.c	2026-11-25 14:07:48
++++ b/dlls/wined3d/wined3d_main.c	2026-11-25 14:07:48
+@@ -417,6 +417,24 @@
+             }
+             else
+                 ERR("VideoMemorySize is %i but must be >0\n", TmpVideoMemorySize);
++        }
++        /* MacFinals: the driver version to report when the renderer the game uses isn't wined3d
++         * and has its own (DXMT presenting an NVIDIA GPU reports 32.0.19.9999 through DXGI). */
++        if (!get_config_key(hkey, appkey, env, "VideoDriverVersion", buffer, size))
++        {
++            unsigned int a, b, c, d;
++
++            if (sscanf(buffer, "%u.%u.%u.%u", &a, &b, &c, &d) == 4
++                    && a <= 0xffff && b <= 0xffff && c <= 0xffff && d <= 0xffff)
++            {
++                TRACE("Using driver version %u.%u.%u.%u\n", a, b, c, d);
++                wined3d_settings.driver_version_high = MAKEDWORD_VERSION(a, b);
++                wined3d_settings.driver_version_low = MAKEDWORD_VERSION(c, d);
++            }
++            else
++            {
++                ERR("Invalid value for VideoDriverVersion %s; expected a.b.c.d.\n", debugstr_a(buffer));
++            }
+         }
+         if (!get_config_key(hkey, appkey, env, "WineLogo", buffer, size))
+         {
+--- a/dlls/wined3d/directx.c	2026-11-25 14:07:48
++++ b/dlls/wined3d/directx.c	2026-11-25 14:07:48
+@@ -981,6 +981,11 @@
+         driver_info->version_low = MAKEDWORD_VERSION(version_info->subversion, version_info->build);
+         if (driver_model == DRIVER_MODEL_NT6X)
+             registry_driver_version(driver_info->vendor, &driver_info->version_high, &driver_info->version_low);
++        if (wined3d_settings.driver_version_high || wined3d_settings.driver_version_low)
++        {
++            driver_info->version_high = wined3d_settings.driver_version_high;
++            driver_info->version_low = wined3d_settings.driver_version_low;
++        }
+ 
+         return true;
+     }

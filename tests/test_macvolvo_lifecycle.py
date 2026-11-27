@@ -39,17 +39,22 @@ class SteamLifecycle(unittest.TestCase):
                               'return waitTaskTicking(p,([mode isEqual:@"hang"] || [mode isEqual:@"stubborn"]) ? 2 : seconds,nil);')
         launch = worker[worker.index('static void launchClient('):]
         request = block(launch, '    if(existing.count) {')
-        end_session = block(worker, 'static void endSession(')
+        end_session = block(worker, 'static int endStragglers(') + block(worker, 'static void endSession(')
         close_client = block(worker, 'static void closeClient(NSString *gameRunning) {')
+        # Seconds in the close wait are counted, not slept: a slow Steam takes no real time here.
+        assert '[NSThread sleepForTimeInterval:1];' in close_client
+        close_client = close_client.replace('[NSThread sleepForTimeInterval:1];', 'waitedSeconds++;')
         source = r'''#import <Foundation/Foundation.h>
 #include <signal.h>
 #include <unistd.h>
+#include <libproc.h>
 static NSString *root, *mode;
 static NSFileManager *fm;
 static NSMutableArray *events;
 static NSMutableDictionary *membershipCache;
 static volatile sig_atomic_t childPID, cancelRequested;
 static int inventoryCalls;
+static int waitedSeconds;
 static NSString *join(NSString *a,NSString *b) {return [a stringByAppendingPathComponent:b];}
 static void fail(NSString *code) {@throw [NSException exceptionWithName:@"SetupError" reason:code userInfo:nil];}
 static void event(NSString *stage,NSDictionary *details) {(void)details;[events addObject:stage];}
@@ -76,6 +81,9 @@ static NSArray *sessionProcesses(void) {
         return @[@{@"kind":@"game",@"pid":@99}];
     if(([mode isEqual:@"client"] || [mode isEqual:@"late-game"]) && call==0)
         return @[@{@"kind":@"client",@"pid":@98}];
+    // Steam honouring -shutdown slowly: 72 s, as one did after its browser failed (2026-11-27).
+    if([mode isEqual:@"slow-steam"] && call<72) return @[@{@"kind":@"client",@"pid":@98}];
+    if([mode isEqual:@"never-closes"]) return @[@{@"kind":@"client",@"pid":@98}];
     return @[];
 }
 ''' + tasks + end_session + close_client + r'''
@@ -96,7 +104,7 @@ int main(int argc,const char **argv) {@autoreleasepool {
         else if(!strcmp(argv[2],"close"))closeClient(@"game_running");
         else endSession(runtime());
     } @catch(NSException *error) {code=error.reason;}
-    NSData *data=[NSJSONSerialization dataWithJSONObject:@{@"code":code,@"events":events} options:0 error:nil];
+    NSData *data=[NSJSONSerialization dataWithJSONObject:@{@"code":code,@"events":events,@"waited":@(waitedSeconds)} options:0 error:nil];
     fwrite(data.bytes,1,data.length,stdout);return 0;
 }}
 '''
@@ -219,6 +227,44 @@ int main(int argc,char **argv) {
             with self.subTest(mode=mode):
                 self.assertEqual(self.call('close', mode)['code'], 'game_running')
                 self.assertEqual(self.server_calls(), [])
+
+    def test_ending_the_session_ends_leftovers_from_the_runtime_only(self):
+        # A Wine process that outlived its server (2026-11-27: a removed own Steam's winedevice.exe
+        # kept the controller open for hours, ignoring SIGTERM).
+        leftover = self.root / 'runtimes/v1/bin/winedevice'
+        shutil.copy2(self.fixture, leftover)
+        outside = self.root / 'elsewhere'
+        outside.mkdir()
+        shutil.copy2(self.fixture, outside / 'winedevice')
+        env = lambda mode, where: {**os.environ, 'TEST_ROOT': str(where), 'TEST_MODE': mode}
+        stray = subprocess.Popen([str(leftover)], env=env('stubborn', self.root))      # ignores SIGTERM, as the real one did
+        other = subprocess.Popen([str(outside / 'winedevice')], env=env('hang', outside))
+        deadline = time.monotonic() + 2
+        while not ((self.root / 'request.pid').exists() and (outside / 'request.pid').exists()) and time.monotonic() < deadline:
+            time.sleep(.01)
+        (self.root / 'request.pid').unlink(missing_ok=True)
+        try:
+            result = self.call('end')
+            self.assertEqual(result['code'], 'ok')
+            self.assertIn('stragglers_ended', result['events'])
+            self.assertEqual(stray.wait(timeout=5), -signal.SIGKILL)
+            self.assertIsNone(other.poll())
+        finally:
+            for p in (stray, other):
+                if p.poll() is None: p.kill()
+                p.wait()
+
+    def test_close_waits_for_a_steam_that_takes_over_a_minute(self):
+        result = self.call('close', 'slow-steam')
+        self.assertEqual(result['code'], 'ok')
+        self.assertGreaterEqual(result['waited'], 71)
+        self.assertEqual(self.server_calls(), ['-k', '-w'])
+
+    def test_close_gives_up_after_90_seconds_without_ending_steam(self):
+        result = self.call('close', 'never-closes')
+        self.assertEqual(result['code'], 'client_close_failed')
+        self.assertEqual(result['waited'], 90)
+        self.assertEqual(self.server_calls(), [])            # Steam is never killed: it may be saving
 
     def test_close_does_not_report_success_when_server_cannot_exit(self):
         self.assertEqual(self.call('close', 'wait-fails')['code'], 'client_close_failed')

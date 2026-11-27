@@ -238,7 +238,7 @@ static void configurePreferences(NSInteger width, NSInteger height, NSInteger ga
 }
 static void configureDisplay(NSInteger width, NSInteger height) {configurePreferences(width,height,width,height,NO);}
 /* The game's window must fit inside the main display as Wine sees it (twice its size in
- * points, in Retina mode), or Wine keeps the pointer out of part of it. A larger choice
+ * points, in Retina mode, which is on for a HiDPI main display only), or Wine keeps the pointer out of part of it. A larger choice
  * (4K on a MacBook screen, say, after playing on a 4K monitor, or 5120x2160 chosen in
  * the game on an ultrawide one) is lowered for this launch to the largest of Settings'
  * resolutions of the same shape that fits, or the largest that fits at all; the choice
@@ -256,7 +256,8 @@ static void fitResolution(NSInteger *width, NSInteger *height, NSInteger maxWidt
 static void fittedResolution(NSInteger *width, NSInteger *height) {
     CGDisplayModeRef mode=CGDisplayCopyDisplayMode(CGMainDisplayID());
     if(!mode)return;
-    NSInteger maxWidth=(NSInteger)CGDisplayModeGetWidth(mode)*2,maxHeight=(NSInteger)CGDisplayModeGetHeight(mode)*2;
+    NSInteger factor=mainDisplayIsRetina()?2:1;   // Retina mode only on a HiDPI main display
+    NSInteger maxWidth=(NSInteger)CGDisplayModeGetWidth(mode)*factor,maxHeight=(NSInteger)CGDisplayModeGetHeight(mode)*factor;
     CGDisplayModeRelease(mode);
     fitResolution(width,height,maxWidth,maxHeight);
 }

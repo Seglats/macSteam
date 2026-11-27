@@ -7,18 +7,24 @@ static NSString *retinaRegistry(void) {
     NSString *text=[NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:nil];
     if(!text)fail(@"retina_configuration_failed");return text;
 }
-static BOOL retinaConfigured(void) {
+/* The Mac Driver's RetinaMode value in the prefix: @"Y", @"N", or nil when unset. */
+static NSString *retinaValue(void) {
     BOOL section=NO;
     for(NSString *raw in [retinaRegistry() componentsSeparatedByString:@"\n"]) {
         NSString *line=[raw stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
         if([line hasPrefix:@"["])
             section=[line hasPrefix:@"[Software\\\\Wine\\\\Mac Driver]"];
-        else if(section && [line isEqual:@"\"RetinaMode\"=\"Y\""])return YES;
+        else if(section && [line isEqual:@"\"RetinaMode\"=\"Y\""])return @"Y";
+        else if(section && [line isEqual:@"\"RetinaMode\"=\"N\""])return @"N";
     }
-    return NO;
+    return nil;
 }
+static BOOL retinaConfigured(void) {return [retinaValue() isEqual:@"Y"];}
+/* Retina mode on for a HiDPI main display, off for a 1x one (mainDisplayIsRetina,
+ * portable_steam.h); set again at each Steam start when the main display changed kind. */
 static void configureRetina(void) {
-    if(retinaConfigured())return;
+    NSString *wanted=mainDisplayIsRetina()?@"Y":@"N";
+    if([retinaValue() isEqual:wanted])return;
     NSString *engine=runtime();
     // Wine caches desktop geometry in the running session. Never change the
     // registry underneath a client/game, or kill one to perform this migration.
@@ -30,13 +36,13 @@ static void configureRetina(void) {
         fail(@"settings_backup_failed");
     ownedPreparation=YES;
     if(waitTask(task(join(engine,@"bin/wine"),
-        @[@"reg.exe",@"add",@"HKCU\\Software\\Wine\\Mac Driver",@"/v",@"RetinaMode",@"/t",@"REG_SZ",@"/d",@"Y",@"/f"],
+        @[@"reg.exe",@"add",@"HKCU\\Software\\Wine\\Mac Driver",@"/v",@"RetinaMode",@"/t",@"REG_SZ",@"/d",wanted,@"/f"],
         wineEnv(engine),@"retina-configuration.log"),60))fail(@"retina_configuration_failed");
     // The registry tool itself starts Wine with the old geometry. Wait for its
-    // server to exit and flush the registry before starting Battle.net afresh.
+    // server to exit and flush the registry before starting Steam afresh.
     if(waitTask(task(join(engine,@"bin/wineserver"),@[@"-w"],wineEnv(engine),@"retina-wait.log"),60))
         fail(@"environment_initialization_busy");
     ownedPreparation=NO;
-    if(!retinaConfigured())fail(@"retina_configuration_failed");
-    event(@"retina_configured",nil);
+    if(![retinaValue() isEqual:wanted])fail(@"retina_configuration_failed");
+    event(@"retina_configured",@{@"retina":@([wanted isEqual:@"Y"])});
 }

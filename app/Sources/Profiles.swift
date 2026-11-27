@@ -55,6 +55,7 @@ enum Profiles {
     static func gameID(_ appID:String)->String { "app-"+appID }
     static func dir(_ id:String)->URL { folder.appendingPathComponent(id) }
     static func dxmtFile(_ id:String)->URL { dir(id).appendingPathComponent("dxmt.conf") }
+    static func d3dmetalFile(_ id:String)->URL { dir(id).appendingPathComponent("d3dmetal.conf") }
 
     /// Games macSteam has its own renderer settings for (bundled <name>.conf), and the Direct3D
     /// games known to use, as the default when making a profile.
@@ -97,12 +98,16 @@ enum Profiles {
     private static func make(_ p:Profile,resources:URL) throws {
         try fm.createDirectory(at:dir(p.id),withIntermediateDirectories:true)
         try writeJSON(p)
-        // Renderer settings once, from the app; a DX12 profile has none to set yet.
+        // Renderer settings once: DXMT's from the app for DX11, D3DMetal's defaults for DX12.
         if p.kind == .dx11 {
             let name=p.appID.flatMap { tuned[$0] } ?? "dx11"
             if fm.fileExists(atPath:dxmtFile(p.id).path) { try fm.removeItem(at:dxmtFile(p.id)) }
             try fm.copyItem(at:resources.appendingPathComponent("NotProton/profiles/\(name).conf"),to:dxmtFile(p.id))
-        } else { try? fm.removeItem(at:dxmtFile(p.id)) }
+            try? fm.removeItem(at:d3dmetalFile(p.id))
+        } else {
+            try? fm.removeItem(at:dxmtFile(p.id))
+            try saveD3DMetal(p.id,D3DMetalSettings())
+        }
         if p.appID == deadlockAppID { NotProton.keepDeadlockOnDirectX11() }
     }
     private static func writeJSON(_ p:Profile) throws {
@@ -112,6 +117,58 @@ enum Profiles {
     static func remove(_ id:String) throws {
         guard exists(id) else { return }
         try fm.removeItem(at:dir(id))
+    }
+    /// A game profile made for the wrong Direct3D (its last launch used the other one) switched in
+    /// place. Never automatic: a game can run either way (KovaaK's with -dx12). Switching away from
+    /// DX11 or DX12 keeps that kind's settings aside (dxmt.conf.dx11, d3dmetal.conf.dx12), so
+    /// switching back restores them.
+    static func setKind(_ id:String,_ kind:Kind,resources:URL) throws {
+        guard let old=profile(id),!old.isGlobal,old.kind != kind else { return }
+        let current=old.kind == .dx11 ? dxmtFile(id) : d3dmetalFile(id)
+        let aside={ (k:Kind) in dir(id).appendingPathComponent(k == .dx11 ? "dxmt.conf.dx11" : "d3dmetal.conf.dx12") }
+        if fm.fileExists(atPath:current.path) {
+            try? fm.removeItem(at:aside(old.kind))
+            try fm.moveItem(at:current,to:aside(old.kind))
+        }
+        let p=Profile(id:old.id,name:old.name,kind:kind,appID:old.appID)
+        if fm.fileExists(atPath:aside(kind).path) {
+            try writeJSON(p)
+            try? fm.removeItem(at:old.kind == .dx11 ? d3dmetalFile(id) : dxmtFile(id))
+            try fm.moveItem(at:aside(kind),to:kind == .dx11 ? dxmtFile(id) : d3dmetalFile(id))
+        } else { try make(p,resources:resources) }
+    }
+
+    // MARK: Renderer settings (d3dmetal.conf of a DX12 profile)
+    /// D3DMetal's settings a DX12 profile holds. The SteamDriver tool reads d3dmetal.conf when the
+    /// game starts (environments/finals/compat-tool/run): the game's own profile if it has one,
+    /// else Global DX12. key = value lines, like dxmt.conf.
+    struct D3DMetalSettings:Equatable {
+        /// upscaling: DLSS runs on Apple's MetalFX (D3DM_ENABLE_METALFX). D3DMetal then presents an
+        /// NVIDIA GPU to the game, Apple's own switch for DLSS.
+        var upscaling=false
+        /// surround: headphone surround (Experimental › Headphone surround, Surround.swift).
+        var surround=false
+    }
+    static func d3dmetalSettings(_ id:String)->D3DMetalSettings {
+        let text=(try? String(contentsOf:d3dmetalFile(id),encoding:.utf8)) ?? ""
+        let v=values(text)
+        func bool(_ k:String)->Bool { v[k].map { $0.lowercased()=="true" || $0=="1" } ?? false }
+        return D3DMetalSettings(upscaling:bool("upscaling"),surround:bool("surround"))
+    }
+    static func saveD3DMetal(_ id:String,_ s:D3DMetalSettings) throws {
+        let text="""
+            # D3DMetal settings for this profile (macSteam). Read by the SteamDriver tool at launch.
+            # upscaling: DLSS on Apple's MetalFX; D3DMetal presents an NVIDIA GPU to the game.
+            upscaling = \(s.upscaling ? "True" : "False")
+            # surround: headphone surround (needs macSteam's Experimental › Headphone surround).
+            surround = \(s.surround ? "True" : "False")
+
+            """
+        try text.write(to:d3dmetalFile(id),atomically:true,encoding:.utf8)
+    }
+    static func d3dmetalSummary(_ s:D3DMetalSettings)->String {
+        [s.upscaling ? "MetalFX upscaling (DLSS)" : "No upscaling",
+         s.surround && Surround.enabled ? "headphone surround" : nil].compactMap { $0 }.joined(separator:" · ")
     }
 
     // MARK: Renderer settings (dxmt.conf of a DX11 profile)
@@ -136,10 +193,17 @@ enum Profiles {
         var sharpScaling=false
         /// d3d11.releaseShaderIR: free each shader's intermediate code once compiled (DXMT's default).
         var releaseShaderIR=true
+        /// steamdriver.upscaling: DLSS on Apple's MetalFX. Read by the SteamDriver tool, not DXMT
+        /// (which ignores the key): the game stays on DXMT, whose own DLSS stand-in runs it
+        /// (runtime macfinals-184 on; older runtimes fall back to D3DMetal).
+        var upscaling=false
+        /// steamdriver.surround: headphone surround, read by the SteamDriver tool (Surround.swift).
+        var surround=false
     }
     private static let keys=(latency:"dxgi.maxFrameLatency",pacing:"dxgi.presentPacing",mode:"dxgi.presentPacingMode",
                              target:"dxgi.presentPacingTargetUs",cap:"d3d11.preferredMaxFrameRate",threads:"d3d11.shaderCompilerThreads",
-                             priority:"d3d11.shaderCompilerNormalPriority",sharp:"dxgi.sharpPresentation",ir:"d3d11.releaseShaderIR")
+                             priority:"d3d11.shaderCompilerNormalPriority",sharp:"dxgi.sharpPresentation",ir:"d3d11.releaseShaderIR",
+                             upscaling:"steamdriver.upscaling",surround:"steamdriver.surround")
     /// key = value lines (the first of each key), whatever section they are in.
     private static func values(_ text:String)->[String:String] {
         var out:[String:String]=[:]
@@ -160,7 +224,8 @@ enum Profiles {
                         lateInput:bool(keys.pacing,false) && int(keys.mode,1)==3,
                         frameCap:max(int(keys.cap,0),0),shaderThreads:min(max(int(keys.threads,0),0),64),
                         shaderNormalPriority:bool(keys.priority,false),sharpScaling:bool(keys.sharp,false),
-                        releaseShaderIR:bool(keys.ir,true))
+                        releaseShaderIR:bool(keys.ir,true),upscaling:bool(keys.upscaling,false),
+                        surround:bool(keys.surround,false))
     }
     static func save(_ id:String,_ s:Settings) throws {
         var lines=((try? String(contentsOf:dxmtFile(id),encoding:.utf8)) ?? "").components(separatedBy:"\n")
@@ -182,6 +247,9 @@ enum Profiles {
         set(keys.priority,b(s.shaderNormalPriority))
         set(keys.sharp,b(s.sharpScaling))
         set(keys.ir,b(s.releaseShaderIR))
+        set(keys.upscaling,b(s.upscaling))
+        // Written only once used, so dxmt.conf files stay as they were for players who never turn it on.
+        if s.surround || lines.contains(where:{ $0.contains(keys.surround) }) { set(keys.surround,b(s.surround)) }
         try (lines.joined(separator:"\n")+"\n").write(to:dxmtFile(id),atomically:true,encoding:.utf8)
     }
     /// Back to the settings macSteam brings (CS2's and Deadlock's own, dx11.conf for others).
@@ -195,7 +263,9 @@ enum Profiles {
          s.lateInput ? "late input sampling" : nil,
          s.frameCap==0 ? "no frame cap" : "capped at \(s.frameCap) fps",
          s.shaderThreads==0 ? "shader threads: automatic" : "\(s.shaderThreads) shader threads",
-         s.sharpScaling ? "sharp scaling" : nil].compactMap { $0 }.joined(separator:" · ")
+         s.sharpScaling ? "sharp scaling" : nil,
+         s.upscaling ? "MetalFX upscaling (DLSS)" : nil,
+         s.surround && Surround.enabled ? "headphone surround" : nil].compactMap { $0 }.joined(separator:" · ")
     }
 
     // MARK: Games to choose from

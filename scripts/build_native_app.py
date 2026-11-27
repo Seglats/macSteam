@@ -25,7 +25,7 @@ APP_BUILD='9'
 # The games' voice chat runs under this app's microphone permission (Microphone.swift); the
 # hardened runtime gives an app signed without the entitlement silence, with no prompt.
 ENTITLEMENTS={'com.apple.security.device.audio-input':True}
-MICROPHONE_USAGE='Voice chat in Counter-Strike 2 and Deadlock uses your microphone.'
+MICROPHONE_USAGE='The game you’re playing asks for microphone input, for voice chat.'
 RESOURCES=('Wordmark.png','WordmarkDark.png')
 # llvm-mingw (docs/HANDOFF.md) builds the Windows stand-in for Steam's steamwebhelper.exe.
 MINGW_CLANG=ROOT/'runtime/toolchains/llvm-mingw-20261006-ucrt-macos-universal/bin/x86_64-w64-mingw32-clang'
@@ -122,6 +122,22 @@ def build(output,workspace,runtime_archive,icon=None,identity=None,variant='dxmt
     run('/usr/bin/swiftc','-file-prefix-map',str(ROOT)+'=/ow2-source','-O','-target','arm64-apple-macos'+MINIMUM_MACOS,'-parse-as-library',*(['-D','MACVOLVO_GPTK4'] if evaluation else []),*sorted((ROOT/'app/Sources').glob('*.swift')),'-o',macos/app_name)
     # Steam's window on Wine 11 (portable_steam.h): the worker puts this in steamwebhelper.exe's place.
     run(MINGW_CLANG,'-O2','-municode','-mwindows','-ffile-prefix-map='+str(ROOT)+'=/ow2-source',ROOT/'scripts/webhelper_wrapper.c','-o',resources/'steamwebhelper.exe')
+    # The controller check's probe (ControllerCheck.swift): shipped with the app, run only by the check
+    # with the SteamDriver tool's Wine in a prefix of its own; never part of a runtime.
+    (resources/'ControllerCheck').mkdir()
+    run(MINGW_CLANG,'-O2','-ffile-prefix-map='+str(ROOT)+'=/ow2-source',ROOT/'scripts/controller_probe.c','-o',resources/'ControllerCheck/controller_probe.exe','-ldinput8','-ldxguid','-lole32')
+    # Experimental › Headphone surround's Test (Surround.swift): a 7.1 stream through the SteamDriver
+    # tool's Wine in a prefix of its own; never part of a runtime.
+    (resources/'SurroundTest').mkdir()
+    run(MINGW_CLANG,'-O2','-ffile-prefix-map='+str(ROOT)+'=/ow2-source','-I',ROOT/'scripts',ROOT/'scripts/surround_test.c','-o',resources/'SurroundTest/surround_test.exe','-lole32','-lksuser')
+    # its sound: one ball bounce (scripts/surround/README.md, Pixabay Content License)
+    shutil.copy2(ROOT/'scripts/surround/ball-bounce.wav',resources/'SurroundTest/ball-bounce.wav')
+    # Headphone surround › Settings…' live preview (SurroundSettings.swift, scripts/surround_preview.c):
+    # the fitted model with the player's knobs, played natively; Save bakes the file Wine loads. With
+    # its head table (MIT KEMAR, Gardner and Martin: free to use with credit, THIRD_PARTY_NOTICES.md).
+    run('/usr/bin/clang','-O2','-arch','arm64','-mmacosx-version-min='+MINIMUM_MACOS,'-ffile-prefix-map='+str(ROOT)+'=/ow2-source','-I',ROOT/'scripts',
+        ROOT/'scripts/surround_preview.c','-framework','AudioToolbox','-o',helpers/'surround_preview')
+    shutil.copy2(ROOT/'scripts/surround/kemar.head',resources/'SurroundTest/kemar.head')
     rosetta=helpers/'Rosetta Check.app/Contents';(rosetta/'MacOS').mkdir(parents=True)
     source=output.parent/'rosetta-check.c';source.write_text('int main(void) { return 0; }\n')
     run('/usr/bin/clang','-ffile-prefix-map='+str(ROOT)+'=/ow2-source','-arch','x86_64','-mmacosx-version-min='+MINIMUM_MACOS,source,'-o',rosetta/'MacOS/RosettaCheck')
@@ -167,7 +183,7 @@ def build(output,workspace,runtime_archive,icon=None,identity=None,variant='dxmt
     (output/'Contents/Info.plist').write_bytes(plistlib.dumps({'CFBundleIdentifier':bundle_id,'CFBundleExecutable':app_name,'CFBundleName':app_name,'CFBundleDisplayName':app_name,'CFBundlePackageType':'APPL','CFBundleShortVersionString':release['appVersion'],'CFBundleVersion':APP_BUILD,'CFBundleIconFile':'AppIcon','LSMinimumSystemVersion':MINIMUM_MACOS,'NSHighResolutionCapable':True,'LSMultipleInstancesProhibited':True,'NSPrincipalClass':'NSApplication','NSMicrophoneUsageDescription':MICROPHONE_USAGE,'NSHumanReadableCopyright':'Independent community project based on Recall. Not affiliated with or endorsed by Valve, Volvo or Apple.'}))
     if identity:
         timestamp=['--timestamp'] if identity!='-' else []
-        for binary in (helpers/'ow2-setup',rosetta.parent):
+        for binary in (helpers/'ow2-setup',helpers/'surround_preview',rosetta.parent):
             run('/usr/bin/codesign','--force','--options','runtime',*timestamp,'--sign',identity,binary)
         with tempfile.TemporaryDirectory() as folder:
             entitlements=Path(folder)/'app.entitlements';entitlements.write_bytes(plistlib.dumps(ENTITLEMENTS))

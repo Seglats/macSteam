@@ -1,0 +1,198 @@
+From: MacFinals
+Subject: [PATCH] winebus.sys, xinput, dinput: macfinals_pad trace channel for controller latency
+
+Trace-class timestamps (microseconds on QueryPerformanceCounter's clock) at each handoff of a
+controller report, only for reports/states that changed, so the controller latency inside Wine
+can be measured (tests/controller_latency, stage 2). Off unless WINEDEBUG has +macfinals_pad.
+
+  usb    winebus.so, Xbox 360 bus: the pad's USB report completed (with its values)
+  hid    winebus.sys: the report handed to hidclass ("read" = a read was waiting)
+  xinput xinput's update thread: the new state is ready (with its values)
+  game   XInputGetState/Ex: the game's first read of that state (with its values)
+  dinput dinput's HID joystick: the new device state is ready
+  game   IDirectInputDevice8::GetDeviceState: the game's first read of it
+
+Windows.Gaming.Input reads through dinput in Wine, so it shows as the dinput lines.
+---
+--- a/dlls/winebus.sys/bus_xbox360.c
++++ b/dlls/winebus.sys/bus_xbox360.c
+@@ -25,6 +25,7 @@
+ 
+ #include <stdarg.h>
+ #include <stdlib.h>
++#include <string.h>
+ 
+ #if defined(HAVE_IOKIT_USB_IOUSBLIB_H)
+ #define DWORD UInt32
+@@ -100,6 +101,7 @@
+ #include "unix_private.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(plugplay);
++WINE_DECLARE_DEBUG_CHANNEL(macfinals_pad);
+ 
+ #ifdef HAVE_IOSERVICEMATCHING
+ 
+@@ -121,6 +123,7 @@
+     UInt8 in_pipe, out_pipe;
+ 
+     char buffer[64];
++    char last_input[20];  /* macfinals_pad: the last input report, to trace only changes */
+ };
+ 
+ static inline struct xbox_device *impl_from_unix_device(struct unix_device *iface)
+@@ -376,6 +379,18 @@
+     report->buttons &= 0xFFF0;
+     report->buttons |= hatswitch;
+ 
++    /* Controller latency (tests/controller_latency): when the pad's report completed, on the
++     * clock QueryPerformanceCounter reads, in microseconds; only reports that changed. */
++    if (TRACE_ON(macfinals_pad) && memcmp(private->last_input, report, sizeof(private->last_input)))
++    {
++        LARGE_INTEGER now;
++        NtQueryPerformanceCounter(&now, NULL);
++        memcpy(private->last_input, report, sizeof(private->last_input));
++        TRACE_(macfinals_pad)("usb t %llu b %04x lt %u rt %u l %d %d r %d %d\n", (unsigned long long)now.QuadPart / 10,
++                              (USHORT)report->buttons, (BYTE)report->trigger_left, (BYTE)report->trigger_right,
++                              report->hat_left_x, report->hat_left_y, report->hat_right_x, report->hat_right_y);
++    }
++
+     bus_event_queue_input_report(&event_queue, device, (BYTE *)report, FIELD_OFFSET(IN_REPORT, reserved));
+ 
+ next:
+--- a/dlls/winebus.sys/main.c
++++ b/dlls/winebus.sys/main.c
+@@ -45,6 +45,7 @@
+ DEFINE_GUID(GUID_NULL,0,0,0,0,0,0,0,0,0,0,0);
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(hid);
++WINE_DECLARE_DEBUG_CHANNEL(macfinals_pad);
+ 
+ static DRIVER_OBJECT *driver_obj;
+ 
+@@ -716,6 +717,14 @@
+ 
+     list_add_tail(&ext->reports, &report->entry);
+ 
++    /* Controller latency: a changed report handed to hidclass ("read" if a read was waiting). */
++    if (TRACE_ON(macfinals_pad) && memcmp(last_report->buffer, report_buf, report_len))
++    {
++        LARGE_INTEGER now;
++        NtQueryPerformanceCounter(&now, NULL);
++        TRACE_(macfinals_pad)("hid t %I64u %s\n", now.QuadPart / 10, ext->pending_read ? "read" : "queued");
++    }
++
+     memcpy(last_report->buffer, report_buf, report_len);
+ 
+     if ((irp = pop_pending_read(ext)))
+--- a/dlls/xinput1_3/main.c
++++ b/dlls/xinput1_3/main.c
+@@ -50,7 +50,23 @@
+ #define XINPUT_GAMEPAD_GUIDE 0x0400
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(xinput);
++WINE_DECLARE_DEBUG_CHANNEL(macfinals_pad);
+ 
++/* Controller latency (tests/controller_latency): microseconds on QueryPerformanceCounter's clock. */
++static ULONGLONG pad_trace_us(void)
++{
++    LARGE_INTEGER now;
++    QueryPerformanceCounter(&now);
++    return now.QuadPart / 10;
++}
++
++static void pad_trace_state(const char *what, DWORD index, const XINPUT_GAMEPAD *pad)
++{
++    TRACE_(macfinals_pad)("%s %lu t %I64u b %04x lt %u rt %u l %d %d r %d %d\n", what, index, pad_trace_us(),
++                          pad->wButtons, pad->bLeftTrigger, pad->bRightTrigger, pad->sThumbLX, pad->sThumbLY,
++                          pad->sThumbRX, pad->sThumbRY);
++}
++
+ struct xinput_controller
+ {
+     CRITICAL_SECTION crit;
+@@ -655,6 +671,8 @@
+     if (controller->enabled)
+     {
+         state.dwPacketNumber = controller->state.dwPacketNumber + 1;
++        if (TRACE_ON(macfinals_pad) && memcmp(&state.Gamepad, &controller->state.Gamepad, sizeof(state.Gamepad)))
++            pad_trace_state("xinput", controller - controllers, &state.Gamepad);
+         controller->state = state;
+         memset(&controller->hid.read_ovl, 0, sizeof(controller->hid.read_ovl));
+         controller->hid.read_ovl.hEvent = controller->hid.read_event;
+@@ -855,6 +873,17 @@
+ 
+     *state = controllers[index].state;
+     controller_unlock(&controllers[index]);
++
++    /* The game's first read of a changed state (racy across threads, fine for a trace). */
++    if (TRACE_ON(macfinals_pad))
++    {
++        static XINPUT_GAMEPAD last_read[XUSER_MAX_COUNT];
++        if (memcmp(&last_read[index], &state->Gamepad, sizeof(state->Gamepad)))
++        {
++            last_read[index] = state->Gamepad;
++            pad_trace_state("game", index, &state->Gamepad);
++        }
++    }
+ 
+     return ERROR_SUCCESS;
+ }
+--- a/dlls/dinput/device_private.h
++++ b/dlls/dinput/device_private.h
+@@ -115,6 +115,7 @@
+ 
+     BYTE device_state_report_id;
+     BYTE device_state[DEVICE_STATE_MAX_SIZE];
++    BOOL pad_trace_unread;      /* macfinals_pad: device_state changed since the last GetDeviceState */
+ 
+     BOOL autocenter;
+     LONG device_gain;
+--- a/dlls/dinput/joystick_hid.c
++++ b/dlls/dinput/joystick_hid.c
+@@ -48,6 +48,7 @@
+ #include "wine/hid.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(dinput);
++WINE_DECLARE_DEBUG_CHANNEL(macfinals_pad);
+ 
+ DEFINE_GUID( GUID_DEVINTERFACE_WINEXINPUT,0x6c53d5fd,0x6480,0x440f,0xb6,0x18,0x47,0x67,0x50,0xc5,0xe1,0xa6 );
+ DEFINE_GUID( hid_joystick_guid, 0x9e573edb, 0x7734, 0x11d2, 0x8d, 0x4a, 0x23, 0x90, 0x3f, 0xb6, 0xbd, 0xf7 );
+@@ -1297,6 +1298,14 @@
+ 
+             enum_objects( impl, &filter, DIDFT_AXIS | DIDFT_POV, read_device_state_value, &params );
+             enum_objects( impl, &filter, DIDFT_BUTTON, check_device_state_button, &params );
++            /* Controller latency (tests/controller_latency): when a changed state is ready. */
++            if (TRACE_ON(macfinals_pad) && memcmp( &params.old_state, impl->base.device_state, format->dwDataSize ))
++            {
++                LARGE_INTEGER now;
++                QueryPerformanceCounter( &now );
++                impl->base.pad_trace_unread = TRUE;
++                TRACE_(macfinals_pad)( "dinput %p t %I64u\n", iface, now.QuadPart / 10 );
++            }
+             if (impl->base.hEvent && memcmp( &params.old_state, impl->base.device_state, format->dwDataSize ))
+                 SetEvent( impl->base.hEvent );
+         }
+--- a/dlls/dinput/device.c
++++ b/dlls/dinput/device.c
+@@ -41,6 +41,7 @@
+ #define WM_WINE_NOTIFY_ACTIVITY WM_USER
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(dinput);
++WINE_DECLARE_DEBUG_CHANNEL(macfinals_pad);
+ 
+ /* Windows uses this GUID for guidProduct on non-keyboard/mouse devices.
+  * Data1 contains the device VID (low word) and PID (high word).
+@@ -1470,6 +1471,13 @@
+         hr = DIERR_INVALIDPARAM;
+     else
+     {
++        if (impl->pad_trace_unread)
++        {
++            LARGE_INTEGER now;
++            QueryPerformanceCounter( &now );
++            impl->pad_trace_unread = FALSE;
++            TRACE_(macfinals_pad)( "game %p t %I64u\n", iface, now.QuadPart / 10 );
++        }
+         memset( user_state, 0, size );
+ 
+         user_obj = user_format->rgodf + device_format->dwNumObjs;

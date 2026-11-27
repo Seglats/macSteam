@@ -355,9 +355,25 @@ static BOOL steamWindowFix(NSString *engine) {
 }
 
 /* Steam lays itself out at Windows' 96 DPI, which Retina mode shows at half size. Twice
- * that (192) keeps its window Mac-sized with sharp text; the games handle it (DPI aware). */
+ * that (192) keeps its window Mac-sized with sharp text; the games handle it (DPI aware).
+ * Without Retina mode (a 1x main display) 96 is already Mac-sized. configureScaling, below. */
+/* Whether the main display runs a HiDPI (2x) mode, decided again at each Steam start. Wine's
+ * Retina mode doubles the main display's native mode for every display, whatever its own scale,
+ * so on a 1x main display (a 3840x1600 monitor beside a MacBook, say) games saw 7680x3200 and
+ * drew four times the pixels the monitor shows (2026-11-27). Retina mode, Steam's scaling and
+ * the games' largest resolution follow this (portable_retina.h, fittedResolution). */
+static BOOL mainDisplayIsRetina(void) {
+    NSString *scale=NSProcessInfo.processInfo.environment[@"SETUP_DISPLAY_SCALE"];   // tests: 1 or 2
+    if(scale.length)return scale.integerValue>1;
+    CGDisplayModeRef mode=CGDisplayCopyDisplayMode(CGMainDisplayID());
+    if(!mode)return YES;   // no answer: as before
+    BOOL hidpi=CGDisplayModeGetPixelWidth(mode)>CGDisplayModeGetWidth(mode);
+    CGDisplayModeRelease(mode);
+    return hidpi;
+}
+
 static void configureScaling(NSString *engine) {
-    registryValue(engine,@"HKCU\\Control Panel\\Desktop",@"LogPixels",@"REG_DWORD",@"192",@"scaling.log");
+    registryValue(engine,@"HKCU\\Control Panel\\Desktop",@"LogPixels",@"REG_DWORD",mainDisplayIsRetina()?@"192":@"96",@"scaling.log");
 }
 
 static void makeGameApps(NSString *engine) {

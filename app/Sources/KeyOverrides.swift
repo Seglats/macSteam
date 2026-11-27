@@ -68,6 +68,12 @@ enum KeyOverrides {
         guard let key=keys.first(where:{ $0.code==keyCode }) else { return nil }
         return (mods.filter { flags.contains($0.flag) }.map(\.name)+[key.name]).joined(separator:"+")
     }
+    /// The macOS key code and modifier names of a combo, or nil for an unknown key or modifier.
+    static func keyCode(_ combo:String)->(code:UInt16,mods:Set<String>)? {
+        let (m,key)=parts(combo)
+        guard let code=keys.first(where:{ $0.name==key })?.code,m.allSatisfy({ name in mods.contains { $0.name==name } }) else { return nil }
+        return (code,Set(m))
+    }
     private static func parts(_ combo:String)->(mods:[String],key:String) {
         let p=combo.split(separator:"+",omittingEmptySubsequences:false).map(String.init)
         return (Array(p.dropLast()),p.last ?? "")

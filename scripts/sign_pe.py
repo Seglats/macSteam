@@ -7,7 +7,7 @@ an untrusted root passes (tested 2026-10-06), so Recall signs the stand-in with 
 certificate, made once by this script, rather than a paid one; if Wine ever enforces trust,
 the fallback is a CA-issued certificate.
 
-  create-certificate DIR   a "Recall Root" CA and a "Recall" code-signing certificate
+  create-certificate DIR [--name N]  a "N Root" CA and an "N" code-signing certificate (N: Recall)
                            issued by it (RSA 3072, 20 years). Keys stay outside git under
                            runtime/; losing them only means making new ones.
   sign DIR IN OUT          signs IN (SHA-256 Authenticode) as OUT with DIR's certificate
@@ -152,7 +152,7 @@ def pe_checksum(data, checksum_off):
 
 # Commands
 
-def create_certificate(folder):
+def create_certificate(folder, name='Recall'):
     folder = Path(folder)
     if (folder / KEY).exists():
         raise SystemExit(f'{folder} already holds a certificate; it is never replaced in place.')
@@ -161,9 +161,9 @@ def create_certificate(folder):
     with tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp)
         (tmp / 'root.cnf').write_text('[req]\ndistinguished_name=dn\nprompt=no\nx509_extensions=v3\n'
-                                      '[dn]\nCN=Recall Root\n[v3]\nbasicConstraints=critical,CA:TRUE\n'
+                                      f'[dn]\nCN={name} Root\n[v3]\nbasicConstraints=critical,CA:TRUE\n'
                                       'keyUsage=critical,keyCertSign,cRLSign\nsubjectKeyIdentifier=hash\n')
-        (tmp / 'request.cnf').write_text('[req]\ndistinguished_name=dn\nprompt=no\n[dn]\nCN=Recall\n')
+        (tmp / 'request.cnf').write_text(f'[req]\ndistinguished_name=dn\nprompt=no\n[dn]\nCN={name}\n')
         (tmp / 'leaf.cnf').write_text('basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature\n'
                                       'extendedKeyUsage=codeSigning\nsubjectKeyIdentifier=hash\n'
                                       'authorityKeyIdentifier=keyid\n')
@@ -177,9 +177,9 @@ def create_certificate(folder):
             '-out', tmp / 'leaf.pem')
         run('x509', '-in', tmp / 'root.pem', '-outform', 'der', '-out', folder / ROOT)
         run('x509', '-in', tmp / 'leaf.pem', '-outform', 'der', '-out', folder / LEAF)
-    for name in (KEY, ROOT_KEY):
-        (folder / name).chmod(0o600)
-    print(f'Created the "Recall" code-signing certificate in {folder}; '
+    for secret in (KEY, ROOT_KEY):
+        (folder / secret).chmod(0o600)
+    print(f'Created the "{name}" code-signing certificate in {folder}; '
           f'SHA-256 {hashlib.sha256((folder / LEAF).read_bytes()).hexdigest()}')
 
 
@@ -249,7 +249,9 @@ def check(path, folder=None):
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     commands = parser.add_subparsers(dest='command', required=True)
-    commands.add_parser('create-certificate').add_argument('folder')
+    p = commands.add_parser('create-certificate')
+    p.add_argument('folder')
+    p.add_argument('--name', default='Recall', help='certificate name (CN); the root is "<name> Root"')
     p = commands.add_parser('sign')
     p.add_argument('folder')
     p.add_argument('input')
@@ -259,7 +261,7 @@ def main():
     p.add_argument('folder', nargs='?')
     args = parser.parse_args()
     if args.command == 'create-certificate':
-        create_certificate(args.folder)
+        create_certificate(args.folder, args.name)
     elif args.command == 'sign':
         sign(args.folder, args.input, args.output)
     else:

@@ -1,0 +1,18 @@
+From: MacFinals
+Subject: [PATCH] winemac.drv: present-timing notice is trace output, not an error
+
+"timing presents of CAMetalDrawable drawables for the per-frame file" only confirms that
+WINEMAC_INPUT_STATS is on; as ERR it showed in every log as err:present_timing_subclass.
+Now trace class on macfinals_ui (WINEDEBUG=+macfinals_ui), per the debug-output model.
+---
+--- a/dlls/winemac.drv/d3dmetal_objc.m	2026-11-25 01:21:03
++++ b/dlls/winemac.drv/d3dmetal_objc.m	2026-11-25 01:21:03
+@@ -110,7 +110,7 @@
+         class_addMethod(sub, @selector(presentAfterMinimumDuration:), (IMP)present_timing_present_after, "v@:d");
+         class_addMethod(sub, @selector(class), (IMP)present_timing_class, "#@:");
+         objc_registerClassPair(sub);
+-        ERR(@"timing presents of %s drawables for the per-frame file\n", class_getName(base));
++        UI_LOG(@"timing presents of %s drawables for the per-frame file\n", class_getName(base));
+     }
+     last_base = base;
+     last_sub = sub;

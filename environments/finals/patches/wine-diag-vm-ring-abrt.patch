@@ -1,0 +1,301 @@
+From: MacFinals
+Subject: [PATCH] ntdll: the stuck dump lists the last memory calls and the last SIGABRT
+
+C16's second capture (2026-11-25 07:54) froze every thread's next syscall in Rosetta's exception
+server from one instant on; the GameThread's last NT call was NtProtectVirtualMemory, and a Metal
+assertion (which aborts) fired in the same minute. Neither left a trace saying what it was.
+
+Diagnostics only.
+
+- A 256-entry ring of NtProtectVirtualMemory and NtFreeVirtualMemory calls (current process)
+  and libd3dshared exec-region registrations: thread, address, size, new protection or free
+  type, old protection, status, the enclosing view (base, size, protect, image flag), start time
+  and duration. A slot is taken when the call starts and completed when it ends, so a call that
+  never returns shows as "STILL IN THE CALL"; a protect is completed only after its exec-region
+  registration. The stuck dump prints calls in flight for over 1 s, then the last 32.
+- The SIGABRT handler records thread (Wine tid, Mach thread id, name), the interrupted rip and
+  the time of the last abort(); the stuck dump prints it, or "none".
+
+--- a/dlls/ntdll/unix/loader.c
++++ b/dlls/ntdll/unix/loader.c
+@@ -1009,8 +1009,155 @@
+     wine_diag_locks[slot].site   = holder ? site : NULL;
+     wine_diag_locks[slot].since  = holder ? syscall_log_now_ns() : 0;
+     __atomic_add_fetch( &wine_diag_locks[slot].seq, 1, __ATOMIC_ACQ_REL );  /* even: stable */
++}
++
++UINT32 syscall_log_current_wtid(void);
++
++/* C16 (2026-11-25): the last memory protection changes, releases and exec-region
++ * registrations, for the stuck dump. In the second C16 capture every thread's next syscall
++ * bounced in Rosetta's exception server forever from one instant on, and the GameThread's last
++ * NT call was NtProtectVirtualMemory - but nothing said what it changed. Each call takes a
++ * ring slot when it starts (so a call that never returns stays visible, marked in flight) and
++ * completes it when it ends. Once syscalls stop working the ring stops moving, so it keeps the
++ * calls of the moment of the freeze. A sequence counter guards each slot against torn reads;
++ * a slot reused by a newer call is not completed by the older one. */
++#define WINE_DIAG_VM_RING 256
++static struct wine_diag_vm
++{
++    LONG   seq;            /* odd while being written */
++    LONG   idx;            /* which call owns the slot */
++    UINT64 begin, end;     /* ns; end 0 = still in the call */
++    UINT32 wtid;
++    UINT32 kind;           /* WINE_DIAG_VM_* */
++    UINT64 addr, size;
++    UINT32 arg, old;       /* new protection or free type; old protection */
++    UINT32 status;
++    UINT64 view_base, view_size;
++    UINT32 view_protect;
++} wine_diag_vm_ring[WINE_DIAG_VM_RING];
++static LONG wine_diag_vm_head;
++static const char * const wine_diag_vm_kinds[] =
++    { "?", "NtProtectVirtualMemory", "NtFreeVirtualMemory", "exec region registration" };
++
++int wine_diag_vm_begin( UINT32 kind, const void *addr, SIZE_T size, UINT32 arg )
++{
++    LONG idx = __atomic_fetch_add( &wine_diag_vm_head, 1, __ATOMIC_RELAXED ) & 0x7fffffff;
++    struct wine_diag_vm *e = &wine_diag_vm_ring[idx % WINE_DIAG_VM_RING];
++
++    __atomic_add_fetch( &e->seq, 1, __ATOMIC_ACQ_REL );
++    e->idx = idx;
++    e->begin = syscall_log_now_ns();
++    e->end = 0;
++    e->wtid = syscall_log_current_wtid();
++    e->kind = kind;
++    e->addr = (UINT_PTR)addr;
++    e->size = size;
++    e->arg = arg;
++    e->old = e->status = e->view_protect = 0;
++    e->view_base = e->view_size = 0;
++    __atomic_add_fetch( &e->seq, 1, __ATOMIC_ACQ_REL );
++    return idx;
+ }
+ 
++void wine_diag_vm_end( int idx, UINT32 status, UINT32 old, const void *view_base, SIZE_T view_size,
++                       UINT32 view_protect )
++{
++    struct wine_diag_vm *e;
++
++    if (idx < 0) return;
++    e = &wine_diag_vm_ring[idx % WINE_DIAG_VM_RING];
++    if (__atomic_load_n( &e->idx, __ATOMIC_ACQUIRE ) != idx) return;  /* reused by a newer call */
++    __atomic_add_fetch( &e->seq, 1, __ATOMIC_ACQ_REL );
++    if (e->idx == idx)
++    {
++        e->status = status;
++        e->old = old;
++        e->view_base = (UINT_PTR)view_base;
++        e->view_size = view_size;
++        e->view_protect = view_protect;
++        e->end = syscall_log_now_ns();
++    }
++    __atomic_add_fetch( &e->seq, 1, __ATOMIC_ACQ_REL );
++}
++
++/* C16: the last SIGABRT (an abort() in any thread - a Metal assertion aborts; Wine turns it into
++ * EXCEPTION_WINE_ASSERTION). Written from the signal handler: plain stores only. */
++static struct { UINT64 when; UINT64 rip; UINT32 wtid; UINT32 count; UINT64 mach_tid; char name[32]; } wine_diag_abrt;
++
++void wine_diag_abrt_note( void *rip )
++{
++    UINT64 tid = 0;
++
++#ifdef __APPLE__
++    pthread_threadid_np( NULL, &tid );
++    if (pthread_getname_np( pthread_self(), wine_diag_abrt.name, sizeof(wine_diag_abrt.name) ))
++#endif
++        wine_diag_abrt.name[0] = 0;
++    wine_diag_abrt.wtid = syscall_log_current_wtid();
++    wine_diag_abrt.mach_tid = tid;
++    wine_diag_abrt.rip = (UINT_PTR)rip;
++    wine_diag_abrt.when = syscall_log_now_ns();
++    __atomic_add_fetch( &wine_diag_abrt.count, 1, __ATOMIC_RELEASE );
++}
++
++static void wine_diag_vm_print( FILE *file, const struct wine_diag_vm *e, UINT64 now )
++{
++    char took[48], view[96], old[24];
++
++    if (e->end) snprintf( took, sizeof(took), "-> %#x, took %.3f ms", e->status,
++                          e->end >= e->begin ? (e->end - e->begin) / 1000000.0 : 0.0 );
++    else snprintf( took, sizeof(took), "STILL IN THE CALL" );
++    view[0] = old[0] = 0;
++    if (e->view_base)
++        snprintf( view, sizeof(view), "; view %#llx+%#llx prot %#x%s",
++                  (unsigned long long)e->view_base, (unsigned long long)e->view_size, e->view_protect,
++                  (e->view_protect & SEC_IMAGE) ? " (image)" : "" );
++    if (e->kind == 1 && e->end && !e->status) snprintf( old, sizeof(old), " (was %#x)", e->old );
++    fprintf( file, "  vm: tid %04x %s %#llx+%#llx %s %#x%s %s%s; %.3f s ago\n", e->wtid,
++             wine_diag_vm_kinds[e->kind < ARRAY_SIZE(wine_diag_vm_kinds) ? e->kind : 0],
++             (unsigned long long)e->addr, (unsigned long long)e->size,
++             e->kind == 1 ? "prot" : e->kind == 2 ? "type" : "end", e->arg, old, took, view,
++             now >= e->begin ? (now - e->begin) / 1000000000.0 : 0.0 );
++}
++
++/* the stuck dump's view of the ring: calls still in flight first, then the last 32 in order */
++static void wine_diag_vm_dump( FILE *file, UINT64 now )
++{
++    static struct wine_diag_vm copy[WINE_DIAG_VM_RING];
++    LONG head = __atomic_load_n( &wine_diag_vm_head, __ATOMIC_ACQUIRE ) & 0x7fffffff;
++    LONG n = min( head, WINE_DIAG_VM_RING ), i, valid = 0;
++    UINT32 abrts;
++
++    for (i = 0; i < n; i++)
++    {
++        const struct wine_diag_vm *e = &wine_diag_vm_ring[(head - n + i) % WINE_DIAG_VM_RING];
++        int tries;
++
++        for (tries = 0; tries < 8; tries++)
++        {
++            LONG seq = __atomic_load_n( &e->seq, __ATOMIC_ACQUIRE );
++            if (seq & 1) continue;
++            copy[valid] = *e;
++            __atomic_thread_fence( __ATOMIC_ACQUIRE );
++            if (__atomic_load_n( &e->seq, __ATOMIC_RELAXED ) != seq) continue;
++            if (copy[valid].kind) valid++;
++            break;
++        }
++    }
++    fprintf( file, "  vm: %d memory calls recorded in all\n", (int)head );
++    for (i = 0; i < valid; i++)
++        if (!copy[i].end && now >= copy[i].begin && now - copy[i].begin > 1000000000ull)
++            wine_diag_vm_print( file, &copy[i], now );
++    for (i = max( 0, valid - 32 ); i < valid; i++) wine_diag_vm_print( file, &copy[i], now );
++
++    if ((abrts = __atomic_load_n( &wine_diag_abrt.count, __ATOMIC_ACQUIRE )))
++        fprintf( file, "  SIGABRT: %u in all; last in tid %04x (thread %#llx \"%s\") at rip %#llx, %.1f s ago\n",
++                 abrts, wine_diag_abrt.wtid, (unsigned long long)wine_diag_abrt.mach_tid,
++                 wine_diag_abrt.name, (unsigned long long)wine_diag_abrt.rip,
++                 now >= wine_diag_abrt.when ? (now - wine_diag_abrt.when) / 1000000000.0 : 0.0 );
++    else fprintf( file, "  SIGABRT: none\n" );
++}
++
+ static const char *wine_diag_who( UINT32 tid, char *buf, size_t size )
+ {
+     if (tid == WINE_DIAG_MAIN_THREAD) return "Cocoa main thread";
+@@ -1102,6 +1249,7 @@
+     }
+     if ((lost = __atomic_load_n( &wine_diag_waits_lost, __ATOMIC_RELAXED )))
+         fprintf( file, "  ui wait: %d wait records lost (table full)\n", (int)lost );
++    wine_diag_vm_dump( file, now );
+ }
+ 
+ 
+@@ -2481,8 +2629,13 @@
+ 
+     if (add)
+     {
++        /* C16: libd3dshared changes how Rosetta treats the range; a call stuck in it stays
++           visible in the stuck dump's memory-call ring */
++        int diag = wine_diag_vm_begin( 3, start, (char *)end - (char *)start, (UINT32)count );
++
+         TRACE( "Marking non_native_code_region: %p-%p\n", start, end );
+         register_non_native_code_region( start, end );
++        wine_diag_vm_end( diag, 0, 0, NULL, 0, 0 );
+     }
+ }
+ 
+--- a/dlls/ntdll/unix/virtual.c
++++ b/dlls/ntdll/unix/virtual.c
+@@ -95,6 +95,13 @@
+ WINE_DEFAULT_DEBUG_CHANNEL(virtual);
+ WINE_DECLARE_DEBUG_CHANNEL(module);
+ WINE_DECLARE_DEBUG_CHANNEL(virtual_ranges);
++
++/* C16 (2026-11-25): the stuck dump's ring of memory calls (loader.c) */
++#define WINE_DIAG_VM_PROTECT 1
++#define WINE_DIAG_VM_FREE    2
++extern int wine_diag_vm_begin( UINT32 kind, const void *addr, SIZE_T size, UINT32 arg );
++extern void wine_diag_vm_end( int idx, UINT32 status, UINT32 old, const void *view_base,
++                              SIZE_T view_size, UINT32 view_protect );
+ 
+ struct preload_info
+ {
+@@ -5741,6 +5748,10 @@
+     unsigned int status = STATUS_SUCCESS;
+     LPVOID addr = *addr_ptr;
+     SIZE_T size = *size_ptr;
++    void *diag_base = NULL;  /* C16: the freed view, for the stuck dump's memory-call ring */
++    SIZE_T diag_size = 0;
++    unsigned int diag_prot = 0;
++    int diag;
+ 
+     TRACE("%p %p %08lx %x\n", process, addr, size, type );
+ 
+@@ -5771,6 +5782,7 @@
+     if (size) size = ROUND_SIZE( addr, size, page_mask );
+     base = ROUND_ADDR( addr, page_mask );
+ 
++    diag = wine_diag_vm_begin( WINE_DIAG_VM_FREE, base, size, type );
+     server_enter_uninterrupted_section( &virtual_mutex, &sigset );
+ 
+     /* avoid freeing the DOS area when a broken app passes a NULL pointer */
+@@ -5784,6 +5796,7 @@
+         status = STATUS_INVALID_PARAMETER;
+     }
+     else if (!(view = find_view( base, 0 ))) status = STATUS_MEMORY_NOT_ALLOCATED;
++    else if ((diag_base = view->base, diag_size = view->size, diag_prot = view->protect, 0)) {}
+     else if (!is_view_valloc( view )) status = STATUS_INVALID_PARAMETER;
+     else if (!size && base != view->base) status = STATUS_FREE_VM_NOT_AT_BASE;
+     else if ((char *)view->base + view->size - base < size && !(type & MEM_COALESCE_PLACEHOLDERS))
+@@ -5817,6 +5830,7 @@
+         *size_ptr = size;
+     }
+     server_leave_uninterrupted_section( &virtual_mutex, &sigset );
++    wine_diag_vm_end( diag, status, 0, diag_base, diag_size, diag_prot );
+     return status;
+ }
+ 
+@@ -5836,6 +5850,10 @@
+     SIZE_T size = *size_ptr;
+     LPVOID addr = *addr_ptr;
+     DWORD old;
++    void *diag_base = NULL;  /* C16: the view, for the stuck dump's memory-call ring */
++    SIZE_T diag_size = 0;
++    unsigned int diag_prot = 0;
++    int diag;
+ #if defined(__APPLE__) && defined(__x86_64__)
+     char *exec_start = NULL, *exec_end = NULL;
+ #endif
+@@ -5874,10 +5892,14 @@
+     size = ROUND_SIZE( addr, size, page_mask );
+     base = ROUND_ADDR( addr, page_mask );
+ 
++    diag = wine_diag_vm_begin( WINE_DIAG_VM_PROTECT, base, size, new_prot );
+     server_enter_uninterrupted_section( &virtual_mutex, &sigset );
+ 
+     if ((view = find_view( base, size )))
+     {
++        diag_base = view->base;
++        diag_size = view->size;
++        diag_prot = view->protect;
+         /* Make sure all the pages are committed */
+         if (get_committed_size( view, base, size, &vprot, VPROT_COMMITTED ) >= size && (vprot & VPROT_COMMITTED))
+         {
+@@ -5912,6 +5934,8 @@
+ #if defined(__APPLE__) && defined(__x86_64__)
+     if (exec_start) mac_register_exec_region( exec_start, exec_end );
+ #endif
++    /* completed after the exec-region registration, so a call stuck there shows in flight */
++    wine_diag_vm_end( diag, status, status ? 0 : old, diag_base, diag_size, diag_prot );
+     if (status == STATUS_SUCCESS)
+     {
+         *addr_ptr = base;
+--- a/dlls/ntdll/unix/signal_x86_64.c
++++ b/dlls/ntdll/unix/signal_x86_64.c
+@@ -2826,11 +2826,14 @@
+  *
+  * Handler for SIGABRT.
+  */
++extern void wine_diag_abrt_note( void *rip );  /* C16: loader.c, for the stuck dump */
++
+ static void abrt_handler( int signal, siginfo_t *siginfo, void *sigcontext )
+ {
+     ucontext_t *ucontext = init_handler( sigcontext );
+     EXCEPTION_RECORD rec = { EXCEPTION_WINE_ASSERTION, EXCEPTION_NONCONTINUABLE };
+ 
++    wine_diag_abrt_note( (void *)RIP_sig(ucontext) );
+     setup_exception( ucontext, &rec );
+ }
+ 

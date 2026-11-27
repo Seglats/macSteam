@@ -19,6 +19,7 @@
 #include <signal.h>
 #include <math.h>
 #include <unistd.h>
+#include <libproc.h>
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wunused-function" // MetalFX environment: Overwatch only
 #include "candidate_contract.generated.h"
@@ -475,11 +476,36 @@ static void installClient(NSString *installer, NSString *expected) {
     event(@"steam_installed",nil);
 }
 static void closeClient(NSString *gameRunning);
+/* Processes still running from this installation's own runtimes once its wineserver is gone.
+ * A Wine process that loses its server should exit, but one can be left behind: on 2026-11-27 a
+ * winedevice.exe from a removed own Steam (its folder already in the Trash) still ran hours
+ * later, without a server, ignoring SIGTERM, and kept the 8BitDo pad open through its winebus,
+ * so THE FINALS in the Steam app's SteamDriver found the pad but couldn't open it ("Failed Start
+ * Device Read Loop"). Only called after wineserver -w returned: nothing of a live session is left
+ * then, so anything still running from root/runtimes is a leftover with no server to talk to. */
+static int endStragglers(void) {
+    NSString *runtimes=[[join(root,@"runtimes") stringByResolvingSymlinksInPath] stringByAppendingString:@"/"];
+    int count=proc_listallpids(NULL,0);if(count<=0)return 0;
+    pid_t *pids=calloc((size_t)count+64,sizeof(pid_t));
+    count=proc_listallpids(pids,(int)(((size_t)count+64)*sizeof(pid_t)));
+    int ended=0;
+    for(int i=0;i<count;i++) {
+        char path[PROC_PIDPATHINFO_MAXSIZE];
+        if(pids[i]<=1 || pids[i]==getpid() || proc_pidpath(pids[i],path,sizeof path)<=0)continue;
+        NSString *exe=[[fm stringWithFileSystemRepresentation:path length:strlen(path)] stringByResolvingSymlinksInPath];
+        if(![exe hasPrefix:runtimes])continue;
+        if(kill(pids[i],SIGKILL)==0)ended++;
+    }
+    free(pids);
+    if(ended)event(@"stragglers_ended",@{@"count":@(ended)});
+    return ended;
+}
 // Ends whatever is left of the Wine session (the update Agent, Wine's own services).
 static void endSession(NSString *engine) {
     int code=waitTask(task(join(engine,@"bin/wineserver"),@[@"-k"],wineEnv(engine),@"session-end.log"),15);
     if(code!=0 && code!=1)fail(@"client_close_failed");
     if(waitTask(task(join(engine,@"bin/wineserver"),@[@"-w"],wineEnv(engine),@"session-end-wait.log"),15))fail(@"client_close_failed");
+    endStragglers();
 }
 /* Apple's Metal Performance HUD (Settings, launch --metal-hud 1) reaches the game through
  * Steam, which starts it with its own environment. MTL_HUD_ELEMENTS lists the HUD's default
@@ -642,7 +668,9 @@ static void advancedSetting(NSString *name, BOOL on, BOOL apply) {
 static void closeClient(NSString *gameRunning) {
     if(!(matches(state()[@"active_runtime"],@"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$") && [fm fileExistsAtPath:join(join(join(root,@"runtimes"),state()[@"active_runtime"]),@"runtime.json")]))return;
     NSString *engine=runtime();BOOL closed=NO;
-    for(int attempt=0;attempt<20 && !closed;attempt++) {
+    // Up to 90 s: a Steam whose browser failed (after its own update replaced the stand-in
+    // helper) took 72 s to honour -shutdown (2026-11-27), and 20 s gave up on it.
+    for(int attempt=0;attempt<90 && !closed;attempt++) {
         if(membershipCache)[membershipCache removeAllObjects];
         NSArray *rows=sessionProcesses();NSMutableArray *clients=[NSMutableArray array];
         for(NSDictionary *p in rows) {if([p[@"kind"] isEqual:@"game"])fail(gameRunning);[clients addObject:p];}
@@ -665,6 +693,8 @@ static void uninstall(void) {
     // environment holding Steam and its games, runtimes, downloads, logs
     // and caches. ownRoot already refused any directory without the marker.
     closeClient(@"close_game_before_uninstall");
+    // closeClient returns early without an active runtime; leftovers must not outlive the folder.
+    endStragglers();
     // Move, never delete: the folder is recoverable from the Trash with Put
     // Back. On the same volume this is a rename even for a full game install.
     NSURL *trashed=nil;NSError *error=nil;
@@ -771,6 +801,9 @@ int main(int argc, const char *argv[]) { @autoreleasepool {
             NSString *amount=nil;configureMetalFX(runtime(),[options[@"enabled"] isEqual:@"1"],options[@"sharpening"] ?: @"off",apply,&amount);
         }
         else if([command isEqual:@"close-client"]) {closeClient(@"close_game_before_update");event(@"client_closed",nil);}
+        // Removing the own Steam with Keep games: closed first, then the app moves the games out
+        // (OwnSteamGames.swift), then uninstall.
+        else if([command isEqual:@"close-for-removal"]) {closeClient(@"close_game_before_uninstall");event(@"client_closed",nil);}
         else if([command isEqual:@"parity-report"])event(@"parity_report",parityReport(runtime(),wineEnv(runtime())));
         else if([command isEqual:@"uninstall"])uninstall();
         else if([command isEqual:@"discard-unused"])discardUnused();
